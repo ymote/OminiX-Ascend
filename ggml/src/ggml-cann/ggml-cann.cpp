@@ -2113,6 +2113,27 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
+    // REPEAT + binary op: skip REPEAT and let the binary op broadcast natively.
+    // Only when both inputs are numpy-broadcastable (no tiling) to the output.
+    if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_REPEAT) {
+        enum ggml_op binary_op = ops.begin()[1];
+        if (binary_op == GGML_OP_MUL || binary_op == GGML_OP_ADD ||
+            binary_op == GGML_OP_DIV || binary_op == GGML_OP_SUB) {
+            ggml_tensor * repeat_node = cgraph->nodes[node_idx];
+            ggml_tensor * binary_node = cgraph->nodes[node_idx + 1];
+            ggml_tensor * repeat_src  = repeat_node->src[0];
+            ggml_tensor * other_src   = (binary_node->src[0] == repeat_node)
+                                          ? binary_node->src[1]
+                                          : binary_node->src[0];
+            // Reject tiling cases (src dim > 1 but != dst dim)
+            if (ggml_cann_need_bcast(binary_node, repeat_src) ||
+                ggml_cann_need_bcast(binary_node, other_src)) {
+                return false;
+            }
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -2153,6 +2174,15 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
+            // REPEAT+binary_op fusion: skip REPEAT, let binary op broadcast
+            for (enum ggml_op bop : {GGML_OP_MUL, GGML_OP_ADD, GGML_OP_SUB, GGML_OP_DIV}) {
+                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_REPEAT, bop })) {
+                    ggml_cann_op_repeat_binary_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                    i++;
+                    goto next_node;
+                }
+            }
+
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
                 node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
                 continue;
@@ -2162,11 +2192,14 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
 
-            bool ok = ggml_cann_compute_forward(*cann_ctx, node);
-            if (!ok) {
-                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            {
+                bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+                if (!ok) {
+                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                }
+                GGML_ASSERT(ok);
             }
-            GGML_ASSERT(ok);
+            next_node:;
         }
     }
 

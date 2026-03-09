@@ -3977,6 +3977,55 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
 
+    // Fast path for decode (n_t=1): depthwise conv degenerates to
+    // per-channel dot product of length d_conv.  Replace the expensive
+    // aclnnConvolution with element-wise MUL + ReduceSum.
+    if (n_t == 1) {
+        // src0: {nc, nr, n_s, 1}  src1: {nc, nr, 1, 1}
+        // Step 1: element-wise MUL (src1 broadcasts over n_s) → temp {nc, nr, n_s, 1}
+        acl_tensor_ptr acl_input  = ggml_cann_create_tensor(src0);
+        acl_tensor_ptr acl_weight = ggml_cann_create_tensor(src1);
+
+        size_t temp_size = nc * nr * n_s * sizeof(float);
+        ggml_cann_pool_alloc temp_alloc(ctx.pool(), temp_size);
+        void * temp_data = temp_alloc.get();
+
+        int64_t temp_ne[GGML_MAX_DIMS] = { nc, nr, n_s, 1 };
+        size_t  temp_nb[GGML_MAX_DIMS] = {
+            sizeof(float),
+            nc * sizeof(float),
+            nc * nr * sizeof(float),
+            nc * nr * n_s * sizeof(float)
+        };
+        acl_tensor_ptr acl_temp = ggml_cann_create_tensor(
+            temp_data, ggml_cann_type_mapping(src0->type),
+            ggml_type_size(src0->type), temp_ne, temp_nb, GGML_MAX_DIMS);
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_input.get(), acl_weight.get(), acl_temp.get());
+
+        // Step 2: ReduceSum along ggml dim 0 (ACL dim 3) → {1, nr, n_s, 1}
+        // dst is {nr, 1, n_s, 1} — same contiguous layout as {1, nr, n_s, 1}
+        int64_t reduce_ne[GGML_MAX_DIMS] = { 1, nr, n_s, 1 };
+        size_t  reduce_nb[GGML_MAX_DIMS] = {
+            sizeof(float),
+            sizeof(float),
+            nr * sizeof(float),
+            nr * n_s * sizeof(float)
+        };
+        acl_tensor_ptr acl_reduce_out = ggml_cann_create_tensor(
+            dst->data, ggml_cann_type_mapping(dst->type),
+            ggml_type_size(dst->type), reduce_ne, reduce_nb, GGML_MAX_DIMS);
+
+        int64_t reduce_dims[] = { 3 };  // ACL dim 3 = ggml dim 0
+        acl_int_array_ptr reduce_dim_array = ggml_cann_create_int_array(reduce_dims, 1);
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, ReduceSum, acl_temp.get(),
+                                reduce_dim_array.get(), true,
+                                ggml_cann_type_mapping(dst->type),
+                                acl_reduce_out.get());
+        return;
+    }
+
     // --- Build CANN tensors ---
 
     // 1) Input: conv_x as NCL
@@ -4103,6 +4152,47 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, AddRmsNorm, acl_x1.get(), acl_x2.get(), acl_gamma.get(),
                             eps,  // double type
                             acl_yout.get(), acl_rstd.get(), acl_xout.get());
+}
+
+void ggml_cann_op_repeat_binary_fused(ggml_backend_cann_context & ctx,
+                                      ggml_tensor * repeat_node,
+                                      ggml_tensor * binary_node) {
+    ggml_tensor * repeat_src = repeat_node->src[0];  // small (un-repeated) tensor
+
+    // Reconstruct binary op inputs, replacing repeat_node with repeat_src.
+    // ggml_cann_can_fuse guarantees both inputs are numpy-broadcastable
+    // to binary_node (no tiling), so ACLNN handles broadcasting natively.
+    ggml_tensor * bin_a;  // binary op's src[0]
+    ggml_tensor * bin_b;  // binary op's src[1]
+    if (binary_node->src[0] == repeat_node) {
+        bin_a = repeat_src;
+        bin_b = binary_node->src[1];
+    } else {
+        GGML_ASSERT(binary_node->src[1] == repeat_node);
+        bin_a = binary_node->src[0];
+        bin_b = repeat_src;
+    }
+
+    acl_tensor_ptr acl_a   = ggml_cann_create_tensor(bin_a);
+    acl_tensor_ptr acl_b   = ggml_cann_create_tensor(bin_b);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(binary_node);
+
+    switch (binary_node->op) {
+        case GGML_OP_MUL:
+            aclnn_mul(ctx, acl_a.get(), acl_b.get(), acl_dst.get());
+            break;
+        case GGML_OP_ADD:
+            aclnn_add(ctx, acl_a.get(), acl_b.get(), acl_dst.get());
+            break;
+        case GGML_OP_SUB:
+            aclnn_sub(ctx, acl_a.get(), acl_b.get(), acl_dst.get());
+            break;
+        case GGML_OP_DIV:
+            aclnn_div(ctx, acl_a.get(), acl_b.get(), acl_dst.get());
+            break;
+        default:
+            GGML_ABORT("unsupported fused binary op");
+    }
 }
 
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {

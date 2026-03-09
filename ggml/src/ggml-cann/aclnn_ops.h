@@ -917,6 +917,17 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
                                      ggml_tensor *               rms_norm_node);
 
 /**
+ * @brief Fused REPEAT + binary op: skip REPEAT and let the binary op broadcast.
+ *
+ * @param ctx           CANN backend context.
+ * @param repeat_node   The REPEAT node (will be skipped).
+ * @param binary_node   The binary op node (MUL/ADD/SUB/DIV) that consumes the REPEAT output.
+ */
+void ggml_cann_op_repeat_binary_fused(ggml_backend_cann_context & ctx,
+                                      ggml_tensor * repeat_node,
+                                      ggml_tensor * binary_node);
+
+/**
  * @brief   Check whether a tensor is a weight tensor for matrix multiplication.
  *
  * @details Checks whether the given tensor serves as weight parameters in matrix multiplication operations,
