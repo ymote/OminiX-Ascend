@@ -27,9 +27,9 @@ OminiX 框架支持多种模态的模型推理：
 | **VLM & VLA（视觉语言/动作模型）** | Moxin-VLA、OpenVLA、Qwen-VL、Vote、Pi-0.5、AntVLA |
 | **语音识别** | Qwen ASR、Qwen TTS、Whisper、GPT-SoVITS、Fun-ASR |
 
-## 性能对比
+## 性能测试
 
-详细的性能测试数据请查看 **[Benchmarks](docs/benchmarks.md)**，以下是部分亮点：
+详细的性能测试数据请查看 **[Benchmarks](docs/benchmarks.md)**，以下是部分数据：
 
 | 模型 | Our framework | 对比方案 | 加速比 |
 |------|---------------|----------|--------|
