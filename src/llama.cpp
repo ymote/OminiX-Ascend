@@ -855,7 +855,13 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
         try {
-            model.load_vocab(ml);
+            if(model.arch != LLM_ARCH_VITS){
+                model.load_vocab(ml);
+            }else{
+                uint32_t n_vocab = 0;
+                ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, n_vocab, false);
+                model.vocab.set_token_size(n_vocab);
+            }
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }

@@ -47,6 +47,7 @@ add_library(llama
             models/bert.cpp
             models/bitnet.cpp
             models/bloom.cpp
+    models/vits.cpp
             models/chameleon.cpp
             models/chatglm.cpp
             models/codeshell.cpp

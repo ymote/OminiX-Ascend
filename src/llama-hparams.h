@@ -162,6 +162,10 @@ struct llama_hparams {
     bool attn_soft_cap = false;
     bool use_kq_norm   = false;
 
+    // for sovits
+    float x_scale = 1.f;
+    float alpha = 1.f;
+
     // for Classifiers
     uint32_t n_cls_out = 1;
 

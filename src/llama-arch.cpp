@@ -30,6 +30,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_BLOOM,            "bloom"            },
     { LLM_ARCH_STABLELM,         "stablelm"         },
     { LLM_ARCH_QWEN,             "qwen"             },
+    { LLM_ARCH_VITS,             "vits"             },
     { LLM_ARCH_QWEN2,            "qwen2"            },
     { LLM_ARCH_QWEN2MOE,         "qwen2moe"         },
     { LLM_ARCH_QWEN2VL,          "qwen2vl"          },
@@ -321,6 +322,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_XIELU_ALPHA_P,         "xielu.alpha_p"         },
     { LLM_KV_XIELU_BETA,            "xielu.beta"            },
     { LLM_KV_XIELU_EPS,             "xielu.eps"             },
+
+    {LLM_KV_POS_ALPHA,                  "alpha"             },
+    {LLM_KV_POS_X_SCALE,                "x_scale"           },
 
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },

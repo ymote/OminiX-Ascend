@@ -33,6 +33,7 @@ enum llm_arch {
     LLM_ARCH_EUROBERT,
     LLM_ARCH_BLOOM,
     LLM_ARCH_STABLELM,
+    LLM_ARCH_VITS,
     LLM_ARCH_QWEN,
     LLM_ARCH_QWEN2,
     LLM_ARCH_QWEN2MOE,
@@ -331,6 +332,9 @@ enum llm_kv {
     LLM_KV_DENSE_2_FEAT_OUT,
     LLM_KV_DENSE_3_FEAT_IN,
     LLM_KV_DENSE_3_FEAT_OUT,
+
+    LLM_KV_POS_ALPHA,
+    LLM_KV_POS_X_SCALE,
 };
 
 enum llm_tensor {

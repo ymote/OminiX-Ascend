@@ -427,6 +427,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.data         =*/ std::move(udata),
+        /*.pos_offset   =*/ 0,
     };
 
     return res;
@@ -762,6 +763,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.data         =*/ std::move(udata),
+        /*.pos_offset   =*/ batch.pos_offset,
     };
 
     if (debug > 0) {

@@ -237,6 +237,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        llama_pos       pos_offset = 0; // for sovits pos generation
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -471,6 +472,8 @@ extern "C" {
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
+
+    LLAMA_API bool llama_get_causal_attn(struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API struct llama_context * llama_new_context_with_model(
                      struct llama_model * model,

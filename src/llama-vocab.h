@@ -82,6 +82,7 @@ struct llama_vocab {
     enum llama_vocab_pre_type get_pre_type() const;
 
     uint32_t n_tokens() const;
+    bool set_token_size(uint32_t token_size);
     uint32_t n_token_types() const;
 
     std::string type_name() const;

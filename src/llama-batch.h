@@ -66,6 +66,7 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    llama_pos pos_offset = 0;   // for sovits attn mask generation
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

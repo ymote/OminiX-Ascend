@@ -2805,6 +2805,9 @@ llama_context_params llama_context_default_params() {
 
     return result;
 }
+bool llama_get_causal_attn(struct llama_context * ctx){
+    return ctx->get_cparams().causal_attn;
+}
 
 llama_context * llama_init_from_model(
                  llama_model * model,

@@ -3417,6 +3417,10 @@ enum llama_vocab_pre_type llama_vocab::get_pre_type() const {
 uint32_t llama_vocab::n_tokens() const {
     return (uint32_t) pimpl->id_to_token.size();
 }
+bool llama_vocab::set_token_size(uint32_t token_size){
+    pimpl->id_to_token.resize(token_size);
+    return true;
+}
 
 uint32_t llama_vocab::n_token_types() const {
     return (uint32_t) pimpl->n_token_types;
