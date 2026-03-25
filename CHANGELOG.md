@@ -2,6 +2,12 @@
 
 ## 2026-03-25
 
+### Fix: Remove residual `tools/qwen_tts` CMakeLists.txt breaking cmake
+
+- Removed `add_subdirectory(qwen_tts)` from `tools/CMakeLists.txt`
+- Deleted leftover `tools/qwen_tts/CMakeLists.txt` (source files were already removed in `8e6a914d`)
+- This fixes `cmake -B build` failing with "Cannot find source file: main.cpp" errors
+
 ### Refactor: Extract shared modules into `tools/qwen_common/`
 
 - Moved 6 shared modules (`bpe_tokenizer`, `audio_io`, `utils`, `model_loader`, `ctx_manager`, `build_graph`) from `tools/qwen_tts/` to new `tools/qwen_common/` static library
