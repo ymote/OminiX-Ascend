@@ -7,17 +7,11 @@ set(TARGET qwen_tts)
 set(SRC_FILES
     main.cpp
     qwen_tts.cpp
-    bpe_tokenizer.cpp
     talker.cpp
     speaker_encoder.cpp
     speech_tokenizer_encoder.cpp
     speech_tokenizer_decoder.cpp
-    audio_io.cpp
-    utils.cpp
-    model_loader.cpp
     model_defs.cpp
-    ctx_manager.cpp
-    build_graph.cpp
     stft.cpp
 )
 
@@ -31,7 +25,7 @@ list(APPEND SRC_FILES ${KISSFFT_SRC})
 
 add_executable(${TARGET} ${SRC_FILES})
 
-target_link_libraries     (${TARGET} PUBLIC ggml llama)
+target_link_libraries     (${TARGET} PUBLIC ggml llama qwen_common)
 target_link_libraries     (${TARGET} PRIVATE Threads::Threads)
 target_include_directories(${TARGET} PUBLIC  .)
 target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR})
@@ -64,14 +58,10 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 set(TEST_CP_SRC
     test_code_predictor.cpp
     talker.cpp
-    model_loader.cpp
     model_defs.cpp
-    ctx_manager.cpp
-    build_graph.cpp
-    utils.cpp
 )
 add_executable(test_code_predictor ${TEST_CP_SRC})
-target_link_libraries     (test_code_predictor PUBLIC ggml llama)
+target_link_libraries     (test_code_predictor PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_code_predictor PRIVATE Threads::Threads common)
 target_include_directories(test_code_predictor PUBLIC  .)
 target_include_directories(test_code_predictor PRIVATE ../.. ../../vendor)
@@ -81,14 +71,10 @@ target_compile_features   (test_code_predictor PRIVATE cxx_std_17)
 set(TEST_TALKER_SRC
     test_talker.cpp
     talker.cpp
-    model_loader.cpp
     model_defs.cpp
-    ctx_manager.cpp
-    build_graph.cpp
-    utils.cpp
 )
 add_executable(test_talker ${TEST_TALKER_SRC})
-target_link_libraries     (test_talker PUBLIC ggml llama)
+target_link_libraries     (test_talker PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_talker PRIVATE Threads::Threads common)
 target_include_directories(test_talker PUBLIC  .)
 target_include_directories(test_talker PRIVATE ../.. ../../vendor)
@@ -98,14 +84,10 @@ target_compile_features   (test_talker PRIVATE cxx_std_17)
 set(TEST_ENCODER_SRC
     test_encoder.cpp
     speech_tokenizer_encoder.cpp
-    model_loader.cpp
     model_defs.cpp
-    ctx_manager.cpp
-    build_graph.cpp
-    utils.cpp
 )
 add_executable(test_encoder ${TEST_ENCODER_SRC})
-target_link_libraries     (test_encoder PUBLIC ggml llama)
+target_link_libraries     (test_encoder PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_encoder PRIVATE Threads::Threads common)
 target_include_directories(test_encoder PUBLIC  .)
 target_include_directories(test_encoder PRIVATE ../.. ../../vendor)
@@ -115,21 +97,17 @@ target_compile_features   (test_encoder PRIVATE cxx_std_17)
 set(TEST_CP_FLOW_SRC
     test_cp_flow.cpp
     talker.cpp
-    model_loader.cpp
     model_defs.cpp
-    ctx_manager.cpp
-    build_graph.cpp
-    utils.cpp
 )
 add_executable(test_cp_flow ${TEST_CP_FLOW_SRC})
-target_link_libraries     (test_cp_flow PUBLIC ggml llama)
+target_link_libraries     (test_cp_flow PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_cp_flow PRIVATE Threads::Threads common)
 target_include_directories(test_cp_flow PUBLIC  .)
 target_include_directories(test_cp_flow PRIVATE ../.. ../../vendor)
 target_compile_features   (test_cp_flow PRIVATE cxx_std_17)
 
 # Test: BPE Tokenizer
-add_executable(test_tokenizer test_tokenizer.cpp bpe_tokenizer.cpp)
-target_link_libraries     (test_tokenizer PRIVATE Threads::Threads)
+add_executable(test_tokenizer test_tokenizer.cpp)
+target_link_libraries     (test_tokenizer PRIVATE Threads::Threads qwen_common)
 target_include_directories(test_tokenizer PRIVATE . ../.. ../../vendor)
 target_compile_features   (test_tokenizer PRIVATE cxx_std_17)
