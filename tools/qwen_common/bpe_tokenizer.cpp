@@ -181,6 +181,9 @@ bool BpeTokenizer::load(const std::string &vocab_path,
                 }
             }
             printf("[tokenizer] loaded %zu special tokens\n", special_tokens_.size());
+        } else {
+            printf("[tokenizer] WARNING: %s not found, special tokens will be unavailable\n",
+                   config_path.c_str());
         }
     }
 
