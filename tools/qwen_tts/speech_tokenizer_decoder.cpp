@@ -853,17 +853,19 @@ bool SpeechTokenizerDecoder::decode_chunked(
         return decode_single_chunk(codes, audio, true);
     }
 
-    // Long sequence: split into chunks with overlap
-    printf("[decoder] chunked mode: %d frames → chunks of %d (overlap=%d)\n",
-           T, CHUNK_SIZE, OVERLAP_FRAMES);
+    // Long sequence: split into chunks with overlap for context.
+    // Each chunk provides full sliding_window context for its interior frames.
+    // Stitching: keep only the NEW frames from each chunk (hard-cut, no crossfade).
+    int step = CHUNK_SIZE - OVERLAP_FRAMES;
+    printf("[decoder] chunked mode: %d frames, chunk=%d, overlap=%d, step=%d\n",
+           T, CHUNK_SIZE, OVERLAP_FRAMES, step);
 
     audio.clear();
-    int overlap_samples = OVERLAP_FRAMES * config_.decode_upsample_rate;
+    int upsample = config_.decode_upsample_rate;
     int chunk_count = 0;
 
-    for (int start = 0; start < T; start += (CHUNK_SIZE - OVERLAP_FRAMES)) {
+    for (int start = 0; start < T; start += step) {
         int end = std::min(start + CHUNK_SIZE, T);
-        int chunk_len = end - start;
 
         // Extract chunk codes
         std::vector<std::vector<int>> chunk_codes(n_q);
@@ -879,35 +881,27 @@ bool SpeechTokenizerDecoder::decode_chunked(
         bool success = decode_single_chunk(chunk_codes, chunk_audio, true);
 
         if (!success) {
-            printf("[decoder] CANN chunk %d failed, falling back to CPU for entire sequence\n",
-                   chunk_count);
-            // Fallback: decode entire sequence on CPU
+            printf("[decoder] CANN chunk %d failed, falling back to CPU\n", chunk_count);
             return decode_single_chunk(codes, audio, false);
         }
 
-        // Stitch audio with crossfade in overlap region
-        if (start > 0 && audio.size() >= overlap_samples) {
-            // Crossfade: linear blend in overlap region
-            for (int i = 0; i < overlap_samples && i < (int)chunk_audio.size(); i++) {
-                float alpha = (float)i / overlap_samples;  // 0→1
-                int audio_idx = audio.size() - overlap_samples + i;
-                audio[audio_idx] = audio[audio_idx] * (1.0f - alpha) +
-                                   chunk_audio[i] * alpha;
-            }
-            // Append non-overlap part
-            if ((int)chunk_audio.size() > overlap_samples) {
-                audio.insert(audio.end(),
-                            chunk_audio.begin() + overlap_samples,
-                            chunk_audio.end());
-            }
-        } else {
-            // First chunk: no overlap
-            audio = chunk_audio;
+        // Hard-cut stitching: only keep the frames that are "new" in this chunk.
+        // First chunk: keep all. Subsequent: skip overlap prefix.
+        int skip_frames = (start > 0) ? OVERLAP_FRAMES : 0;
+        int skip_samples = skip_frames * upsample;
+        int keep_samples = (int)chunk_audio.size() - skip_samples;
+
+        if (keep_samples <= 0) break;  // no new frames in this chunk
+
+        {
+            audio.insert(audio.end(),
+                         chunk_audio.begin() + skip_samples,
+                         chunk_audio.end());
         }
 
         chunk_count++;
-        printf("[decoder]   chunk %d: frames [%d,%d) → %zu samples (CANN)\n",
-               chunk_count, start, end, chunk_audio.size());
+        printf("[decoder]   chunk %d: frames [%d,%d), keep [%d,%d) -> %d samples (CANN)\n",
+               chunk_count, start, end, start + skip_frames, end, keep_samples);
     }
 
     printf("[decoder] chunked decode complete: %d chunks → %zu samples\n",

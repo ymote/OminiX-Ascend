@@ -192,8 +192,8 @@ private:
     // CPU fallback session for long sequences (CANN fails at >100 total frames)
     std::unique_ptr<InferenceSession<SpeechTokenizerDecoderModel>> cpu_session_;
     static constexpr int CANN_MAX_FRAMES = 99;  // CANN decoder correct ≤99, fails ~100+ (CANN 8.5.0)
-    static constexpr int CHUNK_SIZE = 96;       // chunk size with overlap margin (increased from 95)
-    static constexpr int OVERLAP_FRAMES = 2;    // overlap frames for smooth stitching (reduced from 4)
+    static constexpr int CHUNK_SIZE = 96;       // chunk size per CANN pass
+    static constexpr int OVERLAP_FRAMES = 72;   // must >= sliding_window (72) for correct attention context
 
     // Chunked decoding for long sequences (>99 frames)
     bool decode_chunked(const std::vector<std::vector<int>> &codes,
