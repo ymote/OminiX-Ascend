@@ -193,6 +193,17 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
            spk_embedding.size(),
            std::chrono::duration<double>(t1 - t0).count());
 
+    if (params.profiling) {
+        FILE *f = fopen("logs/cpp_spk_embedding.bin", "wb");
+        if (f) {
+            int dim = (int)spk_embedding.size();
+            fwrite(&dim, 4, 1, f);
+            fwrite(spk_embedding.data(), sizeof(float), dim, f);
+            fclose(f);
+            printf("  [debug] dumped spk_embedding (%d dims)\n", dim);
+        }
+    }
+
     // Step 3: Encode reference audio to codec tokens
     printf("\n--- Step 3: Encode reference audio ---\n");
     t0 = std::chrono::high_resolution_clock::now();
@@ -208,7 +219,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
            std::chrono::duration<double>(t1 - t0).count());
 
     // Debug: dump ref_codes for round-trip testing
-    {
+    if (params.profiling) {
         FILE *f = fopen("logs/cpp_ref_codes.bin", "wb");
         if (f) {
             int nq = (int)ref_codes.size(), nf = n_ref_frames;
@@ -222,7 +233,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
             fclose(f);
             printf("  [debug] dumped ref_codes to logs/cpp_ref_codes.bin\n");
         }
-    }
+    }  // profiling
 
     // Step 4: Tokenize text
     printf("\n--- Step 4: Tokenize text ---\n");
@@ -232,6 +243,25 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
 
     auto prefill_end = std::chrono::high_resolution_clock::now();
     double prefill_time = std::chrono::duration<double>(prefill_end - total_t0).count();
+
+    if (params.profiling) {
+        FILE *f = fopen("logs/cpp_ref_text_tokens.bin", "wb");
+        if (f) {
+            int n = (int)ref_text_tokens.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(ref_text_tokens.data(), sizeof(int), n, f);
+            fclose(f);
+        }
+        f = fopen("logs/cpp_target_text_tokens.bin", "wb");
+        if (f) {
+            int n = (int)target_text_tokens.size();
+            fwrite(&n, 4, 1, f);
+            fwrite(target_text_tokens.data(), sizeof(int), n, f);
+            fclose(f);
+        }
+        printf("  [debug] dumped text tokens (ref=%zu, tgt=%zu)\n",
+               ref_text_tokens.size(), target_text_tokens.size());
+    }
 
     // Step 5: Generate codec tokens with Talker LLM
     printf("\n--- Step 5: Generate codec tokens ---\n");
@@ -252,6 +282,21 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     t1 = std::chrono::high_resolution_clock::now();
     int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
     double generate_time = std::chrono::duration<double>(t1 - t0).count();
+
+    if (params.profiling) {
+        FILE *f = fopen("logs/cpp_codec_tokens.bin", "wb");
+        if (f) {
+            int nq = (int)codec_tokens.size();
+            int nf = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
+            fwrite(&nq, 4, 1, f);
+            fwrite(&nf, 4, 1, f);
+            for (int q = 0; q < nq; q++)
+                fwrite(codec_tokens[q].data(), sizeof(int), nf, f);
+            fclose(f);
+            printf("  [debug] dumped codec_tokens (%dx%d)\n", nq, nf);
+        }
+    }
+
     printf("  Generated %d codec frames (%.2f sec, %.1f frames/sec)\n",
            n_gen_frames, generate_time,
            n_gen_frames / generate_time);
