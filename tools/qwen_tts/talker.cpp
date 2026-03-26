@@ -1346,6 +1346,8 @@ bool TalkerLLM::generate(
     int dim = n_embd_;
     int n_groups = talker_config_.num_code_groups;
 
+    auto gen_t0 = std::chrono::high_resolution_clock::now();
+
     // Ensure TTS embeddings are cached
     cache_tts_embeddings();
 
@@ -1360,6 +1362,9 @@ bool TalkerLLM::generate(
                                  language, prefill_embs, prefill_len)) {
         return false;
     }
+
+    auto build_emb_t1 = std::chrono::high_resolution_clock::now();
+    double build_emb_ms = std::chrono::duration<double, std::milli>(build_emb_t1 - gen_t0).count();
 
     // 2. Prefill: feed all embeddings to llama.cpp
     llama_memory_clear(llama_get_memory(llama_ctx_), true);
@@ -1412,9 +1417,11 @@ bool TalkerLLM::generate(
            sampling.repetition_penalty);
 
     double total_llm_ms = 0, total_cp_ms = 0, total_emb_ms = 0, total_head_ms = 0;
+    double total_sample_ms = 0, total_trailing_ms = 0, total_loop_ms = 0;
 
     for (int step = 0; step < max_new_tokens; step++) {
-        auto head_t0 = std::chrono::high_resolution_clock::now();
+        auto loop_t0 = std::chrono::high_resolution_clock::now();
+        auto head_t0 = loop_t0;
         // 4a. Apply codec_head → group 0 logits
         apply_codec_head(hidden.data(), logits_buf.data());
 
@@ -1430,10 +1437,13 @@ bool TalkerLLM::generate(
         total_head_ms += std::chrono::duration<double, std::milli>(head_t1 - head_t0).count();
 
         // 4d. Sample group 0
+        auto sample_t0 = std::chrono::high_resolution_clock::now();
         int group0_token = sample_token(logits_buf.data(), vocab_size,
                                          sampling.temperature, sampling.top_k,
                                          sampling.top_p, sampling.do_sample);
         generated_g0.push_back(group0_token);
+        auto sample_t1 = std::chrono::high_resolution_clock::now();
+        total_sample_ms += std::chrono::duration<double, std::milli>(sample_t1 - sample_t0).count();
 
         // 4e. Check EOS
         if (group0_token == talker_config_.codec_eos_token_id) {
@@ -1473,8 +1483,8 @@ bool TalkerLLM::generate(
             lookup_codec_embedding(group0_token, next_emb.data());
         }
 
-        // Add trailing_text_hidden (Python: inputs_embeds += trailing_text_hidden[:, step])
-        // This injects text context during autoregressive generation.
+        // Add trailing_text_hidden
+        auto trailing_t0 = std::chrono::high_resolution_clock::now();
         {
             int gen_step = (int)codec_tokens[0].size();  // current generation step
             if (trailing_text_len_ > 0 && gen_step < trailing_text_len_) {
@@ -1486,6 +1496,9 @@ bool TalkerLLM::generate(
                 for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
             }
         }
+
+        auto trailing_t1 = std::chrono::high_resolution_clock::now();
+        total_trailing_ms += std::chrono::duration<double, std::milli>(trailing_t1 - trailing_t0).count();
 
         // 4e. Feed to llama.cpp
         auto llm_t0 = std::chrono::high_resolution_clock::now();
@@ -1514,6 +1527,7 @@ bool TalkerLLM::generate(
         memcpy(hidden.data(), embd, dim * sizeof(float));
         auto llm_t1 = std::chrono::high_resolution_clock::now();
         total_llm_ms += std::chrono::duration<double, std::milli>(llm_t1 - llm_t0).count();
+        total_loop_ms += std::chrono::duration<double, std::milli>(llm_t1 - loop_t0).count();
 
         if ((step + 1) % 50 == 0) {
             printf("[talker] step %d/%d, group0_token=%d, codec_frames=%zu\n",
@@ -1535,8 +1549,17 @@ bool TalkerLLM::generate(
         }
     }
 
-    double total_accounted = talker_prefill_ms + total_head_ms + total_cp_ms + total_llm_ms + total_emb_ms;
-    printf("[talker] timing: prefill=%.0fms, head=%.0fms, CP=%.0fms, LLM=%.0fms, EMB=%.0fms (sum=%.0fms)\n",
-           talker_prefill_ms, total_head_ms, total_cp_ms, total_llm_ms, total_emb_ms, total_accounted);
+    printf("[talker] timing breakdown:\n");
+    printf("[talker]   build_emb: %7.0f ms (build_input_embeddings)\n", build_emb_ms);
+    printf("[talker]   prefill:   %7.0f ms\n", talker_prefill_ms);
+    printf("[talker]   head:      %7.0f ms (codec_head + suppress + rep_penalty)\n", total_head_ms);
+    printf("[talker]   sample:    %7.0f ms\n", total_sample_ms);
+    printf("[talker]   CP:        %7.0f ms (predict_code_groups)\n", total_cp_ms);
+    printf("[talker]   EMB:       %7.0f ms (compute_next_embedding)\n", total_emb_ms);
+    printf("[talker]   trailing:  %7.0f ms (trailing_text_hidden)\n", total_trailing_ms);
+    printf("[talker]   LLM:       %7.0f ms (llama_decode + get_embd)\n", total_llm_ms);
+    printf("[talker]   loop_sum:  %7.0f ms (per-step wall clock)\n", total_loop_ms);
+    double total_accounted = build_emb_ms + talker_prefill_ms + total_loop_ms;
+    printf("[talker]   TOTAL:     %7.0f ms (build_emb + prefill + loop)\n", total_accounted);
     return true;
 }
