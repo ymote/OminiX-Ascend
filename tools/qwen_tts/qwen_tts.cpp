@@ -175,6 +175,7 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     std::vector<std::vector<int>> ref_codes;
     std::vector<float> encoder_hidden;
     bool used_cache = false;
+    cached_ref_text_.clear();
 
     // Try loading from ref_cache file
     if (!params.ref_cache.empty()) {
@@ -192,9 +193,19 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                     spk_embedding.resize(spk_dim);
                     fread(spk_embedding.data(), sizeof(float), spk_dim, fc);
                 }
+                // Read cached ref_text (if present)
+                int ref_text_len = 0;
+                if (fread(&ref_text_len, 4, 1, fc) == 1 && ref_text_len > 0) {
+                    std::string cached_ref_text(ref_text_len, '\0');
+                    fread(&cached_ref_text[0], 1, ref_text_len, fc);
+                    cached_ref_text_ = cached_ref_text;
+                    printf("\n--- Loaded ref cache: %s (%dx%d codes, spk=%d, ref_text=%d chars) ---\n",
+                           params.ref_cache.c_str(), nq, nf, spk_dim, ref_text_len);
+                } else {
+                    printf("\n--- Loaded ref cache: %s (%dx%d codes, spk=%d, no ref_text) ---\n",
+                           params.ref_cache.c_str(), nq, nf, spk_dim);
+                }
                 used_cache = true;
-                printf("\n--- Loaded ref cache: %s (%dx%d codes, spk=%d dims) ---\n",
-                       params.ref_cache.c_str(), nq, nf, spk_dim);
             }
             fclose(fc);
         }
@@ -307,8 +318,13 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
                 fwrite(ref_codes[q].data(), sizeof(int), nf, fc);
             fwrite(&spk_dim, 4, 1, fc);
             fwrite(spk_embedding.data(), sizeof(float), spk_dim, fc);
+            // Save ref_text
+            int ref_text_len = (int)params.ref_text.size();
+            fwrite(&ref_text_len, 4, 1, fc);
+            fwrite(params.ref_text.data(), 1, ref_text_len, fc);
             fclose(fc);
-            printf("  Saved ref cache: %s\n", params.ref_cache.c_str());
+            printf("  Saved ref cache: %s (ref_text=%d chars)\n",
+                   params.ref_cache.c_str(), ref_text_len);
         }
     }
 
@@ -319,7 +335,8 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     // Step 4: Tokenize text
     printf("\n--- Step 4: Tokenize text ---\n");
     std::vector<int> ref_text_tokens, target_text_tokens;
-    tokenize_tts_text(params.ref_text, params.text,
+    tokenize_tts_text(cached_ref_text_.empty() ? params.ref_text : cached_ref_text_,
+                       params.text,
                        ref_text_tokens, target_text_tokens);
 
     auto prefill_end = std::chrono::high_resolution_clock::now();

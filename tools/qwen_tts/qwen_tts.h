@@ -40,6 +40,7 @@ public:
 private:
     QwenTTSParams params_;
     bool loaded_ = false;
+    std::string cached_ref_text_;  // ref_text from cache file
 
     // Sub-components
     BpeTokenizer tokenizer_;
