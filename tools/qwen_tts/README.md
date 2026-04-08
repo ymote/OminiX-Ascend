@@ -89,6 +89,29 @@ make qwen_tts -j$(nproc)
   -t "Another sentence with same voice." -o out2.wav
 ```
 
+### 使用内置语音（Built-in Voices）
+
+项目自带一组预置音色，使用前先烘焙缓存（仅需一次）：
+
+```bash
+# 一次性烘焙所有内置音色 (依赖已构建的 build/bin/qwen_tts)
+tools/qwen_tts/scripts/bake_voices.sh
+
+# 查看可用音色
+./build/bin/qwen_tts --list_voices
+
+# 直接按音色 id 推理
+./build/bin/qwen_tts \
+  -m tools/qwen_tts/gguf --tokenizer_dir tools/qwen_tts/gguf \
+  --voice ellen \
+  --talker_model tools/qwen_tts/gguf/qwen_tts_talker_llama_q8_0.gguf \
+  --cp_model tools/qwen_tts/gguf/qwen_tts_cp_llama.gguf \
+  --n_gpu_layers 29 \
+  -t "Hello from a built-in voice." -o out.wav
+```
+
+音色清单由 `tools/qwen_tts/data/voices/voices.json` 维护，可通过 `--voices_dir` 指向其它目录。
+
 ### CLI Arguments
 
 | Argument | Short | Description | Default |
@@ -100,6 +123,9 @@ make qwen_tts -j$(nproc)
 | `--ref_audio` | `-r` | Reference audio path (24kHz recommended) | - |
 | `--ref_text` | | Reference audio transcript | - |
 | `--ref_cache` | | Pre-computed ref cache file (.bin) | - |
+| `--voice` | | Built-in voice id (see `--list_voices`) | - |
+| `--voices_dir` | | Directory containing `voices.json` | `tools/qwen_tts/data/voices` |
+| `--list_voices` | | List built-in voices and exit | - |
 | `--output` | `-o` | Output audio path | `output.wav` |
 | `--talker_model` | | Override Talker GGUF (for quantized models) | - |
 | `--cp_model` | | Override CP llama GGUF (for NPU acceleration) | - |

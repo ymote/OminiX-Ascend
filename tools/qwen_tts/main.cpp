@@ -1,8 +1,93 @@
 #include "qwen_tts.h"
 #include "audio_io.h"
+#include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sys/stat.h>
+
+// ---------------------------------------------------------------------------
+// Built-in voices: voices.json schema
+//   {
+//     "voices": [
+//       {"id": "ellen", "lang": "en", "desc": "...", "cache": "ellen.bin"},
+//       ...
+//     ]
+//   }
+// Each "cache" path is resolved relative to voices_dir.
+// ---------------------------------------------------------------------------
+
+static std::string default_voices_dir() {
+    // Search order: $CWD/tools/qwen_tts/data/voices, then data/voices
+    struct stat st;
+    const char* candidates[] = {
+        "tools/qwen_tts/data/voices",
+        "data/voices",
+        nullptr,
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode)) return candidates[i];
+    }
+    return "tools/qwen_tts/data/voices";
+}
+
+static bool load_voices_json(const std::string& voices_dir, nlohmann::json& out) {
+    std::string path = voices_dir + "/voices.json";
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        fprintf(stderr, "Error: cannot open %s\n", path.c_str());
+        return false;
+    }
+    try { f >> out; } catch (const std::exception& e) {
+        fprintf(stderr, "Error: failed to parse %s: %s\n", path.c_str(), e.what());
+        return false;
+    }
+    return true;
+}
+
+static int list_voices(const std::string& voices_dir) {
+    nlohmann::json j;
+    if (!load_voices_json(voices_dir, j)) return 1;
+    const auto& voices = j.value("voices", nlohmann::json::array());
+    printf("Built-in voices (from %s/voices.json):\n", voices_dir.c_str());
+    printf("  %-20s %-6s %s\n", "ID", "LANG", "DESCRIPTION");
+    printf("  %-20s %-6s %s\n", "--", "----", "-----------");
+    for (const auto& v : voices) {
+        std::string id   = v.value("id",   "");
+        std::string lang = v.value("lang", "");
+        std::string desc = v.value("desc", "");
+        printf("  %-20s %-6s %s\n", id.c_str(), lang.c_str(), desc.c_str());
+    }
+    if (voices.empty()) {
+        printf("  (no voices defined — run scripts/bake_voices.sh to populate)\n");
+    }
+    return 0;
+}
+
+static bool resolve_voice(const std::string& voices_dir, const std::string& id,
+                          std::string& out_cache_path) {
+    nlohmann::json j;
+    if (!load_voices_json(voices_dir, j)) return false;
+    for (const auto& v : j.value("voices", nlohmann::json::array())) {
+        if (v.value("id", "") == id) {
+            std::string cache = v.value("cache", "");
+            if (cache.empty()) {
+                fprintf(stderr, "Error: voice '%s' has no 'cache' field\n", id.c_str());
+                return false;
+            }
+            out_cache_path = voices_dir + "/" + cache;
+            struct stat st;
+            if (stat(out_cache_path.c_str(), &st) != 0) {
+                fprintf(stderr, "Error: voice cache file not found: %s\n", out_cache_path.c_str());
+                return false;
+            }
+            return true;
+        }
+    }
+    fprintf(stderr, "Error: unknown voice id '%s' (use --list_voices to see available)\n", id.c_str());
+    return false;
+}
 
 static void print_usage(const char* prog) {
     printf("Qwen3-TTS Voice Clone\n\n");
@@ -12,7 +97,11 @@ static void print_usage(const char* prog) {
     printf("  -t, --text <text>          Target text to synthesize\n");
     printf("  -r, --ref_audio <path>     Reference audio file (WAV, 24kHz)\n");
     printf("  --ref_text <text>          Reference audio transcript\n");
+    printf("  (or) --voice <id>          Use a built-in voice (see --list_voices)\n");
+    printf("  (or) --ref_cache <path>    Use a pre-computed speaker cache file\n");
     printf("\nOptional:\n");
+    printf("  --voices_dir <path>        Directory with voices.json (default: tools/qwen_tts/data/voices)\n");
+    printf("  --list_voices              List built-in voices and exit\n");
     printf("  --tokenizer_dir <path>     Tokenizer directory (vocab.json + merges.txt)\n");
     printf("                             Default: same as model_dir\n");
     printf("  --target_lang <lang>       Target language (English/Chinese, default: English)\n");
@@ -70,6 +159,13 @@ int main(int argc, char** argv) {
             params.cp_model = argv[++i];
         } else if (arg == "--ref_cache" && i + 1 < argc) {
             params.ref_cache = argv[++i];
+        } else if (arg == "--voice" && i + 1 < argc) {
+            params.voice = argv[++i];
+        } else if (arg == "--voices_dir" && i + 1 < argc) {
+            params.voices_dir = argv[++i];
+        } else if (arg == "--list_voices") {
+            std::string vdir = params.voices_dir.empty() ? default_voices_dir() : params.voices_dir;
+            return list_voices(vdir);
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             params.device = argv[++i];
         } else if ((arg == "-n" || arg == "--n_threads") && i + 1 < argc) {
@@ -100,11 +196,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Resolve --voice → --ref_cache
+    if (!params.voice.empty()) {
+        std::string vdir = params.voices_dir.empty() ? default_voices_dir() : params.voices_dir;
+        std::string cache_path;
+        if (!resolve_voice(vdir, params.voice, cache_path)) return 1;
+        if (!params.ref_cache.empty() && params.ref_cache != cache_path) {
+            fprintf(stderr, "Error: --voice and --ref_cache are mutually exclusive\n");
+            return 1;
+        }
+        params.ref_cache = cache_path;
+        printf("[voice] using built-in voice '%s' -> %s\n",
+               params.voice.c_str(), cache_path.c_str());
+    }
+
     bool has_ref_cache = !params.ref_cache.empty();
     bool has_ref_audio = !params.ref_audio.empty() && !params.ref_text.empty();
     if (params.model_dir.empty() || params.text.empty() ||
         (!has_ref_cache && !has_ref_audio)) {
-        fprintf(stderr, "Error: --model_dir, --text, and (--ref_audio + --ref_text or --ref_cache) are required\n\n");
+        fprintf(stderr, "Error: --model_dir, --text, and one of (--voice | --ref_cache | --ref_audio + --ref_text) are required\n\n");
         print_usage(argv[0]);
         return 1;
     }

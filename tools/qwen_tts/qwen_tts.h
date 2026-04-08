@@ -21,6 +21,8 @@ struct QwenTTSParams {
     std::string talker_model;       // Override Talker GGUF filename (e.g. qwen_tts_talker_llama_q4km.gguf)
     std::string cp_model;           // Override CP llama GGUF (for NPU acceleration)
     std::string ref_cache;          // Pre-computed ref_codes + spk_embedding cache file
+    std::string voice;              // Built-in voice id (resolved to ref_cache via voices.json)
+    std::string voices_dir;         // Directory containing voices.json + *.bin caches
     int n_threads = 8;
     int n_gpu_layers = 0;            // Number of layers to offload to GPU/NPU (0=CPU only)
     int max_new_tokens = 2048;
