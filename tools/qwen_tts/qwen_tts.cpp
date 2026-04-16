@@ -41,14 +41,24 @@ bool QwenTTS::load(const QwenTTSParams& params) {
     }
 
     // 2. Speaker Encoder (CPU: CANN 2.7x slower due to kernel launch overhead)
-    printf("\n[2/5] Loading speaker encoder...\n");
-    ContextParams spk_params;
-    spk_params.device_name = cpu_device;
-    spk_params.n_threads = params.n_threads;
-    if (!speaker_encoder_.load(model_dir + "qwen_tts_speaker_encoder.gguf",
-                                spk_params)) {
-        printf("FAIL: cannot load speaker encoder\n");
-        return false;
+    //    Skip for CustomVoice models which have built-in speaker embeddings
+    std::string spk_enc_path = model_dir + "qwen_tts_speaker_encoder.gguf";
+    bool has_speaker_encoder = false;
+    {
+        FILE *f = fopen(spk_enc_path.c_str(), "rb");
+        if (f) { fclose(f); has_speaker_encoder = true; }
+    }
+    if (has_speaker_encoder) {
+        printf("\n[2/5] Loading speaker encoder...\n");
+        ContextParams spk_params;
+        spk_params.device_name = cpu_device;
+        spk_params.n_threads = params.n_threads;
+        if (!speaker_encoder_.load(spk_enc_path, spk_params)) {
+            printf("FAIL: cannot load speaker encoder\n");
+            return false;
+        }
+    } else {
+        printf("\n[2/5] Skipping speaker encoder (CustomVoice model)\n");
     }
 
     // 3. Speech Tokenizer Encoder (testing CANN)
@@ -111,6 +121,16 @@ bool QwenTTS::load(const QwenTTSParams& params) {
     auto t1 = std::chrono::high_resolution_clock::now();
     double dt = std::chrono::duration<double>(t1 - t0).count();
     printf("\n=== All models loaded in %.1f seconds ===\n", dt);
+
+    // Load standalone transformer (correct MRoPE for xvec/customvoice modes)
+    std::string talker_llama = params.talker_model.empty()
+        ? model_dir + "qwen_tts_talker_llama.gguf" : params.talker_model;
+    standalone_tfm_ = tts_transformer_load(talker_llama.c_str(), params.n_threads);
+    if (standalone_tfm_) {
+        printf("[qwen_tts] standalone transformer loaded (correct MRoPE)\n");
+    } else {
+        printf("[qwen_tts] WARNING: standalone transformer failed to load, xvec/customvoice may produce distorted audio\n");
+    }
 
     loaded_ = true;
     return true;
@@ -465,5 +485,122 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     printf("  Total RTF:     %.2fx (end-to-end / audio)\n",
            total_time / target_duration);
 
+    return true;
+}
+
+// ============================================================================
+// X-vector voice clone (no ref audio codec, just speaker embedding)
+// ============================================================================
+
+bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& audio_out) {
+    if (!loaded_) return false;
+
+    printf("\n=== X-Vector Voice Clone ===\n");
+    printf("  Ref audio: %s\n", params.ref_audio.c_str());
+    printf("  Target text: %s\n", params.text.c_str());
+    printf("  Language: %s\n", params.target_lang.c_str());
+
+    // Lowercase language for map lookup (keys are lowercase in GGUF config)
+    std::string lang = params.target_lang;
+    for (auto &c : lang) c = tolower(c);
+
+    // Extract speaker embedding from ref audio
+    std::vector<float> ref_audio;
+    if (!audio_io::load_audio(params.ref_audio, 24000, ref_audio)) {
+        printf("FAIL: cannot load ref audio\n");
+        return false;
+    }
+    std::vector<float> spk_embedding;
+    if (!speaker_encoder_.extract(ref_audio, 24000, spk_embedding)) {
+        printf("FAIL: speaker embedding extraction failed\n");
+        return false;
+    }
+    printf("  Speaker embedding: %zu dims\n", spk_embedding.size());
+
+    // Tokenize target text
+    std::vector<int> ref_text_tokens, target_text_tokens;
+    tokenize_tts_text("", params.text, ref_text_tokens, target_text_tokens);
+
+    // Generate codec tokens via x-vector mode
+    std::vector<std::vector<int>> codec_tokens;
+    if (standalone_tfm_) {
+        // Use standalone transformer (correct MRoPE) for backbone
+        printf("  Using standalone transformer (correct MRoPE)\n");
+        if (!talker_.generate_xvec_standalone(target_text_tokens, spk_embedding,
+                                    lang, codec_tokens,
+                                    params.max_new_tokens, params.sampling,
+                                    standalone_tfm_)) {
+            printf("FAIL: standalone generation failed\n");
+            return false;
+        }
+    } else {
+        // Fallback to llama.cpp backbone (distorted but functional)
+        if (!talker_.generate_xvec(target_text_tokens, spk_embedding,
+                                    lang, codec_tokens,
+                                    params.max_new_tokens, params.sampling)) {
+            printf("FAIL: generation failed\n");
+            return false;
+        }
+    }
+
+    int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
+    printf("  Generated %d codec frames\n", n_gen_frames);
+
+    // Decode to audio
+    std::vector<float> full_audio;
+    if (!tokenizer_decoder_.decode(codec_tokens, full_audio)) {
+        printf("FAIL: audio decoding failed\n");
+        return false;
+    }
+
+    // No ref audio to cut (x-vector mode doesn't include ref in codec)
+    audio_out = std::move(full_audio);
+    printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
+           audio_out.size(), audio_out.size() / 24000.0f);
+    return true;
+}
+
+// ============================================================================
+// CustomVoice (built-in speaker, no ref audio needed)
+// ============================================================================
+
+bool QwenTTS::generate_customvoice(const QwenTTSParams& params, std::vector<float>& audio_out) {
+    if (!loaded_) return false;
+
+    printf("\n=== CustomVoice Generation ===\n");
+    printf("  Speaker: %s\n", params.speaker.c_str());
+    printf("  Target text: %s\n", params.text.c_str());
+    printf("  Language: %s\n", params.target_lang.c_str());
+
+    // Lowercase language for map lookup
+    std::string lang = params.target_lang;
+    for (auto &c : lang) c = tolower(c);
+
+    // Tokenize target text
+    std::vector<int> ref_text_tokens, target_text_tokens;
+    tokenize_tts_text("", params.text, ref_text_tokens, target_text_tokens);
+
+    // Generate codec tokens via customvoice mode
+    std::vector<std::vector<int>> codec_tokens;
+    if (!talker_.generate_customvoice(target_text_tokens, params.speaker,
+                                      lang, codec_tokens,
+                                      params.max_new_tokens, params.sampling)) {
+        printf("FAIL: generation failed\n");
+        return false;
+    }
+
+    int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
+    printf("  Generated %d codec frames\n", n_gen_frames);
+
+    // Decode to audio
+    std::vector<float> full_audio;
+    if (!tokenizer_decoder_.decode(codec_tokens, full_audio)) {
+        printf("FAIL: audio decoding failed\n");
+        return false;
+    }
+
+    audio_out = std::move(full_audio);
+    printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
+           audio_out.size(), audio_out.size() / 24000.0f);
     return true;
 }
