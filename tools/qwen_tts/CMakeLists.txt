@@ -27,9 +27,14 @@ list(APPEND SRC_FILES ${KISSFFT_SRC})
 add_executable(${TARGET} ${SRC_FILES})
 
 target_link_libraries     (${TARGET} PUBLIC ggml llama qwen_common)
+
+# Native CANN CP engine: prototype exists (cp_cann_engine.cpp) but requires
+# linking against CANN's aclnn libraries which have circular dependency issues.
+# TODO: Either compile as part of ggml-cann shared lib, or use dlsym at runtime.
 target_link_libraries     (${TARGET} PRIVATE Threads::Threads)
 target_include_directories(${TARGET} PUBLIC  .)
-target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR})
+target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR}
+    $ENV{ASCEND_TOOLKIT_HOME}/include)
 target_compile_features   (${TARGET} PRIVATE cxx_std_17)
 
 # Enable NEON F16 intrinsics for ARM
