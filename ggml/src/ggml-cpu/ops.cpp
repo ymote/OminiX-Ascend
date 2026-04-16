@@ -5833,9 +5833,12 @@ static void ggml_compute_forward_rope_flt(
                         rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
                         break;
                     case GGML_ROPE_TYPE_NEOX:
+                        rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data);
+                        break;
                     case GGML_ROPE_TYPE_MROPE:
                     case GGML_ROPE_TYPE_IMROPE:
-                        rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data);
+                        // MRoPE: consecutive pair rotation (matching HF interleaved=True)
+                        rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
                         break;
                     case GGML_ROPE_TYPE_VISION:
                         rotate_pairs<T>(ne0, n_dims, cache, src, dst_data);

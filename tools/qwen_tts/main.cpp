@@ -33,6 +33,8 @@ static void print_usage(const char* prog) {
     printf("  --repetition_penalty <f>   Repetition penalty (default: 1.05)\n");
     printf("  --greedy                   Disable sampling (use greedy decoding)\n");
     printf("  --seed <int>               Random seed for sampling (default: 42)\n");
+    printf("  --mode <mode>              Generation mode: icl (default), xvec, customvoice\n");
+    printf("  --speaker <name>           Speaker name for customvoice mode (e.g., serena)\n");
     printf("  -p, --profiling            Enable profiling\n");
     printf("  -h, --help                 Show this help\n");
     printf("\nExample:\n");
@@ -91,6 +93,10 @@ int main(int argc, char** argv) {
             params.sampling.cp_do_sample = false;
         } else if (arg == "--seed" && i + 1 < argc) {
             set_sampling_seed(std::atoi(argv[++i]));
+        } else if (arg == "--mode" && i + 1 < argc) {
+            params.mode = argv[++i];
+        } else if (arg == "--speaker" && i + 1 < argc) {
+            params.speaker = argv[++i];
         } else if (arg == "-p" || arg == "--profiling") {
             params.profiling = true;
         } else {
@@ -100,13 +106,29 @@ int main(int argc, char** argv) {
         }
     }
 
-    bool has_ref_cache = !params.ref_cache.empty();
-    bool has_ref_audio = !params.ref_audio.empty() && !params.ref_text.empty();
-    if (params.model_dir.empty() || params.text.empty() ||
-        (!has_ref_cache && !has_ref_audio)) {
-        fprintf(stderr, "Error: --model_dir, --text, and (--ref_audio + --ref_text or --ref_cache) are required\n\n");
-        print_usage(argv[0]);
-        return 1;
+    // Validate based on mode
+    if (params.mode == "customvoice") {
+        if (params.model_dir.empty() || params.text.empty() || params.speaker.empty()) {
+            fprintf(stderr, "Error: --model_dir, --text, and --speaker required for customvoice mode\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+    } else if (params.mode == "xvec") {
+        if (params.model_dir.empty() || params.text.empty() || params.ref_audio.empty()) {
+            fprintf(stderr, "Error: --model_dir, --text, and --ref_audio required for xvec mode\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+    } else {
+        // ICL mode (default)
+        bool has_ref_cache = !params.ref_cache.empty();
+        bool has_ref_audio = !params.ref_audio.empty() && !params.ref_text.empty();
+        if (params.model_dir.empty() || params.text.empty() ||
+            (!has_ref_cache && !has_ref_audio)) {
+            fprintf(stderr, "Error: --model_dir, --text, and (--ref_audio + --ref_text or --ref_cache) are required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
     QwenTTS tts;
@@ -115,11 +137,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Warmup run (same input, discard output) to trigger lazy kernel compilation
-    {
+    // Warmup run (ICL mode only — xvec/customvoice don't need ref audio warmup)
+    if (params.mode == "icl") {
         printf("\n=== Warmup run ===\n");
         QwenTTSParams warmup_params = params;
-        warmup_params.max_new_tokens = 5;  // minimal generation
+        warmup_params.max_new_tokens = 5;
         warmup_params.profiling = false;
         std::vector<float> warmup_audio;
         tts.generate(warmup_params, warmup_audio);
@@ -127,7 +149,15 @@ int main(int argc, char** argv) {
     }
 
     std::vector<float> audio_out;
-    if (!tts.generate(params, audio_out)) {
+    bool ok = false;
+    if (params.mode == "xvec") {
+        ok = tts.generate_xvec(params, audio_out);
+    } else if (params.mode == "customvoice") {
+        ok = tts.generate_customvoice(params, audio_out);
+    } else {
+        ok = tts.generate(params, audio_out);
+    }
+    if (!ok) {
         fprintf(stderr, "Failed to generate audio\n");
         return 1;
     }

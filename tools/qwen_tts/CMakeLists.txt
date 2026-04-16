@@ -8,6 +8,7 @@ set(SRC_FILES
     main.cpp
     qwen_tts.cpp
     talker.cpp
+    tts_transformer.cpp
     speaker_encoder.cpp
     speech_tokenizer_encoder.cpp
     speech_tokenizer_decoder.cpp

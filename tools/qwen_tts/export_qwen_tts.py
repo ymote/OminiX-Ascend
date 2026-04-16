@@ -149,6 +149,11 @@ def export_talker(model, output_dir: str):
         lang_ids = cfg.codec_language_id
         writer.add_string("codec_language_ids_json", json.dumps(lang_ids))
 
+    # Add speaker ID mapping (CustomVoice models)
+    if hasattr(cfg, "spk_id") and cfg.spk_id:
+        writer.add_string("spk_ids_json", json.dumps(cfg.spk_id))
+        print(f"  Speaker IDs: {list(cfg.spk_id.keys())}")
+
     # Extract talker state dict, excluding code_predictor
     full_sd = talker.state_dict()
     talker_sd = {k: v for k, v in full_sd.items()

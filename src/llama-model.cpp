@@ -1131,6 +1131,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             {
                 ml.get_key(LLM_KV_POOLING_TYPE, hparams.pooling_type, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                // MRoPE sections (optional, for TTS talker)
+                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
                 switch (hparams.n_layer) {
                     case 28: type = hparams.n_embd == 1024 ? LLM_TYPE_0_6B : LLM_TYPE_1_7B; break;
                     case 36: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_8B; break;
@@ -2676,6 +2678,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+
+    // Override rope_type for MRoPE (TTS talker with interleaved rotation)
+    if (hparams.rope_sections[0] > 0 && hparams.rope_type != LLAMA_ROPE_TYPE_MROPE) {
+        LLAMA_LOG_INFO("%s: MRoPE sections=[%d,%d,%d,%d], setting rope_type MROPE\n", __func__,
+                       hparams.rope_sections[0], hparams.rope_sections[1],
+                       hparams.rope_sections[2], hparams.rope_sections[3]);
+        hparams.rope_type = LLAMA_ROPE_TYPE_MROPE;
+    }
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {

@@ -3204,7 +3204,14 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         GGML_ASSERT(n_dims == ne0 / 2);
     }
 
-    if (is_imrope || mrope_used) {
+    // MRoPE needs neox-style cos/sin duplication [θ1,θ1,θ2,θ2,...] for cache,
+    // but consecutive-pair rotation (mode=1) for the actual rotation.
+    bool mrope_consecutive = false;
+    if (mrope_used && !is_imrope && !is_vision) {
+        // TTS MRoPE: interleaved=true → consecutive pair rotation
+        is_neox = true;  // cos/sin duplication pattern
+        mrope_consecutive = true;  // but rotation uses consecutive pairs
+    } else if (is_imrope || is_vision) {
         is_neox = true;
     }
 
@@ -3377,7 +3384,11 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
     return;
 #endif
+    // mode 0 = NEOX (half-split), mode 1 = NORMAL (consecutive pairs)
     int64_t acl_mode = is_neox ? 0 : 1;
+    if (mrope_consecutive) {
+        acl_mode = 1;  // force consecutive-pair rotation for TTS MRoPE
+    }
 
     // Pre-define head and tail dimensions for reuse
     int64_t head_ne[GGML_MAX_DIMS] = { rope_dims, ne01, ne02, ne03 };

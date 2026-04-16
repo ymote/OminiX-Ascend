@@ -78,6 +78,16 @@ def export_talker_llama(model, output_dir: str, use_f32: bool = False):
     writer.add_feed_forward_length(cfg.intermediate_size)
     writer.add_layer_norm_rms_eps(float(cfg.rms_norm_eps))
     writer.add_rope_freq_base(float(cfg.rope_theta))
+    # MRoPE: interleaved rotation with 3 sections (temporal + 2 spatial)
+    # Critical for correct attention computation in TTS
+    if hasattr(cfg, 'rope_scaling') and cfg.rope_scaling:
+        sections = cfg.rope_scaling.get('mrope_section', [])
+        if sections:
+            # Pad to 4 elements (llama.cpp expects 4)
+            while len(sections) < 4:
+                sections.append(0)
+            writer.add_rope_dimension_count(sum(s * 2 for s in sections[:3]))  # total rope dims
+            writer.add_array("qwen3.rope.dimension_sections", sections[:4])
     writer.add_vocab_size(cfg.vocab_size)  # 3072 (codec vocab)
 
     # Dummy tokenizer (required by llama.cpp, not actually used)

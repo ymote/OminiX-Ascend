@@ -1,5 +1,8 @@
 #pragma once
 
+// Forward declaration for standalone transformer
+struct TtsTransformer;
+
 #include "build_graph.h"
 #include "ctx_manager.h"
 #include "ggml.h"
@@ -60,6 +63,8 @@ struct TalkerConfig {
     int codec_think_eos_id = 2157;
     // Language IDs (parsed from JSON)
     std::map<std::string, int> language_ids;
+    // Speaker IDs for CustomVoice model (parsed from JSON spk_id)
+    std::map<std::string, int> spk_ids;
 };
 
 // ============================================================================
@@ -190,7 +195,69 @@ public:
                   int max_new_tokens = 2048,
                   const TalkerSamplingParams &sampling = TalkerSamplingParams());
 
+    // Generate codec tokens (x-vector voice cloning — no ref audio codec)
+    //   Same as MLX synthesize_voice_clone: uses speaker embedding only.
+    //   Prefill: [role(3)] + [codec_prefix(4) overlaid on tts_pad] + [spk(1)] + [bos+pad(1)] + [first_text+bos(1)]
+    bool generate_xvec(const std::vector<int> &target_text_tokens,
+                       const std::vector<float> &spk_embedding,
+                       const std::string &language,
+                       std::vector<std::vector<int>> &codec_tokens,
+                       int max_new_tokens = 2048,
+                       const TalkerSamplingParams &sampling = TalkerSamplingParams());
+
+    // Generate codec tokens (CustomVoice built-in speaker mode — no ref audio)
+    //   Uses discrete speaker token ID instead of continuous speaker embedding.
+    //   Prefill: [role(3)] + [codec_prefix(5) with spk_id overlaid on tts_pad] + [bos+pad(1)] + [first_text+bos(1)]
+    // X-vector clone using standalone transformer (correct MRoPE, bypasses llama.cpp)
+    bool generate_xvec_standalone(const std::vector<int> &target_text_tokens,
+                       const std::vector<float> &spk_embedding,
+                       const std::string &language,
+                       std::vector<std::vector<int>> &codec_tokens,
+                       int max_new_tokens,
+                       const TalkerSamplingParams &sampling,
+                       TtsTransformer *tfm);
+
+    bool generate_customvoice(const std::vector<int> &target_text_tokens,
+                              const std::string &speaker,
+                              const std::string &language,
+                              std::vector<std::vector<int>> &codec_tokens,
+                              int max_new_tokens = 2048,
+                              const TalkerSamplingParams &sampling = TalkerSamplingParams());
+
     const TalkerConfig &get_config() const { return talker_config_; }
+
+    // ---- Public accessors for C API (qwen_tts_api.cpp) ----
+
+    void cache_tts_embeddings_public() { cache_tts_embeddings(); }
+
+    void lookup_text_projected_public(int token_id, float *out) {
+        cache_tts_embeddings();
+        lookup_text_projected(token_id, out);
+    }
+
+    void lookup_codec_embedding_public(int token_id, float *out) {
+        lookup_codec_embedding(token_id, out);
+    }
+
+    void apply_codec_head_public(const float *hidden, float *logits) {
+        apply_codec_head(hidden, logits);
+    }
+
+    void reset_cache_public();
+
+    // Forward pass for C API: feed embeddings, get logits + hidden from last pos
+    int forward_public(const float *input_embeds, int seq_len,
+                       float *logits_out, float *hidden_out);
+
+    // Generation embedding using correct CP codec embeddings for groups 1-15
+    void compute_next_embedding_public(int group0, const std::vector<int> &groups_1_15, float *out) {
+        compute_next_embedding(group0, groups_1_15, out);
+    }
+
+    const float* get_tts_pad_embed() {
+        cache_tts_embeddings();
+        return tts_pad_embed_.data();
+    }
 
     // TTS special text token IDs (from Qwen3-TTS config)
     static constexpr int tts_bos_token_id = 151672;
@@ -212,6 +279,7 @@ private:
     llama_model *llama_model_ = nullptr;
     llama_context *llama_ctx_ = nullptr;
     int n_embd_ = 0;
+    int api_cur_pos_ = 0;  // Position counter for C API forward_public
 
     // CP via llama.cpp (NPU acceleration)
     llama_model *cp_llama_model_ = nullptr;
@@ -255,6 +323,22 @@ private:
                                  const std::string &language,
                                  std::vector<float> &embeddings,
                                  int &seq_len);
+
+    // Build prefill for x-vector voice clone (10 positions, matches MLX)
+    //   [role(3)] + [codec_prefix(4)] + [spk_embed(1)] + [bos+pad(1)] + [first_text+bos(1)]
+    bool build_xvec_prefill(const std::vector<int> &target_text_tokens,
+                            const std::vector<float> &spk_embedding,
+                            const std::string &language,
+                            std::vector<float> &embeddings,
+                            int &seq_len);
+
+    // Build prefill for CustomVoice (10 positions)
+    //   [role(3)] + [codec_prefix(5) with spk_id] + [bos+pad(1)] + [first_text+bos(1)]
+    bool build_customvoice_prefill(const std::vector<int> &target_text_tokens,
+                                   int spk_token_id,
+                                   const std::string &language,
+                                   std::vector<float> &embeddings,
+                                   int &seq_len);
 
     // Compute text_proj(text_emb(token_id)) into out
     void lookup_text_projected(int token_id, float *out);

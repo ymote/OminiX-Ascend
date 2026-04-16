@@ -5,6 +5,7 @@
 #include "speech_tokenizer_encoder.h"
 #include "speech_tokenizer_decoder.h"
 #include "talker.h"
+#include "tts_transformer.h"
 #include <string>
 #include <vector>
 
@@ -25,6 +26,9 @@ struct QwenTTSParams {
     int n_gpu_layers = 0;            // Number of layers to offload to GPU/NPU (0=CPU only)
     int max_new_tokens = 2048;
     bool profiling = false;
+    // Mode: "icl" (default, voice clone with ref audio), "xvec" (x-vector clone), "customvoice" (built-in speaker)
+    std::string mode = "icl";
+    std::string speaker;             // Speaker name for customvoice mode (e.g., "serena")
     // Sampling parameters (matching Python defaults)
     TalkerSamplingParams sampling;
 };
@@ -32,10 +36,12 @@ struct QwenTTSParams {
 class QwenTTS {
 public:
     QwenTTS() = default;
-    ~QwenTTS() = default;
+    ~QwenTTS() { if (standalone_tfm_) tts_transformer_free(standalone_tfm_); }
 
     bool load(const QwenTTSParams& params);
     bool generate(const QwenTTSParams& params, std::vector<float>& audio_out);
+    bool generate_xvec(const QwenTTSParams& params, std::vector<float>& audio_out);
+    bool generate_customvoice(const QwenTTSParams& params, std::vector<float>& audio_out);
 
 private:
     QwenTTSParams params_;
@@ -48,6 +54,7 @@ private:
     SpeechTokenizerEncoder tokenizer_encoder_;
     SpeechTokenizerDecoder tokenizer_decoder_;
     TalkerLLM talker_;
+    TtsTransformer *standalone_tfm_ = nullptr;  // Correct MRoPE backbone for xvec/customvoice
 
     // Tokenize text — produces separate ref and target text token vectors
     void tokenize_tts_text(const std::string &ref_text,
