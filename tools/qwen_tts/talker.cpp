@@ -1416,7 +1416,7 @@ bool TalkerLLM::predict_code_groups(
     if (cp_use_llama_) {
         // ============================================================
         // NPU path: CP transformer via llama.cpp
-        // input_proj and lm_heads remain on CPU (negligible compute)
+        // input_proj and lm_heads remain on CPU (NEON-accelerated)
         // ============================================================
         llama_memory_clear(llama_get_memory(cp_llama_ctx_), true);
 
@@ -1456,8 +1456,15 @@ bool TalkerLLM::predict_code_groups(
         memcpy(cp_out.data(), llama_embd, cp_hidden * sizeof(float));
 
         // Decode groups 1-15 autoregressively
+        // Optimization: reuse a single batch object to avoid alloc/free per iteration
+        llama_batch step_batch = llama_batch_init(1, cp_hidden, 1);
+        step_batch.n_tokens = 1;
+        step_batch.n_seq_id[0] = 1;
+        step_batch.seq_id[0][0] = 0;
+        step_batch.logits[0] = 1;
+
         for (int g = 0; g < n_groups; g++) {
-            // Apply lm_head on CPU
+            // Apply lm_head on CPU (NEON: [2048, 1024] × [1024] → [2048])
             cp_matvec_f32(cp_f32_.lm_head_w[g].data(), nullptr,
                           cp_out.data(), logits.data(), vocab_size, cp_hidden);
 
@@ -1473,20 +1480,15 @@ bool TalkerLLM::predict_code_groups(
                 cp_matvec_f32(cp_f32_.proj_w.data(), cp_f32_.proj_b.data(),
                               emb_buf.data(), projected.data(), cp_hidden, talker_hidden);
 
-                llama_batch batch = llama_batch_init(1, cp_hidden, 1);
-                batch.n_tokens = 1;
-                memcpy(batch.embd, projected.data(), cp_hidden * sizeof(float));
-                batch.pos[0] = g + 2;
-                batch.n_seq_id[0] = 1;
-                batch.seq_id[0][0] = 0;
-                batch.logits[0] = 1;
-                llama_decode(cp_llama_ctx_, batch);
-                llama_batch_free(batch);
+                memcpy(step_batch.embd, projected.data(), cp_hidden * sizeof(float));
+                step_batch.pos[0] = g + 2;
+                llama_decode(cp_llama_ctx_, step_batch);
 
                 llama_embd = llama_get_embeddings_ith(cp_llama_ctx_, -1);
                 memcpy(cp_out.data(), llama_embd, cp_hidden * sizeof(float));
             }
         }
+        llama_batch_free(step_batch);
 
         return true;
     }
@@ -1542,6 +1544,21 @@ bool TalkerLLM::predict_code_groups(
     }
 
     return true;
+}
+
+// ============================================================================
+// TalkerLLM: ensure_talker_step_batch (pre-allocate reusable batch)
+// ============================================================================
+
+void TalkerLLM::ensure_talker_step_batch() {
+    if (talker_step_batch_ready_) return;
+    int dim = n_embd_;
+    talker_step_batch_ = llama_batch_init(1, dim, 1);
+    talker_step_batch_.n_tokens = 1;
+    talker_step_batch_.n_seq_id[0] = 1;
+    talker_step_batch_.seq_id[0][0] = 0;
+    talker_step_batch_.logits[0] = 1;
+    talker_step_batch_ready_ = true;
 }
 
 // ============================================================================
@@ -1669,6 +1686,9 @@ bool TalkerLLM::generate(
     double total_llm_ms = 0, total_cp_ms = 0, total_emb_ms = 0, total_head_ms = 0;
     double total_sample_ms = 0, total_trailing_ms = 0, total_loop_ms = 0;
 
+    // Pre-allocate reusable batch for per-step talker decode
+    ensure_talker_step_batch();
+
     for (int step = 0; step < max_new_tokens; step++) {
         auto loop_t0 = std::chrono::high_resolution_clock::now();
         auto head_t0 = loop_t0;
@@ -1750,22 +1770,15 @@ bool TalkerLLM::generate(
         auto trailing_t1 = std::chrono::high_resolution_clock::now();
         total_trailing_ms += std::chrono::duration<double, std::milli>(trailing_t1 - trailing_t0).count();
 
-        // 4e. Feed to llama.cpp
+        // 4e. Feed to llama.cpp (reuse pre-allocated batch)
         auto llm_t0 = std::chrono::high_resolution_clock::now();
-        llama_batch step_batch = llama_batch_init(1, dim, 1);
-        step_batch.n_tokens = 1;
-        memcpy(step_batch.embd, next_emb.data(), dim * sizeof(float));
-        step_batch.pos[0] = cur_pos;
-        step_batch.n_seq_id[0] = 1;
-        step_batch.seq_id[0][0] = 0;
-        step_batch.logits[0] = 1;
+        memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
+        talker_step_batch_.pos[0] = cur_pos;
 
-        if (llama_decode(llama_ctx_, step_batch) != 0) {
+        if (llama_decode(llama_ctx_, talker_step_batch_) != 0) {
             printf("[talker] decode failed at step %d\n", step);
-            llama_batch_free(step_batch);
             return false;
         }
-        llama_batch_free(step_batch);
         cur_pos++;
 
         // 4f. Get new hidden states
@@ -1898,15 +1911,11 @@ bool TalkerLLM::generate_xvec(
             for (int j = 0; j < dim; j++) next_emb[j] += tts_pad_embed_[j];
         }
 
-        // Forward one step (MRoPE: 4× position layout)
-        llama_batch sb = llama_batch_init(1, dim, 1);
-        sb.n_tokens = 1;  memcpy(sb.embd, next_emb.data(), dim * sizeof(float));
-        free(sb.pos);
-        sb.pos = (llama_pos *)calloc(4, sizeof(llama_pos));
-        sb.pos[0] = cur_pos;  // temporal; h/w/extra = 0
-        sb.n_seq_id[0] = 1;  sb.seq_id[0][0] = 0;  sb.logits[0] = 1;
-        if (llama_decode(llama_ctx_, sb) != 0) { llama_batch_free(sb); return false; }
-        llama_batch_free(sb);
+        // Forward one step (reuse pre-allocated batch)
+        ensure_talker_step_batch();
+        memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
+        talker_step_batch_.pos[0] = cur_pos;
+        if (llama_decode(llama_ctx_, talker_step_batch_) != 0) return false;
         cur_pos++;
         embd = llama_get_embeddings_ith(llama_ctx_, -1);
         if (!embd) return false;

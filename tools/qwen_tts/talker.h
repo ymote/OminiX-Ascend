@@ -303,6 +303,11 @@ private:
     bool head_f32_ready_ = false;
     void init_head_f32_weights();
 
+    // Pre-allocated batch for per-step talker decode (avoids alloc/free per iteration)
+    llama_batch talker_step_batch_ = {};
+    bool talker_step_batch_ready_ = false;
+    void ensure_talker_step_batch();
+
     // Trailing text hidden for streaming ICL generation
     std::vector<float> trailing_text_;   // [trailing_text_len_ * dim] or [dim] if just tts_pad
     int trailing_text_len_ = 0;          // 0 = use tts_pad for all steps
