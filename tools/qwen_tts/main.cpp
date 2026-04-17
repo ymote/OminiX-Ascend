@@ -23,8 +23,13 @@ static void print_usage(const char* prog) {
     printf("                             If not exists + ref_audio given: encode and save\n");
     printf("  --talker_model <path>      Override Talker GGUF file (for quantized models)\n");
     printf("  --cp_model <path>          Override CP llama GGUF (for NPU acceleration)\n");
-    printf("  --cp_cann                  Use native CANN CP engine (Ascend only, bypasses llama.cpp)\n");
-    printf("  --native_talker            Use native CANN Talker engine (Ascend only, bypasses llama.cpp)\n");
+    printf("  --cp_cann                  [DEFAULT] Use native CANN CP engine (Ascend only).\n");
+    printf("                             Disable with --llama_fallback.\n");
+    printf("  --native_talker            [DEFAULT] Use native CANN Talker engine (Ascend only).\n");
+    printf("                             Disable with --llama_fallback.\n");
+    printf("  --llama_fallback           Force pure llama.cpp path (disables --cp_cann and\n");
+    printf("                             --native_talker). Use as escape hatch if the native\n");
+    printf("                             path regresses.\n");
     printf("  -d, --device <device>      Compute device (CPU, default: CPU)\n");
     printf("  -n, --n_threads <num>      Thread count (default: 8)\n");
     printf("  --n_gpu_layers <num>       Layers to offload to GPU/NPU (default: 0)\n");
@@ -82,6 +87,9 @@ int main(int argc, char** argv) {
             params.cp_cann = true;
         } else if (arg == "--native_talker") {
             params.native_talker = true;
+        } else if (arg == "--llama_fallback") {
+            params.cp_cann = false;
+            params.native_talker = false;
         } else if (arg == "--ref_cache" && i + 1 < argc) {
             params.ref_cache = argv[++i];
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
