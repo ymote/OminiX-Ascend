@@ -458,7 +458,11 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     int cut = (int)((long long)n_ref_frames * (long long)full_audio.size() / std::max(total_frames, 1));
     printf("  Cutting first %d samples (%.2f sec) -- ref audio portion\n",
            cut, cut / 24000.0f);
-    if (cut > 0 && cut < (int)full_audio.size()) {
+    if (getenv("QWEN_TTS_KEEP_REF") != nullptr) {
+        printf("  QWEN_TTS_KEEP_REF set — emitting full decoded audio "
+               "(ref + target), for decoder round-trip check.\n");
+        audio_out = std::move(full_audio);
+    } else if (cut > 0 && cut < (int)full_audio.size()) {
         audio_out.assign(full_audio.begin() + cut, full_audio.end());
     } else {
         audio_out = std::move(full_audio);

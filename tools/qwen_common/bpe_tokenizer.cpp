@@ -182,8 +182,15 @@ bool BpeTokenizer::load(const std::string &vocab_path,
             }
             printf("[tokenizer] loaded %zu special tokens\n", special_tokens_.size());
         } else {
-            printf("[tokenizer] WARNING: %s not found, special tokens will be unavailable\n",
-                   config_path.c_str());
+            fprintf(stderr,
+                "\n[tokenizer] ERROR: tokenizer_config.json not found at %s\n"
+                "  Without it, role-prefix markers like <|im_start|> get BPE'd as\n"
+                "  raw text, which silently corrupts prefill and makes the model\n"
+                "  emit nonsense audio ('Oh.', 'I'm sorry.' etc.). Copy the\n"
+                "  tokenizer_config.json from the Hugging Face model repo into\n"
+                "  the same directory as vocab.json, then rerun.\n\n",
+                config_path.c_str());
+            return false;
         }
     }
 
