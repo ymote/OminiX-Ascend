@@ -84,12 +84,14 @@ column -t "$summary" || cat "$summary"
 echo
 echo "Audio samples in: $WORK_DIR"
 
-# Simple throughput gate check (M2.5 ≥ 20 fps on the longest native run)
-NATIVE_FPS_MIN=$(awk -F'\t' 'NR>1 && $3=="native" && $7!="-" && $7+0>0 {print $7}' "$summary" | sort -g | head -1)
+# Throughput gate: min fps across native runs with ≥ 150 frames (amortizes
+# CANN's JIT warmup cost — short runs are dominated by first-call overhead,
+# not steady-state throughput).
+NATIVE_FPS_MIN=$(awk -F'\t' 'NR>1 && $3=="native" && $4+0>=150 && $7!="-" && $7+0>0 {print $7}' "$summary" | sort -g | head -1)
 if [ -n "${NATIVE_FPS_MIN:-}" ] && awk -v f="$NATIVE_FPS_MIN" 'BEGIN{exit !(f>=20)}'; then
-  echo "Throughput gate (M2.5 ≥20 fps): PASS (min native fps=$NATIVE_FPS_MIN)"
+  echo "Throughput gate (M2.5 ≥20 fps on ≥150-frame runs): PASS (min=$NATIVE_FPS_MIN)"
 else
-  echo "Throughput gate (M2.5 ≥20 fps): FAIL (min native fps=${NATIVE_FPS_MIN:-N/A})"
+  echo "Throughput gate (M2.5 ≥20 fps on ≥150-frame runs): FAIL (min=${NATIVE_FPS_MIN:-N/A})"
 fi
 
 echo
