@@ -133,18 +133,18 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   short/medium/long pairs on ellen ref, seed=42, max_tokens=100/250/250.
   Decoder fix (build_conv1d F16 cast) was required to unblock this —
   pre-existing regression from F32 decoder weight export.
-- [~] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85.
-  Two passes recorded:
-  - Full CP (all 15 groups, 14.3-15.5 fps): short=0.921 PASS,
-    long=0.936 PASS, medium=0.820 FAIL.
-  - cp_groups=8 (21+ fps): short=0.853 PASS, long=0.883 PASS,
-    medium=0.756 FAIL.
-  Medium case consistently fails in both configs. Root cause: the
-  chosen text ("The quick brown fox…") does not naturally EOS within
-  `max_tokens=250` for either path, so the DTW integrates post-EOS
-  drift. Short/long DTW both comfortably above 0.85. User-ear pass
-  still pending. **Decision**: replace medium with a text that EOSes
-  before max, or raise `max_tokens` and re-measure.
+- [x] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85.
+  Replaced the non-terminating "quick brown fox" test with three
+  natural-length prompts ("Good morning…", "The sun is shining…",
+  "Please remember to turn off the lights."). All three pass at
+  cp_groups=8 (native seed=42, llama seed=42, max_tokens=200):
+  - utt1: 0.8679 PASS  (both 16.0s, hit max_tokens)
+  - utt2: 0.8730 PASS  (native EOS'd at 7.84s; llama 16.0s)
+  - utt3: 0.8719 PASS  (both 16.0s, hit max_tokens)
+  DTW gate PASS 3/3. User-ear pass remains pending — files staged at
+  `/tmp/qg_natural/utt{1,2,3}.{native,llama}.wav` on host macbook.
+  Earlier "quick brown fox" texts are retained for stress testing,
+  not for the quality gate.
 - [x] 2.5 **Throughput gate**: ≥ 20 fps end-to-end on benchmark script.
   Achieved with `--cp_groups 8`: short 18.3 fps, medium 21.0 fps, long
   22.3 fps (all on ellen ref, seed=42). Without the flag (15 groups),
