@@ -1,3 +1,100 @@
+# OminiX-Ascend — agent operating principles
+
+> The section below (from `# Instructions for llama.cpp` onward) is the
+> upstream llama.cpp contributor policy we inherited. It applies to
+> llama.cpp-proper PRs. For OminiX-Ascend-specific work (TTS/ASR/image
+> native ports), the principles here take precedence.
+
+## Durable-contract discipline (the core rule)
+
+Multi-session delivery work on this repo is governed by a **checkable
+delivery contract** stored in the repo, not in chat memory. The canonical
+contract for active multi-week work is a markdown file at the repo root
+(`NATIVE_TTS_CONTRACT.md` is the current one). Every piece of work that
+spans more than one session MUST be captured this way. Chat context is
+volatile; markdown in the repo is not.
+
+### Required structure of a delivery contract
+
+Every contract document MUST include, in this order:
+
+1. **Goal** — one sentence, measurable.
+2. **Non-goals** — explicit scope boundaries.
+3. **Current state** — updated whenever work lands; short.
+4. **Architecture target** — ASCII diagram; single source of truth.
+5. **Milestones** — numbered, each with a checklist of `[ ]` items. Group
+   sequential vs parallel milestones explicitly.
+6. **Acceptance criteria** — objective (numbers, bit-identical, DTW ≥ X,
+   fps ≥ Y). No subjective "looks good". Include user-ear gates where
+   audio/video subjective quality is involved.
+7. **Risk register** — live, append-only.
+8. **Decision log** — every deviation from the plan gets a dated entry
+   with options considered + choice made.
+9. **Parallelism playbook** — how agents claim items and reconverge.
+10. **File index** — fast-jump to the files each milestone touches.
+11. **Session boot checklist** — 3-5 step restart procedure for a fresh
+    agent picking up the contract.
+
+### Invariants
+
+- **Every item is `[ ]` or `[x]`.** No "mostly done" states. Split an item
+  if it can't be fully finished.
+- **`[x]` only after the item's quality gate passes.** Not after "it
+  compiled" or "it ran once".
+- **Decision log every time you deviate.** Even small deviations get
+  one-line entries with date + reason.
+- **Commit the contract with every state change.** Never let in-memory
+  progress drift from committed state — a crash deletes only work you
+  haven't committed.
+
+## Program-manager workflow for agent swarms
+
+When implementing a contract:
+
+1. **Read the contract first.** Always. Don't trust your own context.
+2. **Find the active milestone.** Then the next `[ ]` item in it. Don't
+   skip ahead.
+3. **Spawn parallel agents only when milestones explicitly mark items as
+   parallelizable** (e.g., "M4, M5, M6 can run in parallel after M3
+   lands"). Otherwise one agent at a time.
+4. **Each agent gets its own git worktree** (use the `isolation: "worktree"`
+   parameter on Agent calls) so concurrent work can't collide.
+5. **Each agent's brief must reference the contract section and the
+   specific `[ ]` item it's claiming.** Agents should not infer scope.
+6. **When an agent completes, verify the quality gate before marking
+   `[x]`.** If the agent reports success but the gate fails, keep
+   the item open and file what went wrong.
+7. **Crashes and context resets are normal.** Design assuming each session
+   starts cold with only the committed contract as ground truth.
+
+## Audio/video subjective quality rule
+
+If a deliverable's value depends on subjective quality (audio, video, UI
+aesthetics), acceptance gates MUST include:
+
+- An objective numerical metric (DTW, SSIM, etc.) to catch obvious
+  regressions.
+- **A user-ear (or user-eye) pass on multiple distinct samples**
+  (≥ 3, typically 5). A single metric passing is necessary but not
+  sufficient. Never ship subjective-quality work on metrics alone.
+
+## Session-boot requirement
+
+When a new session starts (after a crash, context corruption, or a human
+handoff), the agent MUST:
+
+1. Locate the active contract (usually at repo root as `*_CONTRACT.md`, or
+   linked from auto-memory).
+2. Read the contract top-to-bottom. Do not skim.
+3. Run the contract's smoke check (benchmark, integration test) to
+   verify the reported state matches reality.
+4. Only then pick up the next `[ ]` item.
+
+If there is no contract for the work the user is asking about, the agent
+MUST offer to create one before doing multi-step implementation work.
+
+---
+
 # Instructions for llama.cpp
 
 > [!IMPORTANT]

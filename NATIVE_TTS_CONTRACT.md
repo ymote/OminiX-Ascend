@@ -1,0 +1,238 @@
+# OminiX-Ascend Native TTS — Delivery Contract
+
+> **Boot instructions for any session**: Read top-to-bottom. Current state in §3.
+> Resume by picking the next `[ ]` item in the active milestone. Do not skip
+> ahead. Update `[x]` as each item lands; commit the file with each change.
+
+---
+
+## 1. Goal (single sentence)
+
+Replace the hybrid llama.cpp + native-aclnn TTS compute on Ascend with a
+**fully-native aclnn implementation** exposed via the existing `qwen_tts_api`
+C ABI, reaching **≥ 25 fps** end-to-end on Ascend 910B4 with audio quality
+**indistinguishable from MLX golden** (DTW log-mel ≥ 0.85, plus user-ear pass
+on five distinct utterances).
+
+## 2. Non-goals
+
+- Supporting GGUF quantizations below Q8_0 (CANN is unoptimized for Q4/Q5).
+- Multi-GPU / multi-device inference.
+- Retraining the model or changing any model weights.
+- Preserving the llama.cpp code path for TTS (we may keep it gated behind a
+  fallback flag for A/B measurement, but it's off the hot path).
+- MLX parity on Ascend (Ascend's eager model + different hardware =
+  different absolute ceiling; we target 25-30 fps realistic, 40 fps stretch).
+
+## 3. Current state (update as work lands)
+
+- **Rust harness**: `qwen3-tts-ggml` ↔ `qwen_tts_api` FFI in place and working.
+  The generation loop, sampling, and anti-loop logic come from
+  `qwen3-tts-core` — no change needed.
+- **C++ layer**: hybrid — Talker via llama.cpp/ggml-cann, CP via native aclnn
+  engine (`cp_cann_engine.{h,cpp}`). This hybrid is the **root cause** of
+  audible fragments in the CP output (framework mixing → inconsistent
+  numerics → decoder sees token combinations that match neither pure path).
+- **Best measured v13/v14**: 15-17 fps with audible fragments.
+- **llama.cpp baseline**: 12.2 fps, clean audio (user's current production).
+- Prior experiments documented in
+  `/Users/yuechen/.claude/projects/-Users-yuechen-home-OminiX-API/memory/project_cp_cann_engine.md`
+
+## 4. Architecture target
+
+```
+qwen3-tts-core          (Rust, shared)
+  ↓ TalkerBackend trait
+qwen3-tts-ggml          (Rust, Ascend)
+  ↓ llama-sys FFI
+qwen_tts_api            (C ABI — unchanged)
+  ↓
+[NEW] TtsNativeEngine   (aclnn only, no llama.cpp)
+  ├── TalkerCannEngine   (28-layer Qwen3 — new, mirrors CpCannEngine style)
+  ├── CpCannEngine       (existing, 5-layer — keep)
+  ├── TokenizerEncCannEngine  (existing speech_tokenizer_encoder.cpp — keep/port)
+  ├── TokenizerDecCannEngine  (existing speech_tokenizer_decoder.cpp — keep, tune)
+  └── SpeakerEncoderCannEngine (existing speaker_encoder.cpp — keep/port)
+```
+
+**Invariant**: every tensor in the per-frame hot path lives on NPU; boundary
+F32 staging at I/O only. Single numerical framework (aclnn) end-to-end.
+
+## 5. Milestones (checkable)
+
+Milestones 1 → 3 are **sequential**. 4, 5, 6 can run **in parallel** after 3.
+
+### M1 — Native Talker implementation (1 week)
+
+File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
+
+- [x] 1.1 Scope GGUF reader for talker backbone (load F16 weights, F32 norm
+  gammas, dequant on host, upload via existing `upload_f16`).
+  **Decision (2026-04-17)**: Use ggml's native `gguf_init_from_file` +
+  `ggml_get_tensor` (pattern already in `tts_transformer.cpp:345`). No new
+  dep — ggml is already linked. Tensor naming confirmed standard llama-style
+  (`blk.N.attn_{q,k,v,output}.weight`, `blk.N.ffn_{gate,up,down}.weight`,
+  `blk.N.attn_{q,k}_norm.weight`, `blk.N.attn_norm.weight`,
+  `blk.N.ffn_norm.weight`, `output_norm.weight`). 28 layers, F16 matmul
+  weights + F32 norm gammas. Matches what `CpCannEngine` expects.
+- [ ] 1.2 Implement `init()`: allocate 28-layer weight buffers +
+  intermediates + KV cache + workspace; build persistent aclTensor handles.
+- [ ] 1.3 Implement `forward_decode(input_embed[n_embd], pos, hidden_out)`
+  — single-token path, same op pattern as `CpCannEngine::forward_one_token`.
+  Precision scheme: F32 I/O staging, F16 transformer compute, F32 norm
+  gammas, F16 residual (match llama.cpp's ggml-cann convention).
+- [ ] 1.4 Implement `forward_prefill(input_embeds[seq_len, n_embd], seq_len,
+  hidden_out)` — batched path with causal attention mask via
+  `aclnnFusedInferAttentionScoreV2`.
+- [ ] 1.5 Implement `reset_kv_cache()` and `set_rope_speed(factor)` (for EOS
+  steering — port logic from talker.cpp lines around `rope_speed_factor`).
+- [ ] 1.6 **Quality gate**: per-layer activation dump matches llama.cpp path
+  to ε ≤ 0.01 on a fixed input. Use existing test pattern in
+  `tools/qwen_tts/test_talker.cpp` style.
+- [ ] 1.7 End-to-end: native Talker + llama.cpp CP combo runs without crash
+  and produces speech-range audio for one test utterance.
+
+### M2 — Integrate native Talker into qwen_tts_api (2-3 days)
+
+- [ ] 2.1 Add `--native_talker` flag to `main.cpp` (mirrors existing
+  `--cp_cann`). Default off.
+- [ ] 2.2 In `talker.cpp`, wire `TalkerCannEngine` as a third path alongside
+  `cp_use_llama_` and custom impl. `TalkerLLM::generate*()` branches to it
+  when flag is active.
+- [ ] 2.3 With both `--native_talker --cp_cann` enabled, generate on same
+  utterance+seed as the llama.cpp baseline. Compare audio.
+- [ ] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85;
+  user-ear pass on 3 distinct utterances.
+- [ ] 2.5 **Throughput gate**: ≥ 20 fps end-to-end on benchmark script.
+- [ ] 2.6 File regression test that runs this config nightly.
+
+### M3 — Remove llama.cpp from TTS hot path (1 day)
+
+- [ ] 3.1 Once M2 passes, make `--native_talker --cp_cann` the default.
+- [ ] 3.2 Strip unused `llama_model_*` / `llama_context_*` code from
+  `talker.cpp` (keep llama.cpp dep available for other tools; only TTS
+  exits the dependency).
+- [ ] 3.3 Update `tools/qwen_tts/CMakeLists.txt` — optional `QWEN_TTS_LLAMA`
+  flag for backward compat, default off.
+- [ ] 3.4 Final regression: audio + throughput unchanged from M2.
+
+### M4 — aclGraph capture per-shape (1 week) — PARALLEL after M3
+
+- [ ] 4.1 Add `aclmdlRI*` symbols to `cp_cann_symbols.{h,cpp}`.
+- [ ] 4.2 Wrap `forward_decode` with capture/replay: one graph per `pos` in
+  [0, MAX_SEQ). Cache graphs; first call per pos captures, subsequent
+  replays. Pre-warm workspace allocations before capture.
+- [ ] 4.3 Same for `forward_prefill` at common prefill lengths (50-200) —
+  or LRU cache with dynamic capture.
+- [ ] 4.4 **Quality gate**: audio bit-identical to non-graph path.
+- [ ] 4.5 **Throughput gate**: ≥ 25 fps end-to-end.
+- [ ] 4.6 Diagnostics for graph capture failures — fall back to eager
+  cleanly.
+
+### M5 — FRACTAL_NZ weight layout (3-5 days) — PARALLEL after M3
+
+- [ ] 5.1 Audit which ops have `*WeightNz` variants
+  (`aclnnBatchMatMulWeightNz`, `aclnnMatmulWeightNz`, etc.).
+- [ ] 5.2 At weight upload, pre-convert matmul weights to FRACTAL_NZ format
+  (use existing CANN utility: `aclnnTransMatmulWeight` or similar).
+- [ ] 5.3 Switch matmul calls to `*WeightNz` variants.
+- [ ] 5.4 **Quality gate**: DTW unchanged vs M4 baseline.
+- [ ] 5.5 **Throughput gate**: +15% matmul throughput measurable.
+
+### M6 — Multi-stream pipelining (1 week) — PARALLEL after M3
+
+- [ ] 6.1 Add secondary `aclrtStream` to `TalkerCannEngine` and
+  `CpCannEngine`.
+- [ ] 6.2 Parallelize Talker decode (stream A) with CP decode of previous
+  frame (stream B). Use `aclrtStreamWaitEvent` for sync.
+- [ ] 6.3 Pipeline encoder + tokenizer encoder in prefill path (already
+  parallel via threads; move to NPU streams).
+- [ ] 6.4 Overlap codec decoder chunks with Talker/CP generation.
+- [ ] 6.5 **Quality gate**: audio bit-identical to non-pipelined path.
+- [ ] 6.6 **Throughput gate**: +10% wall-clock on end-to-end.
+
+### Stretch — INT8 post-training quantization tuned for Ascend
+
+- [ ] S1 Port-to-Ascend INT8 calibration using CANN's `aclnnQuantBatchMatmul`.
+- [ ] S2 Accuracy recovery loop (if needed).
+- [ ] S3 End-to-end validation.
+
+## 6. Acceptance criteria
+
+- **Audio quality**: user-ear pass on 5 distinct utterances (English +
+  Chinese + ICL + xvec + customvoice modes). DTW log-mel vs MLX golden ≥
+  0.85.
+- **Throughput**: ≥ 25 fps end-to-end on Ascend 910B4 for a 10-word English
+  utterance.
+- **Memory**: peak NPU usage ≤ 16 GB (leaves half of 32 GB HBM free).
+- **Correctness**: `test_cp_flow`, `test_talker`, `test_code_predictor` all
+  pass. Integration smoke test from Rust harness passes.
+
+## 7. Risk register (live — append new rows)
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| aclGraph capture hits NPU kernel bug (GatherV3 crashed ggml-cann path; our pure-aclnn engine doesn't use GatherV3) | Medium | Drops M4 win | Skip M4; extract what perf we can from M5+M6 alone |
+| FRACTAL_NZ unsupported for some op | Medium | Partial M5 | Fall back to ND per-op |
+| Native Talker precision drifts like CP did | Medium | Audio regression | Match ggml-cann's exact precision: F16 residual + F32 norm gamma + F16 FusedInferAttn. Use v14's precision scheme that matched well before hitting the hybrid wall |
+| Talker f16 overflow (we know Qwen3 text encoder needs F32 per memory; TTS talker may too) | Low-med | NaN in output | F32 input projection already standard; fall back F32 end-to-end on specific layers if needed |
+| Port of existing encoder/speaker impls is not trivial | Low | Adds 1-2 days | Keep llama.cpp-free path optional; build on existing C++ impls |
+
+## 8. Decision log (live — append when deviating)
+
+- **2026-04-17 Design**: Chose native-full over ggml-cann fork because AI
+  portability removes the rewrite tax, eager NPU model doesn't map cleanly
+  onto ggml's graph abstraction, and GGUF quantization advantage doesn't
+  apply on CANN (no Q4/Q5 speedup).
+- **2026-04-17 Scope**: qwen3-tts-core TalkerBackend contract unchanged;
+  only the C++ compute behind qwen_tts_api rewrites. Minimizes Rust churn.
+- **2026-04-17 Baseline**: user's ear-verified "clean" = llama.cpp CP path.
+  MLX golden used for structural match (DTW) but audibly different due
+  to different weight rounding path.
+
+## 9. Parallelism playbook
+
+When an agent is assigned a milestone item:
+
+1. Agent reads §1-4 for context + §3 for current state.
+2. Agent finds next `[ ]` in its assigned milestone.
+3. Agent's deliverable must pass the milestone's quality gate before
+   marking `[x]`.
+4. Agent commits the milestone update with `[x]` and a one-line note under
+   the item explaining what landed.
+5. If agent blocks on a decision, agent appends to §8 Decision Log
+   proposing the options; PM (this session) arbitrates.
+
+Preferred parallel assignments:
+
+- **After M3 lands**: spawn 3 agents — M4, M5, M6 in separate worktrees.
+- **Within M1**: spawn 2 agents — 1.1+1.2 (weights/init) in one worktree,
+  1.3 (decode) in another, reconverging for 1.4-1.7.
+
+## 10. File index (for fast jumping)
+
+| File | Purpose |
+|---|---|
+| `tools/qwen_tts/cp_cann_engine.{h,cpp}` | Existing native CP engine (reference pattern for Talker port) |
+| `tools/qwen_tts/cp_cann_symbols.{h,cpp}` | dlsym loader for aclnn symbols; add more symbols here |
+| `tools/qwen_tts/talker_cann_engine.{h,cpp}` | **TO CREATE** — native Talker |
+| `tools/qwen_tts/talker.cpp` | Orchestrator; integrate native path here |
+| `tools/qwen_tts/qwen_tts_api.{h,cpp}` | C ABI surface — must stay stable |
+| `tools/qwen_tts/main.cpp` | CLI flags — add `--native_talker` here |
+| `tools/qwen_tts/CMakeLists.txt` | Build config — llama.cpp optional flag here |
+| `/Users/yuechen/home/OminiX-MLX/qwen3-tts-core/src/backend.rs` | TalkerBackend trait spec — contract unchanged |
+| `/Users/yuechen/home/OminiX-MLX/qwen3-tts-ggml/src/talker.rs` | Rust binding — should stay as-is |
+
+## 11. Session boot checklist
+
+When a new session picks up this contract:
+
+1. `git status` in `/Users/yuechen/home/OminiX-Ascend` — confirm clean or
+   note in-flight work.
+2. Re-read §3 (current state) — verify no drift since last check.
+3. Run the smoke bench to confirm current fps / audio are where docs claim:
+   ```bash
+   ssh -i ~/home/tensordock/KeyPair-4fbd-yue.pem -p 31984 \
+     ma-user@dev-modelarts.cn-southwest-2.huaweicloud.com 'bash /tmp/bench_cp.sh'
+   ```
+4. Find next `[ ]` and start. Update `[x]` + decision log as you go.
