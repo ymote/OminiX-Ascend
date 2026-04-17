@@ -26,10 +26,36 @@ on five distinct utterances).
 
 ## 3. Current state (update as work lands)
 
-**As of 2026-04-18**: **M1 + M2 complete**. Native TalkerCannEngine at
-`tools/qwen_tts/talker_cann_engine.{h,cpp}` and v4 CpCannEngine both
-in the hot path. Decoder F16 cast unblocked the end-to-end pipeline
-(also unblocked warmup, which no longer needs a skip flag).
+**As of 2026-04-18 (late)**: **CRITICAL pipeline fix + M2 status
+revised**. The prior "M2 DTW gate PASS 3/3" result was invalid — ASR
+checks showed both native and llama paths were emitting short nonsense
+phrases ("Oh.", "I'm sorry.", "Okay. Start. Start. Look.") for every
+target text. DTW-log-mel was comparing garbage to garbage.
+
+**Root cause**: `tokenizer_config.json` was missing from the `gguf/`
+directory. Without it, `BpeTokenizer` BPE'd `<|im_start|>` as raw text,
+and `tokenize_tts_text`'s hardcoded `begin()+3` strip kept 2-3 BPE
+fragments as a phantom prefix of every target utterance. The Talker
+emitted short filler audio and EOS'd before ever seeing the real text.
+
+**Fix** (commit 69c41884): load `tokenizer_config.json` or fail init
+hard with a descriptive error; on Ascend copy
+`~/.OminiX/models/Qwen3-TTS-12Hz-1.7B-Base/tokenizer_config.json` into
+`tools/qwen_tts/gguf/`. After fix:
+  - Production `--talker_model q8_0 --cp_model cp_llama` transcribes
+    "Good morning, how are you today." → "Good morning. How are you
+    today?" (ASR-verified, 12.2 fps — the original baseline returns).
+  - utt2 / utt3 on the same config also transcribe exactly.
+  - Round-trip ref audio → encoder → decoder → ASR matches the book
+    excerpt perfectly (decoder is fine; F16 cast in build_conv1d holds).
+
+**Native Talker path still broken** post-fix: emits "Oh." regardless
+of target. `forward_prefill` completes in 12 ms for a 127-token
+sequence (suspiciously fast — llama.cpp prefill for the same inputs
+takes ~1.2 s). Hypothesis: the fused prefill output or KV-cache layout
+isn't conditioning the decode step on the target-text positions.
+Separate bug; does NOT block pipeline correctness on the llama.cpp
+path. Will investigate next.
 
 Quality gate (M2.4): DTW log-mel ≥0.85 on 3/3 utterances
 (utt1=0.908, utt2=0.921, utt3=0.900) vs llama.cpp baseline, both seed=42,
@@ -144,18 +170,14 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   short/medium/long pairs on ellen ref, seed=42, max_tokens=100/250/250.
   Decoder fix (build_conv1d F16 cast) was required to unblock this —
   pre-existing regression from F32 decoder weight export.
-- [x] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85.
-  Replaced the non-terminating "quick brown fox" test with three
-  natural-length prompts ("Good morning…", "The sun is shining…",
-  "Please remember to turn off the lights."). All three pass at
-  cp_groups=8 (native seed=42, llama seed=42, max_tokens=200):
-  - utt1: 0.8679 PASS  (both 16.0s, hit max_tokens)
-  - utt2: 0.8730 PASS  (native EOS'd at 7.84s; llama 16.0s)
-  - utt3: 0.8719 PASS  (both 16.0s, hit max_tokens)
-  DTW gate PASS 3/3. User-ear pass remains pending — files staged at
-  `/tmp/qg_natural/utt{1,2,3}.{native,llama}.wav` on host macbook.
-  Earlier "quick brown fox" texts are retained for stress testing,
-  not for the quality gate.
+- [~] 2.4 **Quality gate**: DTW log-mel vs llama.cpp baseline ≥ 0.85
+  — **VOIDED for now**. Initial 3/3 pass was invalid: both paths
+  produced similarly-broken nonsense audio from a silent tokenizer
+  misconfiguration (see §3). After the tokenizer_config.json fix the
+  llama.cpp path is clean but native_talker still emits nonsense, so
+  a fair DTW isn't possible until the native path is fixed.
+  New approach: `scripts/asr_quality_check.sh` uses qwen3-asr for a
+  content-level PASS/FAIL (catches exactly this failure mode).
 - [x] 2.5 **Throughput gate**: ≥ 20 fps end-to-end on benchmark script.
   Achieved with `--cp_groups 8`: short 18.3 fps, medium 21.0 fps, long
   22.3 fps (all on ellen ref, seed=42). Without the flag (15 groups),
