@@ -252,14 +252,31 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ## 6. Acceptance criteria
 
-- **Audio quality**: user-ear pass on 5 distinct utterances (English +
-  Chinese + ICL + xvec + customvoice modes). DTW log-mel vs MLX golden ≥
-  0.85.
+- **Audio quality — ASR content check REQUIRED**: qwen3-asr on the
+  generated wav must transcribe to within edit-distance 2 of the target
+  text on each of the 5 canonical utterances. Run via
+  `scripts/asr_quality_check.sh <dir> <targets.tsv>`. Adding DTW alongside
+  is fine but DTW alone is NOT sufficient — a corrupted pipeline can
+  match garbage-to-garbage at DTW 0.9+ while every utterance decodes to
+  nonsense (this is exactly how M2.4 got marked `[x]` twice wrongly
+  before the tokenizer_config.json bug was found).
+- **Audio quality — user-ear pass**: on the same 5 utterances (English +
+  Chinese + ICL + xvec + customvoice modes). ASR is necessary, not
+  sufficient.
 - **Throughput**: ≥ 25 fps end-to-end on Ascend 910B4 for a 10-word English
   utterance.
 - **Memory**: peak NPU usage ≤ 16 GB (leaves half of 32 GB HBM free).
 - **Correctness**: `test_cp_flow`, `test_talker`, `test_code_predictor` all
   pass. Integration smoke test from Rust harness passes.
+
+### Verification stamp (per [x] item)
+
+When marking any milestone item `[x]`, append a one-line
+`**Verified-by:**` stamp citing (a) commit SHA, (b) the artifact that
+proved it (wav path, log snippet, or test output), and (c) the gate
+used (ASR / throughput / DTW / smoke). This forces reverting the stamp
+when the artifact is invalidated by a downstream bug, instead of
+carrying a silent false claim.
 
 ## 7. Risk register (live — append new rows)
 
@@ -282,6 +299,20 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 - **2026-04-17 Baseline**: user's ear-verified "clean" = llama.cpp CP path.
   MLX golden used for structural match (DTW) but audibly different due
   to different weight rounding path.
+- **2026-04-18 (late) discipline update — three hard rules added after
+  the tokenizer_config.json regression**:
+  1. ASR content check is a required gate, not optional. DTW alone
+     passed twice on garbage-to-garbage output.
+  2. Every `[x]` must carry a `**Verified-by:**` stamp (commit + artifact
+     + gate name). Invalidated artifacts must trigger a revert to `[~]`
+     or `[ ]`.
+  3. Tokenizer special-token load failures must be fatal, never a
+     printf warning. Silent misconfig killed a day of M2 work.
+  The regression root cause: `tokenizer_config.json` missing →
+  `<|im_start|>` BPE'd as raw text → prefill role prefix corrupted →
+  every utterance emitted "Oh." / "I'm sorry." / "Okay. Start. Start."
+  across native AND llama paths. DTW on (garbage vs garbage) hit 0.9+,
+  so the gate passed wrongly. Fix: commit 69c41884 makes it fatal.
 - **2026-04-18 M1 landed**: native Talker 28-layer engine working end-to-
   end at the smoke level. All of M1.2-M1.6 passed. Key decisions /
   surprises:
@@ -325,6 +356,23 @@ Preferred parallel assignments:
 - **After M3 lands**: spawn 3 agents — M4, M5, M6 in separate worktrees.
 - **Within M1**: spawn 2 agents — 1.1+1.2 (weights/init) in one worktree,
   1.3 (decode) in another, reconverging for 1.4-1.7.
+
+### Next round (as of the M3.1 release)
+
+Three parallel tracks unblocked:
+
+1. **Batched-prefill bug** (blocks full M2.5, highest ROI): localize why
+   FIAS with S>1 produces cos-sim 0.28 vs the iterative-decode
+   reference. Known-ruled-out: sparseMode=0/nextTokens=0 vs
+   sparseMode=1/nextTokens=65535 (both wrong identically). Next
+   suspects: Q/K batch strides, innerPrecise=2 on batch tensors,
+   numKeyValueHeads broadcast with the strided KV-cache view.
+2. **M3.2 + M3.3** (strip llama.cpp): safe to start in a worktree now
+   that native is default. Put llama.cpp behind a `QWEN_TTS_LLAMA`
+   CMake option, default OFF. `--llama_fallback` flag gated on the
+   option.
+3. **M4 aclGraph** (independent): add `aclmdlRI*` dlsym, wrap
+   `forward_decode` capture/replay per pos. Must keep ASR content gate.
 
 ## 10. File index (for fast jumping)
 
