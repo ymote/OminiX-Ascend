@@ -29,6 +29,18 @@ if(QWEN_TTS_CP_CANN)
     message(STATUS "qwen_tts: CP CANN engine ENABLED (+ native Talker)")
 endif()
 
+# llama.cpp fallback Talker path: optional, default OFF. When OFF, the
+# `--llama_fallback` runtime flag prints a clear error and exits; the
+# native TalkerCannEngine is the only backbone path. When ON, llama.cpp
+# is linked and `--llama_fallback` runs the original hybrid code path.
+option(QWEN_TTS_LLAMA "Link llama.cpp fallback into qwen_tts" OFF)
+if(QWEN_TTS_LLAMA)
+    message(STATUS "qwen_tts: llama.cpp fallback ENABLED (QWEN_TTS_LLAMA=ON)")
+else()
+    message(STATUS "qwen_tts: llama.cpp fallback DISABLED "
+                   "(native-only; enable with -DQWEN_TTS_LLAMA=ON)")
+endif()
+
 # kissfft library for STFT computation
 set(KISSFFT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/kissfft)
 set(KISSFFT_SRC
@@ -39,7 +51,16 @@ list(APPEND SRC_FILES ${KISSFFT_SRC})
 
 add_executable(${TARGET} ${SRC_FILES})
 
-target_link_libraries     (${TARGET} PUBLIC ggml llama qwen_common)
+# Base deps. llama is only linked when QWEN_TTS_LLAMA=ON. The `llama.h`
+# header is still included by talker.h for type declarations (llama_batch
+# field, etc.) so we keep the include path visible in both configs; the
+# actual library is skipped in the OFF case.
+target_link_libraries     (${TARGET} PUBLIC ggml qwen_common)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(QWEN_TTS_LLAMA)
+    target_link_libraries     (${TARGET} PUBLIC llama)
+    target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_LLAMA=1)
+endif()
 
 # Native CP CANN engine: implemented via dlopen/dlsym at runtime to sidestep
 # CANN stub-lib circular deps. We only need libdl + the toolkit headers.
@@ -75,7 +96,12 @@ set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME ${TARGET})
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
-target_link_libraries  (${TARGET} PRIVATE common Threads::Threads)
+# `common` is llama.cpp's utility lib (PUBLIC-links libllama). Only needed
+# when we're actually on the llama.cpp path. qwen_tts sources don't use it.
+if(QWEN_TTS_LLAMA)
+    target_link_libraries  (${TARGET} PRIVATE common)
+endif()
+target_link_libraries  (${TARGET} PRIVATE Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # Test: Code Predictor verification
@@ -89,6 +115,7 @@ target_link_libraries     (test_code_predictor PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_code_predictor PRIVATE Threads::Threads common)
 target_include_directories(test_code_predictor PUBLIC  .)
 target_include_directories(test_code_predictor PRIVATE ../.. ../../vendor)
+target_compile_definitions(test_code_predictor PRIVATE QWEN_TTS_LLAMA=1)
 target_compile_features   (test_code_predictor PRIVATE cxx_std_17)
 
 # Test: Talker LLM integration
@@ -102,6 +129,7 @@ target_link_libraries     (test_talker PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_talker PRIVATE Threads::Threads common)
 target_include_directories(test_talker PUBLIC  .)
 target_include_directories(test_talker PRIVATE ../.. ../../vendor)
+target_compile_definitions(test_talker PRIVATE QWEN_TTS_LLAMA=1)
 target_compile_features   (test_talker PRIVATE cxx_std_17)
 
 # Test: Speech Tokenizer Encoder
@@ -128,6 +156,7 @@ target_link_libraries     (test_cp_flow PUBLIC ggml llama qwen_common)
 target_link_libraries     (test_cp_flow PRIVATE Threads::Threads common)
 target_include_directories(test_cp_flow PUBLIC  .)
 target_include_directories(test_cp_flow PRIVATE ../.. ../../vendor)
+target_compile_definitions(test_cp_flow PRIVATE QWEN_TTS_LLAMA=1)
 target_compile_features   (test_cp_flow PRIVATE cxx_std_17)
 
 # Test: BPE Tokenizer

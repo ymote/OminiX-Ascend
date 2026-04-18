@@ -457,6 +457,7 @@ TalkerLLM::~TalkerLLM() {
         talker_cann_engine_ = nullptr;
     }
 #endif
+#if defined(QWEN_TTS_LLAMA)
     if (cp_llama_ctx_) {
         llama_free(cp_llama_ctx_);
         cp_llama_ctx_ = nullptr;
@@ -473,6 +474,11 @@ TalkerLLM::~TalkerLLM() {
         llama_model_free(llama_model_);
         llama_model_ = nullptr;
     }
+    if (talker_step_batch_ready_) {
+        llama_batch_free(talker_step_batch_);
+        talker_step_batch_ready_ = false;
+    }
+#endif
 }
 
 // ============================================================================
@@ -496,6 +502,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     talker_config_ = embed_session_->get_model().config;
 
     // 2. Load Talker backbone via llama.cpp (llama-compatible GGUF)
+#if defined(QWEN_TTS_LLAMA)
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
 
@@ -523,6 +530,14 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
         return false;
     }
     printf("[talker] llama.cpp backbone loaded\n");
+#else
+    // Built without QWEN_TTS_LLAMA — native Talker CANN engine is the only
+    // backbone path. n_embd_ is populated from the embedding GGUF below.
+    n_embd_ = talker_config_.hidden_size;
+    printf("[talker] llama.cpp disabled at build time (QWEN_TTS_LLAMA=OFF); "
+           "native path required\n");
+    (void)n_gpu_layers;
+#endif
 
     // 3. Load Code Predictor
     ContextParams cp_params;
@@ -536,6 +551,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     cp_n_threads = n_threads;
 
     // 4. Optionally load CP transformer via llama.cpp (for NPU acceleration)
+#if defined(QWEN_TTS_LLAMA)
     if (!cp_llama_path.empty()) {
         printf("[talker] loading CP llama.cpp backend from %s\n",
                cp_llama_path.c_str());
@@ -569,6 +585,12 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
             }
         }
     }
+#else
+    if (!cp_llama_path.empty()) {
+        printf("[talker] --cp_model ignored: built without QWEN_TTS_LLAMA "
+               "(rebuild with -DQWEN_TTS_LLAMA=ON to enable llama.cpp CP path)\n");
+    }
+#endif
 
     // 5. Optionally enable native CP CANN engine (direct ACL ops).
     //    Takes precedence over llama.cpp CP path when both are requested.
@@ -584,6 +606,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
             cp_use_cann_ = true;
             // Native CANN owns CP now; release the llama.cpp CP context to
             // avoid holding duplicate NPU KV buffers.
+#if defined(QWEN_TTS_LLAMA)
             if (cp_llama_ctx_) {
                 llama_free(cp_llama_ctx_);
                 cp_llama_ctx_ = nullptr;
@@ -592,6 +615,7 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
                 llama_model_free(cp_llama_model_);
                 cp_llama_model_ = nullptr;
             }
+#endif
             cp_use_llama_ = false;
         } else {
             printf("[talker] WARN: CP CANN engine init failed, "
@@ -627,6 +651,17 @@ bool TalkerLLM::load_model(const std::string &talker_llama_path,
     }
 #else
     (void)use_talker_cann;
+#endif
+
+#if !defined(QWEN_TTS_LLAMA)
+    // Built without llama.cpp: the native TalkerCannEngine is the only
+    // backbone path. If the caller disabled it (e.g. --llama_fallback),
+    // we have nothing to run.
+    if (!talker_use_cann_) {
+        printf("[talker] llama.cpp fallback not compiled in "
+               "(build with -DQWEN_TTS_LLAMA=ON)\n");
+        return false;
+    }
 #endif
     return true;
 }
@@ -919,9 +954,11 @@ void TalkerLLM::reset_cache_public() {
         talker_cann_engine_->reset_kv_cache();
     }
 #endif
+#if defined(QWEN_TTS_LLAMA)
     if (llama_ctx_) {
         llama_memory_clear(llama_get_memory(llama_ctx_), true);
     }
+#endif
     api_cur_pos_ = 0;
 }
 
@@ -956,6 +993,7 @@ int TalkerLLM::forward_public(const float *input_embeds, int seq_len,
     }
 #endif
 
+#if defined(QWEN_TTS_LLAMA)
     if (!llama_ctx_) return -1;
 
     llama_batch batch = llama_batch_init(seq_len, dim, 1);
@@ -1004,6 +1042,15 @@ int TalkerLLM::forward_public(const float *input_embeds, int seq_len,
     }
 
     return 0;
+#else
+    (void)input_embeds;
+    (void)seq_len;
+    (void)logits_out;
+    (void)hidden_out;
+    printf("[talker] llama.cpp fallback not compiled in "
+           "(build with -DQWEN_TTS_LLAMA=ON)\n");
+    return -1;
+#endif
 }
 
 // ============================================================================
@@ -1574,6 +1621,7 @@ bool TalkerLLM::predict_code_groups(
 #endif
 
     if (cp_use_llama_) {
+#if defined(QWEN_TTS_LLAMA)
         // ============================================================
         // NPU path: CP transformer via llama.cpp
         // input_proj and lm_heads remain on CPU (NEON-accelerated)
@@ -1651,6 +1699,11 @@ bool TalkerLLM::predict_code_groups(
         llama_batch_free(step_batch);
 
         return true;
+#else
+        printf("[talker] llama.cpp CP fallback not compiled in "
+               "(build with -DQWEN_TTS_LLAMA=ON)\n");
+        return false;
+#endif
     }
 
     // ============================================================
@@ -1711,6 +1764,7 @@ bool TalkerLLM::predict_code_groups(
 // ============================================================================
 
 void TalkerLLM::ensure_talker_step_batch() {
+#if defined(QWEN_TTS_LLAMA)
     if (talker_step_batch_ready_) return;
     int dim = n_embd_;
     talker_step_batch_ = llama_batch_init(1, dim, 1);
@@ -1719,6 +1773,7 @@ void TalkerLLM::ensure_talker_step_batch() {
     talker_step_batch_.seq_id[0][0] = 0;
     talker_step_batch_.logits[0] = 1;
     talker_step_batch_ready_ = true;
+#endif
 }
 
 // ============================================================================
@@ -1771,10 +1826,18 @@ bool TalkerLLM::generate(
 #else
         false;
 #endif
+#if defined(QWEN_TTS_LLAMA)
     if (!use_native_talker && !llama_ctx_) {
         printf("[talker] neither llama.cpp backbone nor native Talker loaded\n");
         return false;
     }
+#else
+    if (!use_native_talker) {
+        printf("[talker] llama.cpp fallback not compiled in "
+               "(build with -DQWEN_TTS_LLAMA=ON)\n");
+        return false;
+    }
+#endif
 
     int dim = n_embd_;
     int n_groups = talker_config_.num_code_groups;
@@ -1811,6 +1874,7 @@ bool TalkerLLM::generate(
     } else
 #endif
     {
+#if defined(QWEN_TTS_LLAMA)
         llama_memory_clear(llama_get_memory(llama_ctx_), true);
         llama_batch batch = llama_batch_init(prefill_len, dim, 1);
         batch.n_tokens = prefill_len;
@@ -1836,6 +1900,11 @@ bool TalkerLLM::generate(
             return false;
         }
         memcpy(hidden.data(), embd_llama, dim * sizeof(float));
+#else
+        printf("[talker] llama.cpp fallback not compiled in "
+               "(build with -DQWEN_TTS_LLAMA=ON)\n");
+        return false;
+#endif
     }
     auto prefill_t1 = std::chrono::high_resolution_clock::now();
     double talker_prefill_ms = std::chrono::duration<double, std::milli>(prefill_t1 - prefill_t0).count();
@@ -1974,6 +2043,7 @@ bool TalkerLLM::generate(
         } else
 #endif
         {
+#if defined(QWEN_TTS_LLAMA)
             memcpy(talker_step_batch_.embd, next_emb.data(), dim * sizeof(float));
             talker_step_batch_.pos[0] = cur_pos;
 
@@ -1989,6 +2059,11 @@ bool TalkerLLM::generate(
                 return false;
             }
             memcpy(hidden.data(), embd_step, dim * sizeof(float));
+#else
+            printf("[talker] llama.cpp fallback not compiled in "
+                   "(build with -DQWEN_TTS_LLAMA=ON)\n");
+            return false;
+#endif
         }
         auto llm_t1 = std::chrono::high_resolution_clock::now();
         total_llm_ms += std::chrono::duration<double, std::milli>(llm_t1 - llm_t0).count();
@@ -2041,6 +2116,14 @@ bool TalkerLLM::generate_xvec(
     int max_new_tokens,
     const TalkerSamplingParams &sampling) {
 
+#if !defined(QWEN_TTS_LLAMA)
+    (void)target_text_tokens; (void)spk_embedding; (void)language;
+    (void)codec_tokens; (void)max_new_tokens; (void)sampling;
+    printf("[talker] x-vec mode requires llama.cpp "
+           "(build with -DQWEN_TTS_LLAMA=ON; native Talker does not yet implement "
+           "MRoPE 4×pos)\n");
+    return false;
+#else
     if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
     int dim = n_embd_;
     int n_groups = talker_config_.num_code_groups;
@@ -2129,6 +2212,7 @@ bool TalkerLLM::generate_xvec(
            (int)codec_tokens[0].size(),
            std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
     return true;
+#endif  // QWEN_TTS_LLAMA
 }
 
 // ============================================================================
@@ -2143,6 +2227,14 @@ bool TalkerLLM::generate_customvoice(
     int max_new_tokens,
     const TalkerSamplingParams &sampling) {
 
+#if !defined(QWEN_TTS_LLAMA)
+    (void)target_text_tokens; (void)speaker; (void)language;
+    (void)codec_tokens; (void)max_new_tokens; (void)sampling;
+    printf("[talker] customvoice mode requires llama.cpp "
+           "(build with -DQWEN_TTS_LLAMA=ON; native Talker does not yet implement "
+           "MRoPE 4×pos)\n");
+    return false;
+#else
     if (!llama_ctx_) { printf("[talker] backbone not loaded\n"); return false; }
 
     // Resolve speaker name to token ID
@@ -2237,6 +2329,7 @@ bool TalkerLLM::generate_customvoice(
            (int)codec_tokens[0].size(),
            std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count());
     return true;
+#endif  // QWEN_TTS_LLAMA
 }
 
 // ============================================================================

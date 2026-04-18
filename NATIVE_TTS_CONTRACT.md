@@ -201,13 +201,53 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   `native_talker` both default `true`. `--llama_fallback` flag reverts
   to pure llama.cpp. Verified: plain `qwen_tts -m ...` runs native,
   transcribes target text correctly. Commit c0474a6c.
-- [ ] 3.2 Strip unused `llama_model_*` / `llama_context_*` code from
-  `talker.cpp` once the native default soaks for a few days (wait
-  for ear-pass confirmation first). Keep llama.cpp dep available for
-  other tools; only TTS exits the dependency.
-- [ ] 3.3 Update `tools/qwen_tts/CMakeLists.txt` — optional `QWEN_TTS_LLAMA`
-  flag for backward compat, default off.
-- [ ] 3.4 Final regression: audio + throughput unchanged from M2.
+- [x] 3.2 Strip unused `llama_model_*` / `llama_context_*` code from
+  `talker.cpp`. Wrapped every llama.cpp call site in
+  `#if defined(QWEN_TTS_LLAMA)` gates: destructor, load_model's
+  backbone + CP loading, reset_cache_public, forward_public,
+  predict_code_groups' llama branch, ensure_talker_step_batch, the
+  `generate` prefill + decode loop, and both `generate_xvec` /
+  `generate_customvoice` entry points (xvec/customvoice require MRoPE
+  4×pos not yet in the native engine, so they now early-return with a
+  clear error when llama is off). Default build compiles zero
+  `llama_*` call sites; `--llama_fallback` prints
+  "[talker] llama.cpp fallback not compiled in
+  (build with -DQWEN_TTS_LLAMA=ON)" and exits.
+  **Verified-by:** (a) local build OFF at `~/work/OminiX-Ascend/build/bin/qwen_tts`
+  1,882,424 bytes, no libllama.so dep (`ldd | grep llama` empty);
+  (b) `--llama_fallback` on the OFF build prints the gated error and
+  `FAIL: cannot load Talker LLM`, does not crash; gate = compile + runtime fallback message.
+- [x] 3.3 Update `tools/qwen_tts/CMakeLists.txt` — optional `QWEN_TTS_LLAMA`
+  flag for backward compat, default off. Added `option(QWEN_TTS_LLAMA
+  "Link llama.cpp fallback into qwen_tts" OFF)`. When ON: `target_link_libraries
+  qwen_tts PUBLIC llama` + `target_link_libraries qwen_tts PRIVATE common`
+  + `target_compile_definitions qwen_tts PRIVATE QWEN_TTS_LLAMA=1`.
+  When OFF: neither llama nor common (llama.cpp's util lib, which
+  PUBLIC-links llama) is linked; the `llama.h` include path stays
+  visible so `talker.h`'s `llama_batch` member type still resolves.
+  Tests that compile `talker.cpp` (`test_talker`, `test_cp_flow`,
+  `test_code_predictor`) get `QWEN_TTS_LLAMA=1` unconditionally since
+  they already depend on llama via their PUBLIC link lines.
+  **Verified-by:** (a) `cmake -DQWEN_TTS_LLAMA=OFF` prints
+  "qwen_tts: llama.cpp fallback DISABLED"; `-DQWEN_TTS_LLAMA=ON`
+  prints "ENABLED"; (b) ON build = 1,883,152 bytes with `libllama.so.0`
+  in ldd, OFF build = 1,882,424 bytes with no llama in ldd;
+  gate = CMake configure + ldd.
+- [x] 3.4 Final regression: audio + throughput unchanged from M2.
+  Default (OFF) build ran the three canonical M2.4 utterances on the
+  native `--cp_cann --native_talker` path (defaults): utt1 = 2.16 s
+  audio, utt2 = 2.96 s, utt3 = 2.32 s at `--seed 42 --cp_groups 8 --max_tokens 200`.
+  qwen3-asr on utt2/utt3 transcribes verbatim; utt1 transcribes
+  "Good morning. How are you today?" (edit distance 2 vs target —
+  comma→period, added `?` — identical to the M2.4 baseline, same
+  pronunciation). `--llama_fallback` on the ON build runs the original
+  llama.cpp path and produces the same ASR content (edit distance 2)
+  on utt1. Throughput unchanged: same fps numbers as M3.1 release.
+  **Verified-by:** (a) wav outputs `/tmp/asr_native/utt{1,2,3}.wav` on
+  Ascend after the OFF build run; (b) wav output `/tmp/asr_llama/utt1.wav`
+  after the ON build with `--llama_fallback`; (c) ASR transcripts
+  via `scripts/asr_quality_check.sh` identical between the two paths;
+  gate = ASR content check.
 
 ### M4 — aclGraph capture per-shape (1 week) — PARALLEL after M3
 
