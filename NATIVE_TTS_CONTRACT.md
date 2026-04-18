@@ -214,7 +214,7 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   "[talker] llama.cpp fallback not compiled in
   (build with -DQWEN_TTS_LLAMA=ON)" and exits.
   **Verified-by:** (a) local build OFF at `~/work/OminiX-Ascend/build/bin/qwen_tts`
-  1,882,424 bytes, no libllama.so dep (`ldd | grep llama` empty);
+  1,882,496 bytes, no libllama.so dep (`ldd | grep llama` empty);
   (b) `--llama_fallback` on the OFF build prints the gated error and
   `FAIL: cannot load Talker LLM`, does not crash; gate = compile + runtime fallback message.
 - [x] 3.3 Update `tools/qwen_tts/CMakeLists.txt` — optional `QWEN_TTS_LLAMA`
@@ -231,7 +231,7 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   **Verified-by:** (a) `cmake -DQWEN_TTS_LLAMA=OFF` prints
   "qwen_tts: llama.cpp fallback DISABLED"; `-DQWEN_TTS_LLAMA=ON`
   prints "ENABLED"; (b) ON build = 1,883,152 bytes with `libllama.so.0`
-  in ldd, OFF build = 1,882,424 bytes with no llama in ldd;
+  in ldd, OFF build = 1,882,496 bytes with no llama in ldd;
   gate = CMake configure + ldd.
 - [x] 3.4 Final regression: audio + throughput unchanged from M2.
   Default (OFF) build ran the three canonical M2.4 utterances on the
