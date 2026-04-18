@@ -30,6 +30,17 @@ struct CannSyms {
                                   aclrtMemcpyKind, aclrtStream);
     const char *(*aclGetRecentErrMsg)();
 
+    // ---- Event APIs (multi-stream sync, M6) -------------------------------
+    // Used to fence one stream against another so Talker[N+1] on stream A can
+    // wait for CP[N] on stream B without host roundtrips. Required by the
+    // multi-stream pipeline; callers that don't create secondary streams can
+    // ignore these.
+    aclError (*aclrtCreateEvent)(aclrtEvent *);
+    aclError (*aclrtDestroyEvent)(aclrtEvent);
+    aclError (*aclrtRecordEvent)(aclrtEvent, aclrtStream);
+    aclError (*aclrtStreamWaitEvent)(aclrtStream, aclrtEvent);
+    aclError (*aclrtSynchronizeEvent)(aclrtEvent);
+
     // ---- aclnn base (libnnopbase.so) ----
     aclTensor *(*aclCreateTensor)(const int64_t *viewDims, uint64_t viewDimsNum,
                                    aclDataType dataType, const int64_t *stride,
@@ -162,6 +173,21 @@ struct CannSyms {
                                                     aclOpExecutor *,
                                                     aclrtStream);
 
+    // ---- FRACTAL_NZ weight pre-conversion (M5) ------------------------------
+    // aclnnTransMatmulWeight refreshes a matmul weight tensor in-place to the
+    // private FRACTAL_NZ layout that the hardware prefers for the subsequent
+    // aclnnMm / aclnnMatMul call. The tensor buffer is reused (no new alloc);
+    // only the format descriptor + internal tiling changes. Callers that want
+    // to pre-bake weights gate on has_nz(); absence of the symbol (older CANN
+    // toolkits) means "leave everything ND" and silently fall back.
+    // Signatures per aclnnop/aclnn_trans_matmul_weight.h (CANN 8.3+).
+    aclnnStatus (*aclnnTransMatmulWeightGetWorkspaceSize)(
+        aclTensor *mmWeightRef, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnTransMatmulWeight)(void *workspace, uint64_t workspaceSize,
+                                           aclOpExecutor *executor,
+                                           aclrtStream stream);
+
     // ---- aclGraph (aclmdlRI*) — runtime graph capture/replay ---------------
     // Present on CANN 8.3+. The aclmdlRI / aclmdlRICaptureMode types come from
     // `acl/acl_rt.h` (pulled in transitively by `acl/acl.h` above). If the
@@ -185,6 +211,14 @@ struct CannSyms {
                aclmdlRICaptureEnd   != nullptr &&
                aclmdlRIExecuteAsync != nullptr &&
                aclmdlRIDestroy      != nullptr;
+    }
+
+    // Capability flag for the FRACTAL_NZ weight pre-conversion path (M5).
+    // On CANN 8.3+ both entry points resolve. On older toolkits one or both
+    // will be null and callers must leave weights in ND layout.
+    bool has_nz() const {
+        return aclnnTransMatmulWeightGetWorkspaceSize != nullptr &&
+               aclnnTransMatmulWeight                 != nullptr;
     }
 };
 

@@ -62,12 +62,50 @@ public:
     // change; cheap on subsequent forwards with unchanged factor.
     void set_rope_speed_factor(float factor);
 
+    // Pre-convert each matmul weight buffer to CANN's FRACTAL_NZ layout
+    // (M5.2). MUST be called before init_from_gguf — the conversion is
+    // applied inline during weight upload. When enabled AND the runtime
+    // resolves the required symbol (CannSyms::has_nz()), every per-layer
+    // Q/K/V/O/gate/up/down projection weight is passed through
+    // aclnnTransMatmulWeight after upload so the hardware-preferred layout
+    // is baked in. If the symbol is unavailable we silently fall back to
+    // ND; if init runs with this false (the default), nothing changes from
+    // the pre-M5 behaviour. Matmul call sites still dispatch via plain
+    // aclnnMm — the format is transparent to the op API (see M5.1 audit).
+    void set_use_nz_weights(bool enable) { use_nz_weights_ = enable; }
+    bool use_nz_weights() const { return use_nz_weights_; }
+    // True once the NZ pre-conversion actually ran on the weight buffers
+    // (i.e., use_nz_weights_ was on AND g_cann.has_nz() resolved at init).
+    bool nz_applied() const { return nz_applied_; }
+
+    // ---- Multi-stream pipelining (M6.1) -----------------------------------
+    // The engine owns TWO aclrtStream handles — the primary `stream_` (used
+    // by every op by default) and a secondary `stream_b_` that the
+    // orchestrator (TalkerLLM::generate) can borrow to run a second engine
+    // on so Talker[N+1] overlaps CP[N]. `set_stream(s)` swaps which stream
+    // subsequent ops target; passing nullptr restores the primary.
+    //
+    // Lifetime: both streams are created in init_from_gguf and destroyed in
+    // the dtor. set_stream() does NOT take ownership of the passed stream.
+    aclrtStream get_stream()         const { return stream_; }
+    aclrtStream get_stream_b()       const { return stream_b_; }
+    aclrtStream get_primary_stream() const { return primary_stream_; }
+    void set_stream(aclrtStream s) {
+        stream_ = (s != nullptr) ? s : primary_stream_;
+    }
+
     bool is_ready() const { return ready_; }
 
 private:
     bool ready_ = false;
     int device_ = 0;
-    aclrtStream stream_ = nullptr;
+    // `stream_` is the stream every op in this engine targets. By default it
+    // points to `primary_stream_`; an orchestrator can swap it to
+    // `stream_b_` (or an externally-owned stream from another engine) via
+    // set_stream() to pipeline two engines on two physical NPU streams.
+    aclrtStream stream_         = nullptr;
+    aclrtStream primary_stream_ = nullptr;  // owned
+    aclrtStream stream_b_       = nullptr;  // owned; used for multi-stream overlap
 
     // Model dimensions (cached from config)
     int n_embd_   = 0;   // 2048
@@ -194,12 +232,29 @@ private:
                                    // availability. When false, forward_decode
                                    // runs its original eager path unmodified.
 
+    // ---- FRACTAL_NZ weight pre-conversion (M5.2) ----------------------------
+    // Caller-controlled opt-in. When true AND g_cann.has_nz() resolves at
+    // init, init_from_gguf runs aclnnTransMatmulWeight on each matmul weight
+    // buffer right after the F16 upload. The ND layout path (default) stays
+    // bit-identical to pre-M5 behavior. M5.3 (switching call sites to
+    // *WeightNz variants) is out of scope for the agent that landed this —
+    // see the comment on set_use_nz_weights() above.
+    bool use_nz_weights_ = false;
+    bool nz_applied_     = false;  // true once weights have been converted.
+
     // ---- Internal helpers ----
     void alloc_dev_(void **ptr, size_t bytes);
     void ensure_workspace_(size_t needed);
     void upload_(void *dev, const void *host, size_t bytes);
     void build_rope_tables_();   // populate cos/sin and upload as F16.
     void build_causal_mask_();   // fill causal_mask_dev_ once at init.
+
+    // Apply aclnnTransMatmulWeight to one [out, in] F16 matmul weight buffer
+    // in place. Called from init_from_gguf for every projection weight when
+    // use_nz_weights_ && g_cann.has_nz(). Safe to call with unsupported
+    // runtime: returns without touching the buffer (caller must have already
+    // gated on has_nz()).
+    void nz_convert_weight_(void *weight_dev, int64_t rows, int64_t cols);
 
     // Core decode kernel sequence — what used to be the body of forward_decode
     // between the input-upload/cast and the final-output readback. Broken out

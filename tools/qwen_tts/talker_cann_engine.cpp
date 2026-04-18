@@ -288,10 +288,18 @@ TalkerCannEngine::~TalkerCannEngine() {
         one_scalar_f16_ = nullptr;
     }
 
-    if (stream_) {
-        g_cann.aclrtDestroyStream(stream_);
-        stream_ = nullptr;
+    // stream_ may either be pointing at primary_stream_ (default) or at some
+    // externally-owned stream handed in via set_stream() — in either case we
+    // only destroy the two streams this engine owns.
+    if (primary_stream_) {
+        g_cann.aclrtDestroyStream(primary_stream_);
+        primary_stream_ = nullptr;
     }
+    if (stream_b_) {
+        g_cann.aclrtDestroyStream(stream_b_);
+        stream_b_ = nullptr;
+    }
+    stream_ = nullptr;
 }
 
 // ============================================================================
@@ -334,6 +342,57 @@ void TalkerCannEngine::ensure_workspace_(size_t needed) {
 void TalkerCannEngine::upload_(void *dev, const void *host, size_t bytes) {
     ACL_CHECK_RET(g_cann.aclrtMemcpy(dev, bytes, host, bytes,
                                       ACL_MEMCPY_HOST_TO_DEVICE));
+}
+
+// ============================================================================
+// FRACTAL_NZ weight pre-conversion (M5.2). Wraps aclnnTransMatmulWeight: the
+// op refreshes the input tensor in-place so subsequent aclnnMm / aclnnMatMul
+// calls pick up the hardware-preferred private layout automatically. Safe
+// no-op when the runtime lacks the symbol — caller must still honor
+// use_nz_weights_; this helper gates on g_cann.has_nz() as a safety net.
+// ============================================================================
+
+void TalkerCannEngine::nz_convert_weight_(void *weight_dev,
+                                           int64_t rows, int64_t cols) {
+    if (!g_cann.has_nz() || weight_dev == nullptr) return;
+
+    // Build a throwaway [rows, cols] F16 tensor descriptor over the device
+    // buffer. aclnnTransMatmulWeight mutates the tensor metadata in place;
+    // the buffer pointer stays valid for reuse with aclnnMm afterwards.
+    int64_t shape[2]   = {rows, cols};
+    int64_t strides[2] = {cols, 1};
+    int64_t storage_len = rows * cols;
+    aclTensor *t = g_cann.aclCreateTensor(
+        shape, 2, ACL_FLOAT16, strides, 0, ACL_FORMAT_ND,
+        &storage_len, 1, weight_dev);
+    if (!t) {
+        fprintf(stderr, "[talker_cann] nz_convert: aclCreateTensor failed\n");
+        return;
+    }
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnTransMatmulWeightGetWorkspaceSize(
+        t, &ws_needed, &exec);
+    if (s != 0) {
+        fprintf(stderr, "[talker_cann] nz_convert: GetWorkspaceSize status=%d "
+                        "(shape=%lldx%lld)\n",
+                (int)s, (long long)rows, (long long)cols);
+        g_cann.aclDestroyTensor(t);
+        return;
+    }
+    ensure_workspace_(ws_needed);
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    s = g_cann.aclnnTransMatmulWeight(ws, ws_needed, exec, stream_);
+    if (s != 0) {
+        fprintf(stderr, "[talker_cann] nz_convert: TransMatmulWeight status=%d "
+                        "(shape=%lldx%lld)\n",
+                (int)s, (long long)rows, (long long)cols);
+    }
+    // Sync once per layer group to surface any device-side error. Weight
+    // conversion happens once at init so the sync cost is amortized.
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    g_cann.aclDestroyTensor(t);
 }
 
 // ============================================================================
@@ -395,7 +454,16 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
 
     device_ = device;
     ACL_CHECK_RET(g_cann.aclrtSetDevice(device_));
-    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_));
+    // Primary stream. Every engine op targets this by default. Stored in
+    // `primary_stream_` so set_stream(nullptr) can restore the default
+    // after an orchestrator temporarily redirected the engine onto another
+    // stream (M6 multi-stream pipelining).
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&primary_stream_));
+    stream_ = primary_stream_;
+    // Secondary stream owned by this engine. An orchestrator that wants to
+    // pipeline two engines on two physical NPU streams can grab this via
+    // get_stream_b() and hand it to the other engine's set_stream().
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
 
     // Cache dims from config.
     n_embd_     = cfg.hidden_size;
@@ -420,6 +488,24 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
         fprintf(stderr, "[talker_cann] failed to load GGUF: %s\n",
                 gguf_path.c_str());
         return false;
+    }
+
+    // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
+    // We need a workspace buffer before nz_convert_weight_ runs its first
+    // aclnnTransMatmulWeight, because the op's GetWorkspaceSize can report
+    // a non-zero scratch requirement. The regular workspace alloc happens
+    // lower down in init_from_gguf; move a small seed up here so the
+    // conversion path has something to grow from.
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    if (use_nz_weights_ && !g_cann.has_nz()) {
+        printf("[talker_cann] NZ weights requested but "
+               "aclnnTransMatmulWeight unresolved on this CANN toolkit — "
+               "falling back to ND\n");
+    }
+    if (nz_enabled && workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
     }
 
     // ---- Per-layer weights ----
@@ -458,6 +544,22 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
                                TFMT("blk.%d.ffn_down.weight"),
                                (size_t)n_embd_ * inter_, lw.down_proj_w))
             goto fail;
+
+        // --- FRACTAL_NZ pre-conversion (M5.2) ---
+        // Pre-bake every matmul weight so the matmul ops (M5.3 will flip
+        // these to WeightNz variants; today the default aclnnMm consumes
+        // the private layout transparently). Shapes here match the [out, in]
+        // layout aclnnMm expects — see the upload calls above for provenance.
+        if (nz_enabled) {
+            nz_convert_weight_(lw.q_proj_w,    q_dim_,   n_embd_);
+            nz_convert_weight_(lw.k_proj_w,    kv_dim_,  n_embd_);
+            nz_convert_weight_(lw.v_proj_w,    kv_dim_,  n_embd_);
+            nz_convert_weight_(lw.o_proj_w,    n_embd_,  q_dim_);
+            nz_convert_weight_(lw.gate_proj_w, inter_,   n_embd_);
+            nz_convert_weight_(lw.up_proj_w,   inter_,   n_embd_);
+            nz_convert_weight_(lw.down_proj_w, n_embd_,  inter_);
+        }
+
         // Norms: F32 gammas (matches aclnnRmsNorm SupportInfo for F16 x +
         // F32 gamma — same path CpCannEngine uses).
         if (!upload_tensor_f32(ggml_ctx,
@@ -551,10 +653,15 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     // Scalar used by aclnnAdd (alpha=1.0 F16).
     one_scalar_f16_ = make_f16_scalar(1.0f);
 
-    // Workspace seed (will grow on first big op).
-    workspace_size_ = 4 * 1024 * 1024;
-    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
-                                      ACL_MEM_MALLOC_HUGE_FIRST));
+    // Workspace seed (will grow on first big op). Skip if NZ pre-conversion
+    // already allocated (and possibly grown) the workspace during weight
+    // upload — it's valid and we don't want to leak the existing buffer.
+    if (workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+    nz_applied_ = nz_enabled;
 
     // aclGraph cache (M4). OPT-IN only: set TALKER_CANN_GRAPH=1 to enable.
     // Rationale: within a single utterance each `pos` is visited exactly once

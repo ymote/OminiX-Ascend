@@ -175,10 +175,18 @@ CpCannEngine::~CpCannEngine() {
     if (attn_scale_f16_) { g_cann.aclDestroyScalar(attn_scale_f16_); attn_scale_f16_ = nullptr; }
     if (one_scalar_)     { g_cann.aclDestroyScalar(one_scalar_);     one_scalar_     = nullptr; }
 
-    if (stream_) {
-        g_cann.aclrtDestroyStream(stream_);
-        stream_ = nullptr;
+    // stream_ may be pointing at primary_stream_ (default) or at some
+    // externally-owned stream handed in via set_stream() — only destroy the
+    // two streams this engine owns.
+    if (primary_stream_) {
+        g_cann.aclrtDestroyStream(primary_stream_);
+        primary_stream_ = nullptr;
     }
+    if (stream_b_) {
+        g_cann.aclrtDestroyStream(stream_b_);
+        stream_b_ = nullptr;
+    }
+    stream_ = nullptr;
 }
 
 // ============================================================================
@@ -216,6 +224,52 @@ static void upload_f16(void *dev, const float *host, size_t n) {
     ACL_CHECK_RET(g_cann.aclrtMemcpy(dev, n * sizeof(uint16_t),
                                       buf.data(), n * sizeof(uint16_t),
                                       ACL_MEMCPY_HOST_TO_DEVICE));
+}
+
+// ============================================================================
+// FRACTAL_NZ weight pre-conversion (M5.2). Mutates the weight tensor buffer
+// in place to the private NZ layout via aclnnTransMatmulWeight. Safe no-op
+// when g_cann.has_nz() is false. The F32 input projection weight is NOT
+// eligible — TransMatmulWeight only supports F16/INT8/BF16 — so callers
+// only invoke this on F16 Q/K/V/O/gate/up/down weights.
+// ============================================================================
+
+void CpCannEngine::nz_convert_weight_(void *weight_dev,
+                                       int64_t rows, int64_t cols) {
+    if (!g_cann.has_nz() || weight_dev == nullptr) return;
+
+    int64_t shape[2]   = {rows, cols};
+    int64_t strides[2] = {cols, 1};
+    int64_t storage_len = rows * cols;
+    aclTensor *t = g_cann.aclCreateTensor(
+        shape, 2, ACL_FLOAT16, strides, 0, ACL_FORMAT_ND,
+        &storage_len, 1, weight_dev);
+    if (!t) {
+        fprintf(stderr, "[cp_cann] nz_convert: aclCreateTensor failed\n");
+        return;
+    }
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnTransMatmulWeightGetWorkspaceSize(
+        t, &ws_needed, &exec);
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] nz_convert: GetWorkspaceSize status=%d "
+                        "(shape=%lldx%lld)\n",
+                (int)s, (long long)rows, (long long)cols);
+        g_cann.aclDestroyTensor(t);
+        return;
+    }
+    ensure_workspace(ws_needed);
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    s = g_cann.aclnnTransMatmulWeight(ws, ws_needed, exec, stream_);
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] nz_convert: TransMatmulWeight status=%d "
+                        "(shape=%lldx%lld)\n",
+                (int)s, (long long)rows, (long long)cols);
+    }
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+    g_cann.aclDestroyTensor(t);
 }
 
 // ============================================================================
@@ -458,7 +512,11 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     const std::streamoff data_base = 8 + (std::streamoff)header_size;
 
     ACL_CHECK_RET(g_cann.aclrtSetDevice(device_));
-    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_));
+    // Primary + secondary streams (M6.1). Primary is the default target;
+    // stream_b_ is spare for multi-stream pipelining.
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&primary_stream_));
+    stream_ = primary_stream_;
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
 
     // Helper: load one tensor by name, convert BF16 → F16 on host, upload.
     auto load_one_f16 = [&](const std::string &name, void *&dev,
@@ -527,6 +585,18 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     if (!load_one_f32(pfx + "small_to_mtp_projection.bias",   proj_b_dev_,
                       cp_hidden_)) return false;
 
+    // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    if (use_nz_weights_ && !g_cann.has_nz()) {
+        printf("[cp_cann] NZ weights requested but "
+               "aclnnTransMatmulWeight unresolved — falling back to ND\n");
+    }
+    if (nz_enabled && workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+
     // Per-layer weights.
     layer_w_.resize(n_layers_);
     for (int il = 0; il < n_layers_; ++il) {
@@ -546,6 +616,15 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
                           (size_t)inter_ * cp_hidden_)) return false;
         if (!load_one_f16(lp + "mlp.down_proj.weight", dst.down_proj_w,
                           (size_t)cp_hidden_ * inter_)) return false;
+        if (nz_enabled) {
+            nz_convert_weight_(dst.q_proj_w,    q_dim_,     cp_hidden_);
+            nz_convert_weight_(dst.k_proj_w,    kv_dim_,    cp_hidden_);
+            nz_convert_weight_(dst.v_proj_w,    kv_dim_,    cp_hidden_);
+            nz_convert_weight_(dst.o_proj_w,    cp_hidden_, q_dim_);
+            nz_convert_weight_(dst.gate_proj_w, inter_,     cp_hidden_);
+            nz_convert_weight_(dst.up_proj_w,   inter_,     cp_hidden_);
+            nz_convert_weight_(dst.down_proj_w, cp_hidden_, inter_);
+        }
         // Norms kept F32 (matches the F32 norm path in v9/v11).
         if (!load_one_f32(lp + "self_attn.q_norm.weight", dst.q_norm_w,
                           head_dim_)) return false;
@@ -623,9 +702,13 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
     attn_scale_f16_ = make_f16_scalar(1.0f / sqrtf((float)head_dim_));
     one_scalar_     = make_f16_scalar(1.0f);
 
-    workspace_size_ = 4 * 1024 * 1024;
-    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
-                                      ACL_MEM_MALLOC_HUGE_FIRST));
+    // Skip the seed alloc if NZ pre-conversion already set it up.
+    if (workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+    nz_applied_ = nz_enabled;
 
     build_persistent_tensors_();
 
@@ -649,7 +732,11 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
 
     device_ = device;
     ACL_CHECK_RET(g_cann.aclrtSetDevice(device_));
-    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_));
+    // Primary + secondary streams (M6.1). Primary is the default target;
+    // stream_b_ is spare for multi-stream pipelining.
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&primary_stream_));
+    stream_ = primary_stream_;
+    ACL_CHECK_RET(g_cann.aclrtCreateStream(&stream_b_));
 
     talker_hidden_ = cfg.talker_hidden_size;
     cp_hidden_     = cfg.hidden_size;
@@ -677,6 +764,19 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     alloc_dev(&proj_b_dev_, cp_hidden_ * sizeof(float));
     upload(proj_b_dev_, w.proj_b.data(), cp_hidden_);
 
+    // ---- FRACTAL_NZ gating (M5.2) ------------------------------------------
+    const bool nz_enabled = use_nz_weights_ && g_cann.has_nz();
+    if (use_nz_weights_ && !g_cann.has_nz()) {
+        printf("[cp_cann] NZ weights requested but "
+               "aclnnTransMatmulWeight unresolved — falling back to ND\n");
+    }
+    // Seed workspace early so nz_convert_weight_ has scratch to grow from.
+    if (nz_enabled && workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+
     layer_w_.resize(n_layers_);
     auto upload_mat_f16 = [&](void *&dev, const std::vector<float> &host,
                                int rows, int cols) {
@@ -693,6 +793,17 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
         upload_mat_f16(dst.gate_proj_w, src.gate_proj_w, inter_,     cp_hidden_);
         upload_mat_f16(dst.up_proj_w,   src.up_proj_w,   inter_,     cp_hidden_);
         upload_mat_f16(dst.down_proj_w, src.down_proj_w, cp_hidden_, inter_);
+        if (nz_enabled) {
+            // proj_w / proj_b are F32 (F32 input projection path); keep those
+            // in ND since TransMatmulWeight doesn't support F32 weights.
+            nz_convert_weight_(dst.q_proj_w,    q_dim_,     cp_hidden_);
+            nz_convert_weight_(dst.k_proj_w,    kv_dim_,    cp_hidden_);
+            nz_convert_weight_(dst.v_proj_w,    kv_dim_,    cp_hidden_);
+            nz_convert_weight_(dst.o_proj_w,    cp_hidden_, q_dim_);
+            nz_convert_weight_(dst.gate_proj_w, inter_,     cp_hidden_);
+            nz_convert_weight_(dst.up_proj_w,   inter_,     cp_hidden_);
+            nz_convert_weight_(dst.down_proj_w, cp_hidden_, inter_);
+        }
         // RMSNorm gammas are stored as F32 in the GGUF and aclnnRmsNorm
         // natively accepts F32 gamma with F16 input (SupportInfo[0]).
         // Casting them to F16 loses precision for a 1-in-1024-sized vector
@@ -782,9 +893,14 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
     one_scalar_     = make_f16_scalar(1.0f);
 
     // --- Workspace seed ---
-    workspace_size_ = 4 * 1024 * 1024;
-    ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
-                                      ACL_MEM_MALLOC_HUGE_FIRST));
+    // Skip if the NZ pre-conversion path already allocated and possibly
+    // grew the workspace earlier; we don't want to leak that buffer.
+    if (workspace_dev_ == nullptr) {
+        workspace_size_ = 4 * 1024 * 1024;
+        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
+                                          ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+    nz_applied_ = nz_enabled;
 
     build_persistent_tensors_();
 

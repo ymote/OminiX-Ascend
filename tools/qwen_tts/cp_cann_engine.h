@@ -72,12 +72,48 @@ public:
         active_layers_ = (n > 0 && n < n_layers_) ? n : 0;
     }
 
+    // Pre-convert each F16 matmul weight buffer to CANN's FRACTAL_NZ layout
+    // (M5.2). MUST be called before init / init_from_safetensors — the
+    // conversion runs inline during weight upload. Per-layer Q/K/V/O/gate/up/
+    // down projections get the aclnnTransMatmulWeight pass when enabled AND
+    // g_cann.has_nz() is true. The F32 input projection (proj_w) is left in
+    // ND because TransMatmulWeight only supports F16/INT8/BF16 weights. If
+    // the runtime lacks the symbol we silently fall back to ND; default
+    // (flag off) preserves pre-M5 behaviour bit-for-bit. Matmul call sites
+    // still dispatch via plain aclnnMm — format is transparent to the op
+    // API (see M5.1 audit).
+    void set_use_nz_weights(bool enable) { use_nz_weights_ = enable; }
+    bool use_nz_weights() const { return use_nz_weights_; }
+    // True once the NZ pre-conversion actually ran on the weight buffers.
+    bool nz_applied() const { return nz_applied_; }
+
+    // ---- Multi-stream pipelining (M6.1) -----------------------------------
+    // Engine owns two aclrtStream handles — `primary_stream_` (default) and
+    // `stream_b_` (spare for multi-stream overlap). set_stream(s) swaps
+    // which stream subsequent ops target; passing nullptr restores the
+    // primary.
+    //
+    // Lifetime: both streams are created in init()/init_from_safetensors
+    // and destroyed in the dtor. set_stream() does NOT take ownership of
+    // the passed handle.
+    aclrtStream get_stream()         const { return stream_; }
+    aclrtStream get_stream_b()       const { return stream_b_; }
+    aclrtStream get_primary_stream() const { return primary_stream_; }
+    void set_stream(aclrtStream s) {
+        stream_ = (s != nullptr) ? s : primary_stream_;
+    }
+
     bool is_ready() const { return ready_; }
 
 private:
     bool ready_ = false;
     int device_ = 0;
-    aclrtStream stream_ = nullptr;
+    // `stream_` is the stream every op in this engine targets. By default
+    // it points to `primary_stream_`; an orchestrator can swap it via
+    // set_stream() to pipeline two engines on two physical NPU streams.
+    aclrtStream stream_         = nullptr;
+    aclrtStream primary_stream_ = nullptr;  // owned
+    aclrtStream stream_b_       = nullptr;  // owned; used for M6 overlap
 
     // Model dimensions (cached from config)
     int talker_hidden_ = 0;  // 2048
@@ -225,11 +261,19 @@ private:
     };
     Tensors t_{};
 
+    // ---- FRACTAL_NZ weight pre-conversion (M5.2) ----------------------------
+    bool use_nz_weights_ = false;
+    bool nz_applied_     = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
     void download(float *host, const void *dev, size_t n_floats);
     void ensure_workspace(size_t needed);
+    // Apply aclnnTransMatmulWeight in place. No-op if runtime lacks has_nz()
+    // or if use_nz_weights_ is false. See header comment on
+    // set_use_nz_weights() for the full semantics.
+    void nz_convert_weight_(void *weight_dev, int64_t rows, int64_t cols);
 
     // Create all persistent aclTensor descriptors after weights + buffers
     // have been allocated. Called once at the end of init().

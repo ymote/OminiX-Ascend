@@ -102,6 +102,13 @@ bool load_once() {
     ok &= resolve(h_rt,   "aclrtMemcpyAsync",         g_cann.aclrtMemcpyAsync);
     ok &= resolve(h_rt,   "aclGetRecentErrMsg",       g_cann.aclGetRecentErrMsg);
 
+    // Event APIs (multi-stream sync — M6). Required on every supported CANN.
+    ok &= resolve(h_rt,   "aclrtCreateEvent",         g_cann.aclrtCreateEvent);
+    ok &= resolve(h_rt,   "aclrtDestroyEvent",        g_cann.aclrtDestroyEvent);
+    ok &= resolve(h_rt,   "aclrtRecordEvent",         g_cann.aclrtRecordEvent);
+    ok &= resolve(h_rt,   "aclrtStreamWaitEvent",     g_cann.aclrtStreamWaitEvent);
+    ok &= resolve(h_rt,   "aclrtSynchronizeEvent",    g_cann.aclrtSynchronizeEvent);
+
     // aclnn base (libnnopbase)
     ok &= resolve(h_base, "aclCreateTensor",          g_cann.aclCreateTensor);
     ok &= resolve(h_base, "aclDestroyTensor",         g_cann.aclDestroyTensor);
@@ -164,6 +171,14 @@ bool load_once() {
                      g_cann.aclmdlRIExecuteAsync);
     resolve_optional(h_rt, "aclmdlRIDestroy",
                      g_cann.aclmdlRIDestroy);
+
+    // Optional: FRACTAL_NZ weight pre-conversion (M5). Lives in libopapi.so
+    // alongside the other aclnn ops; absence means older CANN and callers
+    // gate via has_nz() before touching weights.
+    resolve_optional(h_op, "aclnnTransMatmulWeightGetWorkspaceSize",
+                     g_cann.aclnnTransMatmulWeightGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnTransMatmulWeight",
+                     g_cann.aclnnTransMatmulWeight);
 
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
