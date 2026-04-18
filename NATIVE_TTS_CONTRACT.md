@@ -251,10 +251,46 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
 
 ### M4 — aclGraph capture per-shape (1 week) — PARALLEL after M3
 
-- [ ] 4.1 Add `aclmdlRI*` symbols to `cp_cann_symbols.{h,cpp}`.
-- [ ] 4.2 Wrap `forward_decode` with capture/replay: one graph per `pos` in
+- [x] 4.1 Add `aclmdlRI*` symbols to `cp_cann_symbols.{h,cpp}`.
+  Four entries wired via `resolve_optional` (non-fatal on older CANN):
+  `aclmdlRICaptureBegin`, `aclmdlRICaptureEnd`, `aclmdlRIExecuteAsync`,
+  `aclmdlRIDestroy`. There is no `aclmdlRICreate` in the public API —
+  a graph is created implicitly by the Capture{Begin,End} pair
+  (CUDA-Graph-style). `CannSyms::has_aclgraph()` returns true only when
+  all four resolve, so callers degrade to eager silently on pre-8.3
+  toolkits. The `aclmdlRI` / `aclmdlRICaptureMode` types come from
+  `acl/acl_rt.h`, pulled in transitively by `acl/acl.h`.
+  **Verified-by:** qwen_tts build on Ascend 910B4 links and runs; `nm
+  -D /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so` shows
+  all four entries present; `[talker_cann] aclGraph ENABLED` log line
+  fires when `TALKER_CANN_GRAPH=1` is set, confirming `has_aclgraph()`
+  returns true on the target runtime. Gate: smoke.
+- [~] 4.2 Wrap `forward_decode` with capture/replay: one graph per `pos` in
   [0, MAX_SEQ). Cache graphs; first call per pos captures, subsequent
   replays. Pre-warm workspace allocations before capture.
+  **Status**: fully wired (pre-warm + CaptureBegin/End + `std::vector<aclmdlRI>
+  decode_graphs_(MAX_SEQ)` cache + `aclmdlRIExecuteAsync` replay + fall-
+  back to eager on any error + graph invalidation on workspace realloc),
+  **bit-identical codec output** vs eager on the canonical long utterance
+  (0-byte diff on 76 generated frames, seed=42, cp_groups=8, target text
+  "Speech synthesis on neural processing units is a compelling application
+  of modern deep learning."), but **does not deliver a single-utterance
+  throughput win** — see §8 note dated 2026-04-19 for the analysis.
+  Gated behind `TALKER_CANN_GRAPH=1` opt-in; default stays eager so
+  single-shot qwen_tts benchmarks are unaffected. Marking `[~]` (rather
+  than `[x]`) until a session-mode caller actually reuses the graph
+  cache across utterances and M4.5 throughput gate can be met. Code is
+  production-safe in opt-out mode (`TALKER_CANN_NO_GRAPH=1` also works).
+  **Verified-by:**
+  (a) bit-identical: `diff /tmp/eager_frames.txt /tmp/graph_frames.txt`
+      returns 0 bytes; gate = content.
+  (b) throughput (regression, NOT a pass): eager 14.5 fps → aclGraph
+      6.2 fps (~2.3× slowdown) on the canonical utterance; LLM-only
+      timing 17 ms/step eager vs 67 ms/step aclGraph, so the
+      CaptureBegin/End pair is costing ~50 ms per step. Gate =
+      throughput (FAILED for single-utterance runs). See §8.
+  (c) crash-clean: no ACL error messages in `/tmp/graph.log`; no
+      stuck graphs (destructor cleans up `decode_graphs_` fully).
 - [ ] 4.3 Same for `forward_prefill` at common prefill lengths (50-200) —
   or LRU cache with dynamic capture.
 - [ ] 4.4 **Quality gate**: audio bit-identical to non-graph path.
@@ -377,6 +413,46 @@ carrying a silent false claim.
   (d) Deferred full byte-for-byte validation vs llama.cpp (would require
   linking the test to the llama.cpp compute path); smoke gates cover
   "engine runs correctly" and M2 will cover "audio quality matches".
+- **2026-04-19 M4.1 landed, M4.2 blocked by workload shape (design
+  note)**: the aclmdlRI* symbols and the per-pos graph cache are fully
+  wired in `TalkerCannEngine::forward_decode`, captured graphs replay
+  bit-identically, and the path crash-cleanly falls back to eager on
+  any runtime failure. But the intended throughput win is not reachable
+  for single-utterance workloads with this design, for two reasons that
+  are both structural to the model rather than the implementation:
+  (1) **No intra-utterance amortization**. The Talker decodes strictly
+  left-to-right: for an N-token output we call `forward_decode(pos=p)`
+  exactly once for each p in [prefill_len, prefill_len+N). Capture-once-
+  then-replay can only amortize cost if the same `pos` is revisited in
+  the same session, which never happens within one utterance. Capturing
+  at each new `pos` pays 1× eager (pre-warm) + 1× capture overhead and
+  returns 0× replay savings in the first (and, for single-shot
+  `qwen_tts`, only) pass.
+  (2) **CaptureBegin/CaptureEnd overhead is high on CANN 8.3**. Measured
+  on the canonical long utterance ("Speech synthesis on neural processing
+  units…", seed=42, cp_groups=8, 76 output frames), per-step Talker
+  timing was 17 ms eager vs 67 ms with capture enabled — a ~50 ms tax per
+  `forward_decode` call, which is nearly 3× the eager step cost.
+  `ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL` was slightly less bad than
+  `GLOBAL` (5.4 → 6.2 fps end-to-end) but still a net regression from
+  14.5 fps eager.
+  Decision: default OFF (`TALKER_CANN_GRAPH=1` opt-in), leave the
+  infrastructure in place for the server-mode use-case (persistent
+  engine across utterances can replay captured graphs from utterance 2
+  onward and skip the per-step overhead), and mark M4.2 `[~]` with the
+  throughput gate explicitly failed. The `[x]` cannot land until either
+  (a) a benchmark harness exercises multi-utterance reuse, or (b) the
+  capture-cost/replay-cost ratio improves (CANN 8.3 tuning work, or
+  `aclmdlRICaptureTaskUpdateBegin/End` per-argument updates — which is
+  M4.3+ territory). M5 (FRACTAL_NZ) and M6 (multi-stream) are the
+  better near-term attacks on the 22+ fps target, since they apply to
+  every decode step regardless of pos reuse.
+  **Files touched (Track C only)**: `tools/qwen_tts/cp_cann_symbols.{h,cpp}`
+  (+27 lines; 4 optional symbols + `has_aclgraph()`), `tools/qwen_tts/
+  talker_cann_engine.{h,cpp}` (+~200 lines; `run_decode_ops_` extraction,
+  `decode_graphs_` cache, opt-in init, capture/replay flow, workspace-
+  grow invalidation, destructor cleanup). No edits to `main.cpp`,
+  `CMakeLists.txt`, or `forward_prefill`.
 
 ## 9. Parallelism playbook
 

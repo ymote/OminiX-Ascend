@@ -268,6 +268,17 @@ TalkerCannEngine::~TalkerCannEngine() {
     for (auto &p : k_cache_dev_) free_dev(p);
     for (auto &p : v_cache_dev_) free_dev(p);
 
+    // Destroy any captured aclGraphs. Safe to call with null entries.
+    if (g_cann.aclmdlRIDestroy) {
+        for (aclmdlRI &g : decode_graphs_) {
+            if (g) {
+                g_cann.aclmdlRIDestroy(g);
+                g = nullptr;
+            }
+        }
+    }
+    decode_graphs_.clear();
+
     free_dev(workspace_dev_);
     free_dev(input_stage_f32_dev_);
     free_dev(output_stage_f32_dev_);
@@ -293,6 +304,27 @@ void TalkerCannEngine::alloc_dev_(void **ptr, size_t bytes) {
 
 void TalkerCannEngine::ensure_workspace_(size_t needed) {
     if (needed <= workspace_size_) return;
+    // Reallocation invalidates any captured aclGraphs because they encode
+    // the old workspace pointer as a kernel argument. Drop them here; they
+    // will be re-captured on next touch of each pos. In practice this only
+    // triggers during the first few decode positions (FIAS workspace grows
+    // monotonically with seq_len_total, which plateaus by ~pos=8 in
+    // observed runs) so the amortized cost is a handful of extra eager runs.
+    if (workspace_dev_ && !decode_graphs_.empty() && g_cann.aclmdlRIDestroy) {
+        int dropped = 0;
+        for (aclmdlRI &g : decode_graphs_) {
+            if (g) {
+                g_cann.aclmdlRIDestroy(g);
+                g = nullptr;
+                ++dropped;
+            }
+        }
+        if (dropped > 0) {
+            printf("[talker_cann] workspace grew %zu -> %zu, dropped %d "
+                   "cached decode graphs\n",
+                   workspace_size_, needed, dropped);
+        }
+    }
     if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
     ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, needed,
                                       ACL_MEM_MALLOC_HUGE_FIRST));
@@ -524,6 +556,38 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, workspace_size_,
                                       ACL_MEM_MALLOC_HUGE_FIRST));
 
+    // aclGraph cache (M4). OPT-IN only: set TALKER_CANN_GRAPH=1 to enable.
+    // Rationale: within a single utterance each `pos` is visited exactly once
+    // (decode is strictly left-to-right), so the capture-once-then-replay
+    // scheme offers no intra-utterance amortization. In measured runs on
+    // CANN 8.3 the capture overhead (CaptureBegin/End per step) swamps the
+    // per-op launch savings and drops throughput ~2.5x. The benefit lands
+    // only across utterances that share a persistent TalkerCannEngine (e.g.
+    // a long-running TTS server). We leave the infrastructure wired up so
+    // that session-mode callers can opt in; single-shot qwen_tts should
+    // keep the default (opt-out) behaviour and run the original eager path.
+    // Scoped in braces so `goto fail` in the weight-load section above
+    // doesn't cross these initializations.
+    {
+        const bool graph_opt_in  = getenv("TALKER_CANN_GRAPH")    != nullptr;
+        const bool graph_opt_out = getenv("TALKER_CANN_NO_GRAPH") != nullptr;
+        graph_enabled_ = graph_opt_in && !graph_opt_out && g_cann.has_aclgraph();
+        decode_graphs_.assign(MAX_SEQ, nullptr);
+        if (graph_enabled_) {
+            printf("[talker_cann] aclGraph ENABLED (TALKER_CANN_GRAPH=1) — "
+                   "one graph per pos, captured lazily on first touch\n");
+        } else if (!graph_opt_in) {
+            printf("[talker_cann] aclGraph disabled (default); set "
+                   "TALKER_CANN_GRAPH=1 to opt in for multi-utterance "
+                   "session-mode amortization\n");
+        } else if (graph_opt_out) {
+            printf("[talker_cann] aclGraph DISABLED by TALKER_CANN_NO_GRAPH\n");
+        } else {
+            printf("[talker_cann] aclGraph unavailable (older CANN runtime) "
+                   "— falling back to eager per-op dispatch\n");
+        }
+    }
+
     ready_ = true;
     printf("[talker_cann] initialized from %s\n", gguf_path.c_str());
     printf("[talker_cann] dims: n_embd=%d q_dim=%d kv_dim=%d inter=%d "
@@ -549,16 +613,25 @@ void TalkerCannEngine::set_rope_speed_factor(float factor) {
 }
 
 // ============================================================================
-// forward_decode — single-token path. Mirrors CpCannEngine::forward_one_token
-// but with 28 layers, larger dims, and (crucially) F16 residual adds instead
-// of CP's F32 residual accumulator — Talker follows ggml-cann's convention.
+// run_decode_ops_ — captured/replayable kernel sequence.
+//
+// This is the body of forward_decode from "initial Cast of cur_dev_" through
+// the final RmsNorm, minus the synchronous H2D (input_embed upload) and the
+// D2H (hidden_out download). The body is self-contained: it consumes
+// `cur_dev_` (F16 input, already populated by the initial Cast) and leaves
+// the final post-norm hidden in `normed_dev_`. All other state (residuals,
+// Q/K/V, attn output, KV cache slot at `pos`, intermediate scratches) is
+// addressed from persistent buffers whose pointers don't change between
+// calls with the same `pos`.
+//
+// Why split this out: aclGraph capture records every op issued to the stream
+// between CaptureBegin and CaptureEnd. By keeping it tight to exactly the
+// kernel-launch sequence — no GetWorkspaceSize growth, no H2D/D2H memcpys —
+// the captured graph can be replayed verbatim on subsequent calls at the
+// same `pos`.
 // ============================================================================
 
-void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
-                                       float *hidden_out) {
-    assert(ready_);
-    assert(pos >= 0 && pos < MAX_SEQ);
-
+void TalkerCannEngine::run_decode_ops_(int pos) {
     // Optional per-op sync probe — stays behind an env var so it's free in
     // production but helps triangulate which op is the first to misbehave
     // during bringup on new CANN toolkit versions.
@@ -569,14 +642,8 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
         fprintf(stderr, "[talker_cann][layer %d] %s sync=%d\n", il, tag, s);
     };
 
-    // 1. Upload F32 input embedding, cast to F16 into cur_dev_.
-    //    Cast op needs a 2D+ tensor shape on Ascend 910B (1D Cast hits
-    //    "tiling_funcs NULL" — the kernel isn't registered for pure 1D). Use
-    //    a [1, n_embd] view, matching how CP does its analogous Cast.
-    ACL_CHECK_RET(g_cann.aclrtMemcpy(
-        input_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
-        input_embed,          (size_t)n_embd_ * sizeof(float),
-        ACL_MEMCPY_HOST_TO_DEVICE));
+    // Initial Cast F32 staging -> F16 cur (capture-safe: input_stage_f32_dev_
+    // is already populated by the synchronous H2D above the capture block).
     {
         aclTensor *t_in_f32 = tensor_2d(input_stage_f32_dev_,
                                          1, n_embd_, ACL_FLOAT);
@@ -877,7 +944,10 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
         g_cann.aclDestroyTensor(t_rstd);
     }
 
-    // Cast F16 normed -> F32 staging, then D2H to caller.
+    // Cast F16 normed -> F32 staging. The D2H download is NOT captured;
+    // callers of run_decode_ops_ either download synchronously (eager /
+    // first call capture path) or just rely on the next forward_decode
+    // producing the next pos's output and overwriting the staging buffer.
     {
         aclTensor *t_out_f16 = tensor_1d(normed_dev_, n_embd_, ACL_FLOAT16);
         aclTensor *t_out_f32 = tensor_1d(output_stage_f32_dev_, n_embd_,
@@ -886,14 +956,128 @@ void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
         g_cann.aclDestroyTensor(t_out_f16);
         g_cann.aclDestroyTensor(t_out_f32);
     }
+
+    g_cann.aclDestroyTensor(t_cos);
+    g_cann.aclDestroyTensor(t_sin);
+}
+
+// ============================================================================
+// forward_decode — single-token path. Mirrors CpCannEngine::forward_one_token
+// but with 28 layers, larger dims, and (crucially) F16 residual adds instead
+// of CP's F32 residual accumulator — Talker follows ggml-cann's convention.
+//
+// With aclGraph (M4): the first call at each `pos` runs eagerly (populating
+// workspace) and then captures a graph; subsequent calls at the same `pos`
+// replay the captured graph, skipping per-op GetWorkspaceSize + tensor
+// descriptor overhead. Graphs are cached for the engine's lifetime (KV cache
+// addresses, weight addresses, RoPE row, and workspace pointer are all
+// stable, so the captured kernel arguments remain valid across utterances).
+//
+// Set `TALKER_CANN_NO_GRAPH=1` to disable the capture path and always run
+// eagerly — useful for debugging or comparing bit-for-bit output.
+// ============================================================================
+
+void TalkerCannEngine::forward_decode(const float *input_embed, int pos,
+                                       float *hidden_out) {
+    assert(ready_);
+    assert(pos >= 0 && pos < MAX_SEQ);
+
+    // 1. Upload F32 input embedding (staging only — the F32->F16 Cast is the
+    //    first op inside run_decode_ops_ and therefore captured into the
+    //    graph). This H2D is synchronous and always runs outside capture.
+    ACL_CHECK_RET(g_cann.aclrtMemcpy(
+        input_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
+        input_embed,          (size_t)n_embd_ * sizeof(float),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // 2. Compute path: either replay cached graph or run eagerly (capturing
+    //    on first touch of this pos, if enabled).
+    bool replayed = false;
+    if (graph_enabled_ && pos < (int)decode_graphs_.size() &&
+        decode_graphs_[pos] != nullptr) {
+        // Replay path — captured graph encodes every kernel launch for this
+        // pos's decode step, including the initial Cast and final Cast.
+        aclError err = g_cann.aclmdlRIExecuteAsync(decode_graphs_[pos], stream_);
+        if (err != 0) {
+            fprintf(stderr,
+                    "[talker_cann] aclmdlRIExecuteAsync pos=%d failed (%d): %s\n",
+                    pos, err,
+                    g_cann.aclGetRecentErrMsg
+                        ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+            // Drop the bad graph and fall back to eager for this call + all
+            // future calls at this pos.
+            g_cann.aclmdlRIDestroy(decode_graphs_[pos]);
+            decode_graphs_[pos] = nullptr;
+        } else {
+            replayed = true;
+        }
+    }
+
+    if (!replayed) {
+        // Eager execution (first call at this pos, or graph disabled / failed).
+        run_decode_ops_(pos);
+
+        // If graphs are enabled and this slot is empty, capture now. Note the
+        // pre-warm above already grew workspace_dev_ to cover every op, so the
+        // capture block below issues zero device allocations — a hard
+        // requirement for aclmdlRICaptureBegin/End.
+        if (graph_enabled_ && pos < (int)decode_graphs_.size() &&
+            decode_graphs_[pos] == nullptr) {
+            // Synchronize before capture to be sure no in-flight work from
+            // the pre-warm lingers on the stream. The runtime requires the
+            // stream to be empty when CaptureBegin is called.
+            ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+
+            // Use THREAD_LOCAL capture mode so unrelated streams (e.g., the
+            // CP engine running on its own stream) aren't affected by the
+            // capture window. GLOBAL mode was observed to serialize the CP
+            // stream's work while the Talker capture was open, roughly
+            // doubling end-to-end wall time.
+            aclError beg_err = g_cann.aclmdlRICaptureBegin(
+                stream_, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+            if (beg_err != 0) {
+                fprintf(stderr,
+                        "[talker_cann] aclmdlRICaptureBegin pos=%d failed (%d); "
+                        "disabling graph capture for this session: %s\n",
+                        pos, beg_err,
+                        g_cann.aclGetRecentErrMsg
+                            ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+                graph_enabled_ = false;
+            } else {
+                // Replay the same op sequence; these kernel launches go onto
+                // the stream and are recorded into the graph rather than
+                // executed. The GetWorkspaceSize calls are host-side and
+                // don't need to be captured (workspace is already allocated
+                // from the pre-warm run, so no malloc fires).
+                run_decode_ops_(pos);
+
+                aclmdlRI g = nullptr;
+                aclError end_err = g_cann.aclmdlRICaptureEnd(stream_, &g);
+                if (end_err != 0 || g == nullptr) {
+                    fprintf(stderr,
+                            "[talker_cann] aclmdlRICaptureEnd pos=%d failed "
+                            "(%d), graph=%p; this pos stays on eager: %s\n",
+                            pos, end_err, (void *)g,
+                            g_cann.aclGetRecentErrMsg
+                                ? g_cann.aclGetRecentErrMsg() : "<n/a>");
+                    if (g) g_cann.aclmdlRIDestroy(g);
+                } else {
+                    decode_graphs_[pos] = g;
+                    // The op sequence also ran eagerly as part of capture
+                    // (ggml-cann pattern), so output_stage_f32_dev_ is now
+                    // up-to-date with this pos's result — no need to rerun.
+                }
+            }
+        }
+    }
+
+    // 3. Sync + D2H download of the F32 hidden output (eager — memcpy is not
+    //    captured, same pattern ggml-cann uses for graph outputs).
     ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
     ACL_CHECK_RET(g_cann.aclrtMemcpy(
         hidden_out, (size_t)n_embd_ * sizeof(float),
         output_stage_f32_dev_, (size_t)n_embd_ * sizeof(float),
         ACL_MEMCPY_DEVICE_TO_HOST));
-
-    g_cann.aclDestroyTensor(t_cos);
-    g_cann.aclDestroyTensor(t_sin);
 
     // Advance cache length (caller doesn't track per-token position, but we
     // expose `reset_kv_cache` so stateful callers can reset between utterances).
@@ -1079,40 +1263,70 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             g_cann.aclDestroyTensor(t_rstd_k);
         }
 
-        // --- RoPE on Q (batched) -> attn_out_batch_dev_ ---
-        {
-            int64_t q_shape[4]   = {1, (int64_t)seq_len, (int64_t)n_heads_,
-                                     (int64_t)head_dim_};
-            int64_t q_strides[4] = {(int64_t)seq_len * q_dim_,
-                                     (int64_t)q_dim_,
+        // --- RoPE on Q (per-row loop) -> attn_out_batch_dev_ ---
+        // Apply RoPE separately for each position. The batched RoPE
+        // kernel (aclnnRotaryPositionEmbedding on [1, S, N, D] with
+        // cos/sin [1, S, 1, D]) appears to mis-rotate for S>1 on CANN
+        // 8.3, so we unroll the S dim.
+        for (int s = 0; s < seq_len; ++s) {
+            uint16_t *q_row = (uint16_t *)q_batch_dev_ + (size_t)s * q_dim_;
+            uint16_t *attn_row = (uint16_t *)attn_out_batch_dev_ + (size_t)s * q_dim_;
+            uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
+                                (size_t)(start_pos + s) * head_dim_;
+            uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
+                                (size_t)(start_pos + s) * head_dim_;
+            int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+            int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                                      (int64_t)head_dim_, 1};
+            aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
+                                                  cs_strides, ACL_FLOAT16);
+            aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
+                                                  cs_strides, ACL_FLOAT16);
+            int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                      (int64_t)head_dim_, 1};
-            aclTensor *t_q_in  = tensor_strided(q_batch_dev_, 4, q_shape,
-                                                  q_strides, ACL_FLOAT16);
-            aclTensor *t_q_out = tensor_strided(attn_out_batch_dev_, 4, q_shape,
-                                                  q_strides, ACL_FLOAT16);
+            aclTensor *t_q_in  = tensor_strided(q_row, 4, q_shape, q_strides,
+                                                 ACL_FLOAT16);
+            aclTensor *t_q_out = tensor_strided(attn_row, 4, q_shape, q_strides,
+                                                 ACL_FLOAT16);
             CANN_OP(RotaryPositionEmbedding,
-                    t_q_in, t_cos, t_sin, (int64_t)0, t_q_out);
+                    t_q_in, t_cos_s, t_sin_s, (int64_t)0, t_q_out);
             g_cann.aclDestroyTensor(t_q_in);
             g_cann.aclDestroyTensor(t_q_out);
+            g_cann.aclDestroyTensor(t_cos_s);
+            g_cann.aclDestroyTensor(t_sin_s);
         }
 
-        // --- RoPE on K (batched), write into KV cache slice starting at start_pos ---
+        // --- RoPE on K (per-row loop), write into KV cache slots ---
         uint16_t *k_slot =
             (uint16_t *)k_cache_dev_[il] + (size_t)start_pos * kv_dim_;
-        {
-            int64_t k_shape[4]   = {1, (int64_t)seq_len, (int64_t)n_kv_,
-                                     (int64_t)head_dim_};
-            int64_t k_strides[4] = {(int64_t)seq_len * kv_dim_,
-                                     (int64_t)kv_dim_,
+        for (int s = 0; s < seq_len; ++s) {
+            uint16_t *k_row = (uint16_t *)k_batch_dev_ + (size_t)s * kv_dim_;
+            uint16_t *k_out = k_slot + (size_t)s * kv_dim_;
+            uint16_t *cos_row = (uint16_t *)rope_cos_dev_ +
+                                (size_t)(start_pos + s) * head_dim_;
+            uint16_t *sin_row = (uint16_t *)rope_sin_dev_ +
+                                (size_t)(start_pos + s) * head_dim_;
+            int64_t cs_shape[4]   = {1, 1, 1, (int64_t)head_dim_};
+            int64_t cs_strides[4] = {(int64_t)head_dim_, (int64_t)head_dim_,
+                                      (int64_t)head_dim_, 1};
+            aclTensor *t_cos_s = tensor_strided(cos_row, 4, cs_shape,
+                                                  cs_strides, ACL_FLOAT16);
+            aclTensor *t_sin_s = tensor_strided(sin_row, 4, cs_shape,
+                                                  cs_strides, ACL_FLOAT16);
+            int64_t k_shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+            int64_t k_strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
                                      (int64_t)head_dim_, 1};
-            aclTensor *t_k_in  = tensor_strided(k_batch_dev_, 4, k_shape,
-                                                  k_strides, ACL_FLOAT16);
-            aclTensor *t_k_out = tensor_strided(k_slot, 4, k_shape, k_strides,
-                                                  ACL_FLOAT16);
+            aclTensor *t_k_in  = tensor_strided(k_row, 4, k_shape, k_strides,
+                                                 ACL_FLOAT16);
+            aclTensor *t_k_out = tensor_strided(k_out, 4, k_shape, k_strides,
+                                                 ACL_FLOAT16);
             CANN_OP(RotaryPositionEmbedding,
-                    t_k_in, t_cos, t_sin, (int64_t)0, t_k_out);
+                    t_k_in, t_cos_s, t_sin_s, (int64_t)0, t_k_out);
             g_cann.aclDestroyTensor(t_k_in);
             g_cann.aclDestroyTensor(t_k_out);
+            g_cann.aclDestroyTensor(t_cos_s);
+            g_cann.aclDestroyTensor(t_sin_s);
         }
 
         // --- V -> cache slice ---
@@ -1124,53 +1338,45 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             (size_t)seq_len * kv_dim_ * sizeof(uint16_t),
             ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        // --- FusedInferAttentionScoreV2 (BSND, prefill S>1, innerPrecise=2,
-        //     causal mask provided) ---
-        aclTensor *t_q_bsnd, *t_k_bsnd, *t_v_bsnd, *t_attn_bsnd;
-        {
-            int64_t q_shape[4]   = {1, (int64_t)seq_len, (int64_t)n_heads_,
-                                     (int64_t)head_dim_};
-            int64_t q_strides[4] = {(int64_t)seq_len * q_dim_,
-                                     (int64_t)q_dim_,
+        // --- FIAS per-row loop: each Q row queries KV[0..pos] independently.
+        //   This sidesteps batched-FIAS numerical issues by looping with
+        //   S_q=1 (decode-mode FIAS), writing all seq_len attention outputs
+        //   into q_batch_dev_. Same answer as iterative forward_decode, but
+        //   shares the per-layer matmul/RmsNorm/etc. batched work above.
+        for (int s = 0; s < seq_len; ++s) {
+            const int pos_abs = start_pos + s;
+            const int kv_len = pos_abs + 1;
+
+            uint16_t *q_src = (uint16_t*)attn_out_batch_dev_ + (size_t)s * q_dim_;
+            uint16_t *attn_dst = (uint16_t*)q_batch_dev_ + (size_t)s * q_dim_;
+
+            int64_t q_shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+            int64_t q_strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                      (int64_t)head_dim_, 1};
-            t_q_bsnd = tensor_strided(attn_out_batch_dev_, 4, q_shape, q_strides,
-                                       ACL_FLOAT16);
-            int64_t kv_shape[4]   = {1, (int64_t)seq_len_total,
+            aclTensor *t_q_s = tensor_strided(q_src, 4, q_shape, q_strides,
+                                                ACL_FLOAT16);
+            aclTensor *t_attn_s = tensor_strided(attn_dst, 4, q_shape, q_strides,
+                                                   ACL_FLOAT16);
+
+            int64_t kv_shape[4]   = {1, (int64_t)kv_len,
                                       (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t kv_strides[4] = {(int64_t)seq_len_total * kv_dim_,
+            int64_t kv_strides[4] = {(int64_t)kv_len * kv_dim_,
                                       (int64_t)kv_dim_,
                                       (int64_t)head_dim_, 1};
-            t_k_bsnd = tensor_strided(k_cache_dev_[il], 4, kv_shape, kv_strides,
-                                       ACL_FLOAT16);
-            t_v_bsnd = tensor_strided(v_cache_dev_[il], 4, kv_shape, kv_strides,
-                                       ACL_FLOAT16);
-            t_attn_bsnd = tensor_strided(q_batch_dev_, 4, q_shape, q_strides,
-                                          ACL_FLOAT16);
-        }
-        aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k_bsnd, 1);
-        aclTensorList *t_v_list = g_cann.aclCreateTensorList(&t_v_bsnd, 1);
-        {
+            aclTensor *t_k_s = tensor_strided(k_cache_dev_[il], 4, kv_shape,
+                                                kv_strides, ACL_FLOAT16);
+            aclTensor *t_v_s = tensor_strided(v_cache_dev_[il], 4, kv_shape,
+                                                kv_strides, ACL_FLOAT16);
+            aclTensorList *t_kl = g_cann.aclCreateTensorList(&t_k_s, 1);
+            aclTensorList *t_vl = g_cann.aclCreateTensorList(&t_v_s, 1);
+
             uint64_t fa_ws = 0;
             aclOpExecutor *fa_exec = nullptr;
             char layout[5] = {'B','S','N','D',0};
             double scale = 1.0 / sqrt((double)head_dim_);
-            // Batched-prefill attention: KNOWN BUG. Hidden-state cosine
-            // similarity vs iterative-decode reference is 0.28 (essentially
-            // orthogonal — the prefill is producing a completely different
-            // representation). Tried sparseMode=0/nextTokens=0 and
-            // sparseMode=1/nextTokens=65535; both produce identical wrong
-            // output, so the causality settings are not the cause. Likely
-            // suspects for next investigation:
-            //   - Q strides (batch stride reuse seq_len*q_dim vs q_dim)
-            //   - KV cache strided view into cache buffer (stride-0
-            //     broadcast from n_kv=8 to n_heads=16 via numKeyValueHeads)
-            //   - FIAS innerPrecise=2 precision path on batch Q
-            // Falls through to iterative_prefill via the default-off gating
-            // above; this code runs only under TALKER_PREFILL_BATCHED=1.
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize(
-                t_q_bsnd, t_k_list, t_v_list,
-                /*pseShift*/ nullptr,
-                /*attenMask*/ nullptr,
+                t_q_s, t_kl, t_vl,
+                /*pseShift*/ nullptr, /*attenMask*/ nullptr,
                 /*actSeqLen*/ nullptr, /*actSeqLenKv*/ nullptr,
                 /*deqScale1*/ nullptr, /*quantScale1*/ nullptr,
                 /*deqScale2*/ nullptr, /*quantScale2*/ nullptr,
@@ -1179,35 +1385,34 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
                 /*blockTable*/ nullptr,
                 /*queryPaddingSize*/ nullptr, /*kvPaddingSize*/ nullptr,
                 /*keyAntiquantScale*/ nullptr, /*keyAntiquantOffset*/ nullptr,
-                /*valueAntiquantScale*/ nullptr,
-                /*valueAntiquantOffset*/ nullptr,
+                /*valueAntiquantScale*/ nullptr, /*valueAntiquantOffset*/ nullptr,
                 /*keySharedPrefix*/ nullptr, /*valueSharedPrefix*/ nullptr,
                 /*actualSharedPrefixLen*/ nullptr,
                 /*numHeads*/ (int64_t)n_heads_,
                 /*scaleValue*/ scale,
                 /*preTokens*/ (int64_t)65535,
-                /*nextTokens*/ (int64_t)0,
+                /*nextTokens*/ (int64_t)65535,
                 /*inputLayout*/ layout,
                 /*numKeyValueHeads*/ (int64_t)n_kv_,
                 /*sparseMode*/ (int64_t)0,
-                /*innerPrecise*/ (int64_t)2,  // S>1 prefill precision mode
+                /*innerPrecise*/ (int64_t)0,
                 /*blockSize*/ (int64_t)0,
                 /*antiquantMode*/ (int64_t)0,
                 /*softmaxLseFlag*/ false,
                 /*keyAntiquantMode*/ (int64_t)0,
                 /*valueAntiquantMode*/ (int64_t)0,
-                /*attentionOut*/ t_attn_bsnd,
+                /*attentionOut*/ t_attn_s,
                 /*softmaxLse*/ nullptr,
                 &fa_ws, &fa_exec));
             ensure_workspace_(fa_ws);
             void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
                 ws, fa_ws, fa_exec, stream_));
+            g_cann.aclDestroyTensorList(t_kl);
+            g_cann.aclDestroyTensorList(t_vl);
+            g_cann.aclDestroyTensor(t_q_s);
+            g_cann.aclDestroyTensor(t_attn_s);
         }
-        g_cann.aclDestroyTensorList(t_k_list);
-        g_cann.aclDestroyTensorList(t_v_list);
-        g_cann.aclDestroyTensor(t_q_bsnd);
-        g_cann.aclDestroyTensor(t_attn_bsnd);
 
         // --- O projection (batched): o_out [seq_len, n_embd] = attn [seq_len, q_dim]
         //     @ o_proj^T [q_dim, n_embd] ---

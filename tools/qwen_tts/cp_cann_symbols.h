@@ -162,7 +162,30 @@ struct CannSyms {
                                                     aclOpExecutor *,
                                                     aclrtStream);
 
+    // ---- aclGraph (aclmdlRI*) — runtime graph capture/replay ---------------
+    // Present on CANN 8.3+. The aclmdlRI / aclmdlRICaptureMode types come from
+    // `acl/acl_rt.h` (pulled in transitively by `acl/acl.h` above). If the
+    // toolkit is older and the symbols don't resolve, has_aclgraph() returns
+    // false and callers fall back to eager execution silently. Note: there is
+    // no `aclmdlRICreate` in the public API — a graph is created implicitly
+    // by the CaptureBegin/CaptureEnd pair, similar to CUDA's
+    // cudaStreamBeginCapture/cudaStreamEndCapture flow.
+    aclError (*aclmdlRICaptureBegin)(aclrtStream, aclmdlRICaptureMode);
+    aclError (*aclmdlRICaptureEnd)(aclrtStream, aclmdlRI *);
+    aclError (*aclmdlRIExecuteAsync)(aclmdlRI, aclrtStream);
+    aclError (*aclmdlRIDestroy)(aclmdlRI);
+
     bool is_ready() const { return aclrtMalloc != nullptr; }
+
+    // Separate capability flag: aclGraph is optional. Callers that want to
+    // use capture/replay check this first and silently fall back to eager
+    // mode if it returns false (e.g., running on CANN < 8.3).
+    bool has_aclgraph() const {
+        return aclmdlRICaptureBegin != nullptr &&
+               aclmdlRICaptureEnd   != nullptr &&
+               aclmdlRIExecuteAsync != nullptr &&
+               aclmdlRIDestroy      != nullptr;
+    }
 };
 
 extern CannSyms g_cann;

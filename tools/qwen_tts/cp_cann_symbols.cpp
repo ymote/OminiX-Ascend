@@ -35,6 +35,17 @@ bool resolve(void *handle, const char *name, FnPtr &out) {
     return true;
 }
 
+// Same as resolve() but doesn't log/fail when the symbol is missing. Used for
+// optional symbols (aclGraph entry points on older CANN toolkits).
+template <typename FnPtr>
+void resolve_optional(void *handle, const char *name, FnPtr &out) {
+    dlerror();
+    void *sym = dlsym(handle, name);
+    const char *err = dlerror();
+    if (sym && !err) out = reinterpret_cast<FnPtr>(sym);
+    // else: leave nullptr, checked via has_aclgraph()
+}
+
 bool load_once() {
     // Each of these lives in a different CANN shared object. We search a few
     // common paths (flat + aarch64-linux) to be robust against toolkit layout
@@ -142,6 +153,17 @@ bool load_once() {
                   g_cann.aclnnFusedInferAttentionScoreV2GetWorkspaceSize);
     ok &= resolve(h_op,   "aclnnFusedInferAttentionScoreV2",
                   g_cann.aclnnFusedInferAttentionScoreV2);
+
+    // Optional: aclGraph (aclmdlRI*). Present on CANN 8.3+ only. Absence is
+    // not fatal — callers that want capture/replay gate on has_aclgraph().
+    resolve_optional(h_rt, "aclmdlRICaptureBegin",
+                     g_cann.aclmdlRICaptureBegin);
+    resolve_optional(h_rt, "aclmdlRICaptureEnd",
+                     g_cann.aclmdlRICaptureEnd);
+    resolve_optional(h_rt, "aclmdlRIExecuteAsync",
+                     g_cann.aclmdlRIExecuteAsync);
+    resolve_optional(h_rt, "aclmdlRIDestroy",
+                     g_cann.aclmdlRIDestroy);
 
     if (!ok) {
         // Wipe partial state so is_ready() reports false.

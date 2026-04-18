@@ -27,6 +27,8 @@
 #include <vector>
 #include <cstdint>
 
+#include "cp_cann_symbols.h"
+
 struct TalkerConfig;
 
 class TalkerCannEngine {
@@ -170,10 +172,40 @@ private:
     std::vector<float> cos_host_;  // [MAX_SEQ * head_dim]
     std::vector<float> sin_host_;
 
+    // ---- aclGraph capture/replay cache (M4) --------------------------------
+    // One graph per position slot. First call at pos=p runs eagerly AND
+    // captures the kernel stream into decode_graphs_[p]. Subsequent calls at
+    // the same pos replay the captured graph (saves per-kernel launch
+    // overhead, which dominates at 28 layers × ~10 ops/layer). Because KV
+    // cache, RoPE row, and workspace addresses are all tied to `pos`, two
+    // calls at the same pos map to identical kernel arguments — only the
+    // input embedding (input_stage_f32_dev_) and output (output_stage_f32_dev_)
+    // vary between calls. Those are host-memcpy'd outside the captured region.
+    //
+    // Vector sized to MAX_SEQ up front; entries are nullptr until captured.
+    // `pos` increments monotonically during a utterance, so the cache fills
+    // in order. reset_kv_cache() does NOT invalidate graphs — the captured
+    // ops only depend on pos, KV cache addresses, and weight addresses, all
+    // of which are stable across utterances (the KV cache is overwritten in
+    // place, but the address is the same). This means the graph cache
+    // amortizes across every utterance in a session.
+    std::vector<aclmdlRI> decode_graphs_;
+    bool graph_enabled_ = false;  // Set at init based on env var + symbol
+                                   // availability. When false, forward_decode
+                                   // runs its original eager path unmodified.
+
     // ---- Internal helpers ----
     void alloc_dev_(void **ptr, size_t bytes);
     void ensure_workspace_(size_t needed);
     void upload_(void *dev, const void *host, size_t bytes);
     void build_rope_tables_();   // populate cos/sin and upload as F16.
     void build_causal_mask_();   // fill causal_mask_dev_ once at init.
+
+    // Core decode kernel sequence — what used to be the body of forward_decode
+    // between the input-upload/cast and the final-output readback. Broken out
+    // so capture mode can record exactly these ops while the surrounding H2D
+    // and D2H transfers stay on the eager path. Assumes `cur_dev_` already
+    // holds the F16 input and leaves the final (post-norm) result in
+    // `normed_dev_` ready to be cast to F32 and downloaded.
+    void run_decode_ops_(int pos);
 };
