@@ -841,6 +841,16 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
 
     // No ref audio to cut (x-vector mode doesn't include ref in codec)
     audio_out = std::move(full_audio);
+    // Cubic 200 ms fade-in at the decoder boundary (same as ICL path).
+    // x-vector mode starts from a cold decoder state, so the first ~100 ms
+    // still carries a noise burst that a linear fade leaves audible.
+    {
+        int fade_samples = std::min((int)(200 * 24), (int)audio_out.size());
+        for (int i = 0; i < fade_samples; i++) {
+            float t = (float)i / fade_samples;
+            audio_out[i] *= t * t * t;
+        }
+    }
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), audio_out.size() / 24000.0f);
     return true;
@@ -886,6 +896,14 @@ bool QwenTTS::generate_customvoice(const QwenTTSParams& params, std::vector<floa
     }
 
     audio_out = std::move(full_audio);
+    // Cubic 200 ms fade-in at the decoder boundary (see ICL + xvec notes).
+    {
+        int fade_samples = std::min((int)(200 * 24), (int)audio_out.size());
+        for (int i = 0; i < fade_samples; i++) {
+            float t = (float)i / fade_samples;
+            audio_out[i] *= t * t * t;
+        }
+    }
     printf("  Output: %zu samples (%.2f sec at 24kHz)\n",
            audio_out.size(), audio_out.size() / 24000.0f);
     return true;
