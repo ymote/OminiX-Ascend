@@ -2008,19 +2008,20 @@ bool TalkerLLM::generate(
                                 cp_cann_engine_ &&
                                 cp_cann_engine_->is_ready();
 
-    // Speculative-embedding toggle.  Defaults ON when the pipelined stack
-    // is available; `TALKER_SPECULATIVE=0` opts back into Track H's k=1
-    // behaviour (useful when A/B'ing ASR gates).
-    bool pipeline_speculative = pipeline_base;
+    // Speculative-embedding toggle. Benchmarks showed the speculative
+    // variant is ~1 fps SLOWER than the Track H k=1 path on single-
+    // utterance workloads (26.5 vs 27.7 fps on the long utt) because the
+    // Cast+InplaceAdd+fence overhead exceeds the overlap win on our short
+    // CP (cp_groups=8). Default OFF; opt in with `TALKER_SPECULATIVE=1`
+    // for experiments on workloads with longer CP or larger max_tokens
+    // where the overlap win is expected to dominate.
+    bool pipeline_speculative = false;
     if (pipeline_base) {
         const char *spec = getenv("TALKER_SPECULATIVE");
-        if (spec && spec[0] == '0' && spec[1] == '\0') {
-            pipeline_speculative = false;
-            printf("[talker] TALKER_SPECULATIVE=0 — falling back to k=1 "
-                   "pipeline (Track H behaviour)\n");
-        } else {
-            printf("[talker] M6.2 Track J speculative-embedding pipeline "
-                   "enabled (set TALKER_SPECULATIVE=0 to disable)\n");
+        if (spec && spec[0] == '1' && spec[1] == '\0') {
+            pipeline_speculative = true;
+            printf("[talker] TALKER_SPECULATIVE=1 — speculative-embedding "
+                   "pipeline enabled (experimental)\n");
         }
     }
     const bool pipeline_native = pipeline_base;  // either mode needs the swap
