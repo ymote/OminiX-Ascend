@@ -673,7 +673,19 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
         audio_out = std::move(full_audio);
     }
 
-
+    // Fade-in mask for the decoder boundary artifact at the ref/target cut
+    // point. Originally landed as e6eb3929 (50 ms); the patch was lost in a
+    // later merge. 120 ms linear ramp tamps the brief noise burst that
+    // survives the cut without audibly softening the onset of speech.
+    {
+        int fade_ms = 120;
+        int fade_samples = std::min(
+            (int)(fade_ms * 24 /* samples per ms at 24kHz */),
+            (int)audio_out.size());
+        for (int i = 0; i < fade_samples; i++) {
+            audio_out[i] *= (float)i / fade_samples;
+        }
+    }
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
     double total_time = std::chrono::duration<double>(total_t1 - total_t0).count();
