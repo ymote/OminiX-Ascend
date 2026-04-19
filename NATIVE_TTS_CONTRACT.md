@@ -818,17 +818,17 @@ File: `tools/qwen_tts/talker_cann_engine.{h,cpp}` — mirrors `CpCannEngine`.
   natural EOS at step 74 with no NaN/inf in the W8 scale buffers (sanity
   check during calib). Gate: init-lands; no numerical faults.
 - [x] S2 Accuracy recovery loop (if needed).
-  **Verified-by:** commit `f10508a`, ModelArts `build-85` binary, canonical
-  utt1/utt2/utt3 under `TALKER_W8_QUANT=1 TASK_QUEUE_ENABLE=2`: all three
-  reach natural EOS (utt1→53 frames, utt2→35, utt3→34); waveforms saved at
-  `/tmp/w8_utt{1,2,3}.wav` on ModelArts. ASR-based edit-distance check
-  `scripts/asr_quality_check.sh` is NOT present in the repo yet (only
-  `scripts/native_tts_quality_gate.sh` which uses DTW); this stamp is based
-  on clean EOS + the S1 init-phase NaN sanity check. Accuracy recovery loop
-  was not needed — the symmetric INT8 calibration with the existing F16
-  prefill + F16 activation path produced audible, EOS-terminating output on
-  the first attempt. See §8 Track M note for the caveat about the missing
-  script.
+  **Verified-by:** commit `0d6160d7`, ModelArts `build-85` binary, canonical
+  utt1/utt2/utt3 under `TALKER_W8_QUANT=1 TASK_QUEUE_ENABLE=2`:
+    - utt1 → "Good morning. How are you today?" (target "Good morning, how
+      are you today." — edit-distance 2: `,→.` plus `.→?`)
+    - utt2 → verbatim match (edit-distance 0)
+    - utt3 → verbatim match (edit-distance 0)
+  ASR via `mlx-community/whisper-base-mlx` on host Mac. Artifacts at
+  `~/Desktop/omx-tts-samples/w8/w8_utt{1,2,3}.wav`. Accuracy recovery loop
+  was not needed — symmetric per-channel INT8 calibration produced
+  EOS-terminating, content-correct output on the first attempt. All three
+  utterances pass the contract §6 edit-distance ≤ 2 gate.
 - [~] S3 End-to-end validation. **Throughput PASSED**: long utt (seed=42,
   cp_groups=8) `TALKER_W8_QUANT=1 TASK_QUEUE_ENABLE=2` yields
   **33.8 fps median** over 3 runs (33.8 / 33.9 / 33.5) vs NZ baseline
