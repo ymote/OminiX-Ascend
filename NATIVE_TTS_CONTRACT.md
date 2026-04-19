@@ -816,6 +816,13 @@ carrying a silent false claim.
 
 ## 8. Decision log (live — append when deviating)
 
+- **Pointer**: Track N GGUF quant-on-load exploration doc lives at
+  [`docs/gguf_quant_exploration.md`](docs/gguf_quant_exploration.md) —
+  K-quants (Q4_K_M / Q5_K_M / Q8_0) vs Ascend-native A16W8 (Stretch S1)
+  trade-off analysis, inventory of existing pre-quantized GGUFs under
+  `tools/qwen_tts/gguf/`, dequant-on-load implementation sketch. Parked,
+  not a v1 concern.
+
 - **2026-04-19 Track I — CANN 8.3 vs 8.5 regression: NOT reproducible today;
   likely env-state/container-reset, mitigation `TASK_QUEUE_ENABLE=2`**:
   Re-ran the canonical long utterance ("Speech synthesis on neural processing
