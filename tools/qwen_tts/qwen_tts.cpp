@@ -204,6 +204,34 @@ bool QwenTTS::load(const QwenTTSParams& params) {
     }
 
     loaded_ = true;
+
+    // Warm-up pass: dispatch a trivial xvec generation (5 throw-away frames)
+    // through TalkerCannEngine so the first real xvec call doesn't pay the
+    // aclnn kernel JIT + rope-cache cold-start cost (~1s on 910B4 CANN 8.5).
+    // ICL already amortizes this via an internal 5-frame warmup; xvec didn't,
+    // which made short-utt xvec appear 15-25% slower than ICL. The speaker
+    // encoder remains a per-request cost (can't precompute without a real
+    // ref audio).
+    if (getenv("QWEN_TTS_SKIP_WARMUP") == nullptr) {
+        printf("[qwen_tts] warming up xvec path (one-time, ~1s)...\n");
+        auto t_wu0 = std::chrono::high_resolution_clock::now();
+        std::vector<float> fake_spk(talker_.get_config().hidden_size, 0.0f);
+        std::vector<int> fake_text_tokens = { 0 };
+        std::vector<std::vector<int>> throwaway_codes;
+        TalkerSamplingParams wu_sampling = params.sampling;
+        // Greedy + tiny max = fastest possible dispatch that still hits every layer.
+        wu_sampling.do_sample = false;
+        wu_sampling.cp_do_sample = false;
+        std::string wu_lang = params.target_lang;
+        for (auto &c : wu_lang) c = tolower(c);
+        (void)talker_.generate_xvec(fake_text_tokens, fake_spk,
+                                     wu_lang, throwaway_codes,
+                                     /*max_new_tokens=*/5, wu_sampling);
+        auto t_wu1 = std::chrono::high_resolution_clock::now();
+        double wu_ms = std::chrono::duration<double, std::milli>(t_wu1 - t_wu0).count();
+        printf("[qwen_tts] warmup done in %.0f ms\n", wu_ms);
+    }
+
     return true;
 }
 
@@ -787,22 +815,28 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
     std::string lang = params.target_lang;
     for (auto &c : lang) c = tolower(c);
 
+    auto t_phase0 = std::chrono::high_resolution_clock::now();
+
     // Extract speaker embedding from ref audio
     std::vector<float> ref_audio;
     if (!audio_io::load_audio(params.ref_audio, 24000, ref_audio)) {
         printf("FAIL: cannot load ref audio\n");
         return false;
     }
+    auto t_phase1 = std::chrono::high_resolution_clock::now();
+
     std::vector<float> spk_embedding;
     if (!speaker_encoder_.extract(ref_audio, 24000, spk_embedding)) {
         printf("FAIL: speaker embedding extraction failed\n");
         return false;
     }
     printf("  Speaker embedding: %zu dims\n", spk_embedding.size());
+    auto t_phase2 = std::chrono::high_resolution_clock::now();
 
     // Tokenize target text
     std::vector<int> ref_text_tokens, target_text_tokens;
     tokenize_tts_text("", params.text, ref_text_tokens, target_text_tokens);
+    auto t_phase3 = std::chrono::high_resolution_clock::now();
 
     // Generate codec tokens via x-vector mode.
     // B6.2: TalkerLLM::generate_xvec now auto-dispatches to the native
@@ -817,6 +851,14 @@ bool QwenTTS::generate_xvec(const QwenTTSParams& params, std::vector<float>& aud
             return false;
         }
     }
+    auto t_phase4 = std::chrono::high_resolution_clock::now();
+
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    printf("[xvec-prof] load_audio=%.1f ms  spk_encoder=%.1f ms  tokenize=%.1f ms  talker_xvec=%.1f ms\n",
+           ms(t_phase0, t_phase1), ms(t_phase1, t_phase2),
+           ms(t_phase2, t_phase3), ms(t_phase3, t_phase4));
 
     int n_gen_frames = codec_tokens.empty() ? 0 : (int)codec_tokens[0].size();
     printf("  Generated %d codec frames\n", n_gen_frames);
