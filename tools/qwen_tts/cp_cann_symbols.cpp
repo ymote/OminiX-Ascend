@@ -232,6 +232,15 @@ bool load_once() {
     resolve_optional(h_op, "aclnnAddRmsNorm",
                      g_cann.aclnnAddRmsNorm);
 
+    // Optional: aclnnInplaceAddRmsNorm (Phase A.1, CANN 8.3+). Lives in
+    // libopapi.so alongside the non-inplace variant. Absence means the
+    // toolkit lacks the in-place sibling and callers must stay on
+    // aclnnAddRmsNorm + residual-copy. Gated via has_inplace_add_rms_norm().
+    resolve_optional(h_op, "aclnnInplaceAddRmsNormGetWorkspaceSize",
+                     g_cann.aclnnInplaceAddRmsNormGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnInplaceAddRmsNorm",
+                     g_cann.aclnnInplaceAddRmsNorm);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};

@@ -436,6 +436,15 @@ private:
     std::vector<aclmdlRI> aclgraph_graphs_;
     void *zero_f16_cp_dev_ = nullptr;  // F16 [cp_hidden] zeros — copy helper
 
+    // ---- Phase A.1: aclnnInplaceAddRmsNorm drop-in (TALKER_CP_INPLACE_ADDRMSNORM)
+    // When set AND g_cann.has_inplace_add_rms_norm(), the fused post-attn and
+    // post-FFN tails dispatch aclnnInplaceAddRmsNorm and skip the trailing
+    // residual-copy (saves ~75 aclnn copies/frame). Per the Phase A contract,
+    // aclGraph capture is disabled while this flag is on until A.3 verifies
+    // the inplace semantics compose with captured tensor descriptors.
+    bool cp_inplace_ars_enabled_ = false;
+    bool cp_inplace_ars_applied_ = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);

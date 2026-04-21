@@ -112,6 +112,24 @@ struct CannSyms {
                                     aclOpExecutor *executor,
                                     aclrtStream stream);
 
+    // ---- Inplace Add + RmsNorm (Phase A.1, CANN 8.3+) ----------------------
+    // In-place sibling of aclnnAddRmsNorm. Per aclnn_inplace_add_rms_norm.h:
+    //     x2Ref  <- x1 + x2            (becomes the updated residual)
+    //     x1Ref  <- RmsNorm(x1+x2, gamma, eps)  (becomes the normed tensor)
+    //     rstdOut <- 1 / sqrt(mean((x1+x2)^2) + eps)
+    // i.e. the x1 slot is overwritten with yOut and the x2 slot is overwritten
+    // with xOut — no separate output buffers, no residual-copy needed on the
+    // caller side. Dtype / gamma conventions match the non-inplace variant
+    // (F16 x1Ref/x2Ref/gamma, F32 rstdOut). Gated by has_inplace_add_rms_norm().
+    aclnnStatus (*aclnnInplaceAddRmsNormGetWorkspaceSize)(
+        aclTensor *x1Ref, aclTensor *x2Ref, const aclTensor *gamma,
+        double epsilon, const aclTensor *rstdOut,
+        uint64_t *workspaceSize, aclOpExecutor **executor);
+    aclnnStatus (*aclnnInplaceAddRmsNorm)(void *workspace,
+                                           uint64_t workspaceSize,
+                                           aclOpExecutor *executor,
+                                           aclrtStream stream);
+
     // Attention-on-NPU ops (added for the v2 engine — no host roundtrips).
     aclnnStatus (*aclnnBatchMatMulGetWorkspaceSize)(const aclTensor *,
                                                      const aclTensor *,
@@ -378,6 +396,16 @@ struct CannSyms {
     bool has_add_rms_norm() const {
         return aclnnAddRmsNormGetWorkspaceSize != nullptr &&
                aclnnAddRmsNorm                 != nullptr;
+    }
+
+    // Capability flag for aclnnInplaceAddRmsNorm (Phase A.1, CANN 8.3+).
+    // When present + TALKER_CP_INPLACE_ADDRMSNORM=1, CpCannEngine writes
+    // rmsnorm(x1+x2) back into x1Ref and the sum into x2Ref, eliminating the
+    // residual-copy that follows aclnnAddRmsNorm. Absence means caller keeps
+    // the non-inplace path.
+    bool has_inplace_add_rms_norm() const {
+        return aclnnInplaceAddRmsNormGetWorkspaceSize != nullptr &&
+               aclnnInplaceAddRmsNorm                 != nullptr;
     }
 };
 
