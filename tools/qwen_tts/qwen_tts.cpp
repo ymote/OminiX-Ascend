@@ -754,17 +754,50 @@ bool QwenTTS::generate(const QwenTTSParams& params, std::vector<float>& audio_ou
     // (matches Python: cut = int(ref_len / total_len * wav.shape[0]))
     int total_frames = n_ref_frames + n_gen_frames;
     int cut = (int)((long long)n_ref_frames * (long long)full_audio.size() / std::max(total_frames, 1));
-    // Shift the cut forward past the decoder's ref→target boundary transient.
-    // The decoder's conv receptive field straddles the ref/gen codec seam;
-    // the first ~150 ms post-boundary carry a settle ripple that earlier
-    // fade-based mitigations (50/120/200 ms cubic) could attenuate but not
-    // eliminate. Speech onset in practice lands ~170-250 ms post-boundary,
-    // so dropping 150 ms of the lead-in discards the transient without
-    // clipping the first consonant.
-    const int transient_margin = 3600;  // 150 ms at 24 kHz
-    cut += transient_margin;
-    printf("  Cutting first %d samples (%.2f sec) -- ref portion + %d ms boundary margin\n",
-           cut, cut / 24000.0f, transient_margin * 1000 / 24000);
+    // Content-aware trim: the decoder's conv receptive field straddles the
+    // ref/gen codec seam and the settle region's length varies per ref audio
+    // (measured 150 ms on mayun_ref, ~300 ms on ellen_ref). A fixed margin
+    // (previous values 50/120/150/200 ms) either leaves a noise tail on one
+    // ref or clips the onset on another. Instead: starting at the
+    // proportional ref/gen cut, scan forward in 10 ms windows and advance
+    // past any window whose RMS is below the speech-onset threshold. Cap
+    // the scan at 500 ms so we can never eat real speech.
+    // Require k consecutive windows above the speech-onset threshold before
+    // declaring "speech starts here". A single noise transient (peak ~0.05)
+    // can momentarily exceed the RMS bar but isn't sustained speech; only
+    // when speech truly begins do we see several windows in a row at
+    // 0.05+ RMS (real speech floors at ~0.1 RMS on this codec/decoder).
+    {
+        constexpr int   window_samples  = 240;      // 10 ms at 24 kHz
+        constexpr float onset_threshold = 0.05f;    // real speech is ≥ 0.1
+        constexpr int   onset_consecutive = 3;      // 30 ms sustained
+        constexpr int   max_scan        = 14400;    // 600 ms cap
+        int scan_end = std::min(cut + max_scan, (int)full_audio.size());
+        int advance = 0;
+        int streak = 0;
+        int speech_start_adv = -1;
+        while (cut + advance + window_samples <= scan_end) {
+            double ss = 0.0;
+            for (int j = 0; j < window_samples; j++) {
+                float s = full_audio[cut + advance + j];
+                ss += (double)s * (double)s;
+            }
+            float rms = (float)std::sqrt(ss / window_samples);
+            if (rms >= onset_threshold) {
+                if (streak == 0) speech_start_adv = advance;
+                streak++;
+                if (streak >= onset_consecutive) break;
+            } else {
+                streak = 0;
+                speech_start_adv = -1;
+            }
+            advance += window_samples;
+        }
+        int applied = (speech_start_adv >= 0) ? speech_start_adv : advance;
+        cut += applied;
+        printf("  Cutting first %d samples (%.2f sec) -- ref portion + %d ms content-aware trim\n",
+               cut, cut / 24000.0f, applied * 1000 / 24000);
+    }
     if (getenv("QWEN_TTS_KEEP_REF") != nullptr) {
         printf("  QWEN_TTS_KEEP_REF set — emitting full decoded audio "
                "(ref + target), for decoder round-trip check.\n");
