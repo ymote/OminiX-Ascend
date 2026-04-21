@@ -2,9 +2,36 @@
 
 ## 1. Status & mandate
 
-**Status**: NEW (2026-04-21, PM signed). Umbrella contract for the
-stretch target. Subsumes `FUSED_OP_LANDING_CONTRACT.md` as its
-milestone M1.
+**Status (2026-04-21 FINAL)**: **RECALIBRATED — M3 DEAD**.
+
+Agent GD-audit (2026-04-21) confirmed Qwen3-TTS is **strict 15-step
+RVQ depth transformer**. Four independent sources (MLX reference at
+`qwen3-tts-mlx/src/talker.rs:372-389`, Ascend native CANN at
+`talker.cpp:1681-1734`, llama.cpp path at `talker.cpp:1813-1837`, CPU
+path at `talker.cpp:1879-1896`) confirm each group's forward pass
+receives the embedding of the previous group's sampled integer token.
+**Group-collapse is structurally impossible.** See
+`docs/cp_group_dependency_audit.md` for the citations.
+
+**Revised realistic single-card ceiling**:
+
+| Lever | Δ | Cumulative |
+|---|---|---|
+| Current (aclGraph on, LONG) | baseline | 31.6 |
+| M1 Phase A+B (vendor fused ops) | +1.5 | ~33 |
+| M1-extra (lower-ranked FO-audit) | +0.5 | ~33.5 |
+| M3'new' — position 0+1 batching (tiny) | +1.0 | ~34.5 |
+| M2 Talker aclGraph | +1-2 | ~35.5-36.5 |
+| M4 W8 → W4 quant (ear-gate risky) | +2-5 | ~37.5-41.5 |
+
+**40 fps is only reachable with M4 W4 quant** — the quality risk is
+real. Without W4, realistic single-card ceiling is **~36 fps**
+(≈M4 Pro parity). For a dependable 40+, cluster tensor-parallel is
+the structural path.
+
+Umbrella contract subsumes `FUSED_OP_LANDING_CONTRACT.md` as M1. M3
+(group-collapse) is CLOSED without dispatch. M3'new' (pos-batching)
+added as small micro-opt.
 
 **Target**: **≥ 40 fps** on canonical xvec mayun zh LONG text, aclGraph
 on, sampling on (ship config), byte-identical user-ear verdict.
@@ -99,27 +126,32 @@ should apply analogously.
 
 **M2 gate**: fps ≥ 34.5 LONG + drift ≤ 1 + ear clean.
 
-### M3 — CP group-collapse (→ potentially 40+ fps)
+### M3 — CP group-collapse — **CLOSED (NO-COLLAPSE verdict)**
 
-**HARD GATE on GD-audit verdict**:
-- FULL-COLLAPSE (parallel codebooks): full batch=15 CP forward →
-  ~5× CP speedup. Major engine rewrite but algorithmically clean.
-- PARTIAL-COLLAPSE: batch subset of groups. Less speedup, moderate
-  rewrite.
-- NO-COLLAPSE (strict RVQ): M3 is dead; fps ceiling = M1 + M2.
+GD-audit (`docs/cp_group_dependency_audit.md`, 2026-04-21): Qwen3-TTS
+is strict RVQ. Group *i*'s forward pass consumes group *i-1*'s
+sampled integer token via `codec_embeddings[i-1]` → embed → project
+→ new 5-layer CP transformer pass. 15 separate codec_embeddings and
+15 separate lm_heads are classic RVQ-depth-transformer architecture
+(Qwen2.5-Omni / MoonCast lineage). Dispatch-free dependency from
+group *i-1* to *i* makes batch=N impossible.
 
-If GD-audit returns GREEN/YELLOW:
+M3 not dispatched. Fps ceiling without this lever = M1 + M2 + M3'new'
+= ~35-36 fps.
 
-- [ ] M3.1 Design doc: new CP forward signature, batch dimension,
-      KV-cache layout changes
-- [ ] M3.2 Offline numerical validation: batched CP forward output ==
-      sequential (bit-identical at cp_greedy)
-- [ ] M3.3 Wire into CpCannEngine behind `TALKER_CP_GROUP_BATCH=N`
-      (where N = batch size, e.g. 5 or 15)
-- [ ] M3.4 Drift gate + ear gate
-- [ ] M3.5 Perf gate: fps ≥ 40 LONG
+### M3'new' — Position 0+1 batching micro-opt (→ ~34.5 fps)
 
-**M3 gate**: fps ≥ 40 LONG + drift ≤ 1 + ear clean.
+Bonus finding from GD-audit: native CANN path issues 2 sequential
+`forward_one_token_launch` calls for positions 0 and 1
+(`talker.cpp:1647` and `1667`), while llama.cpp (`talker.cpp:1784-1798`)
+and MLX paths already batch these as `n_tokens=2`. Gap ~1 ms/frame.
+
+- [ ] M3'new'.1 Wire `n_tokens=2` path into CpCannEngine for
+      positions 0+1 at frame start
+- [ ] M3'new'.2 Drift + ear gates
+- [ ] M3'new'.3 Perf gate: fps delta vs M1+M2 baseline
+
+**Gate**: +0.5-1.5 fps + drift ≤ 1 + ear clean. ~2-4 hr work.
 
 ### M4 — W8 → W4 quant (conditional, → potentially 42-55)
 
