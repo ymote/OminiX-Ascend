@@ -14,6 +14,16 @@ C ABI, reaching **≥ 25 fps** end-to-end on Ascend 910B4 with audio quality
 **indistinguishable from MLX golden** (DTW log-mel ≥ 0.85, plus user-ear pass
 on five distinct utterances).
 
+**STATUS (2026-04-20): goal MET at clean quality.** Post-W1 landing
+measurement on canonical mayun xvec Chinese (W8 + TQE=2 +
+**cp_groups=15** + sampling on, ac01): **30.2 fps**, user-ear
+confirmed identical to pre-W1 baseline. The prior S3 citation of
+33.8 fps relied on `--cp_groups 8` which user ear-check rejected for
+low-frequency rumble (see §8 2026-04-20 entry). The honest clean-
+quality number is 30.2 fps; the fps/quality frontier is now documented
+in the CP_FPS_OPTIMIZATION_CONTRACT (OminiX-API repo) rather than
+extended here.
+
 ## 2. Non-goals
 
 - Supporting GGUF quantizations below Q8_0 (CANN is unoptimized for Q4/Q5).
