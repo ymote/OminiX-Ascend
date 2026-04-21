@@ -29,6 +29,37 @@ if(QWEN_TTS_CP_CANN)
     message(STATUS "qwen_tts: CP CANN engine ENABLED (+ native Talker)")
 endif()
 
+# -----------------------------------------------------------------------------
+# Path C W4.1: AscendC custom kernels.
+#
+# The fused_attn_sublayer kernel collapses the CP transformer's attention
+# sublayer (12 aclnn ops) into a single AscendC dispatch. Built into a
+# STATIC library via the ascendc_library() cmake macro from the CANN
+# toolkit. The library is named `qwen_tts_ascendc_kernels`; downstream
+# targets (qwen_tts executable, qwen_tts_api shared lib, and the offline
+# 4.1.2 diff harness) link it as an internal dep.
+#
+# Gated on QWEN_TTS_CP_CANN — the kernels are only useful when the CP
+# CANN engine is also built. Default off when ASCEND_TOOLKIT_HOME is
+# absent (macOS / non-Ascend hosts); default on when we're on an Ascend
+# host. Source file lives at tools/qwen_tts/ascendc/.
+# -----------------------------------------------------------------------------
+option(QWEN_TTS_ASCENDC "Build AscendC custom kernels (W4.1)" OFF)
+if(QWEN_TTS_CP_CANN
+   AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
+   AND EXISTS "$ENV{ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin/ccec")
+    set(QWEN_TTS_ASCENDC ON CACHE BOOL "" FORCE)
+endif()
+if(QWEN_TTS_ASCENDC)
+    set(ASCEND_CANN_PACKAGE_PATH $ENV{ASCEND_TOOLKIT_HOME})
+    set(SOC_VERSION Ascend910B4)
+    set(RUN_MODE npu)
+    include(${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+    ascendc_library(qwen_tts_ascendc_kernels STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/ascendc/fused_attn_sublayer.cpp)
+    message(STATUS "qwen_tts: AscendC kernels ENABLED (W4.1 fused_attn_sublayer)")
+endif()
+
 # llama.cpp fallback Talker path: optional, default OFF. When OFF, the
 # `--llama_fallback` runtime flag prints a clear error and exits; the
 # native TalkerCannEngine is the only backbone path. When ON, llama.cpp
@@ -70,6 +101,16 @@ if(QWEN_TTS_CP_CANN)
     target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_CP_CANN=1)
     target_include_directories(${TARGET} PRIVATE
         $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include)
+endif()
+if(QWEN_TTS_ASCENDC)
+    # Static link with the AscendC library + the auto-generated host stub
+    # header (exposes `aclrtlaunch_fused_attn_sublayer`). The runtime
+    # static libs come in via the ascendc.cmake's add_link_deps.
+    target_link_libraries(${TARGET} PRIVATE qwen_tts_ascendc_kernels)
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_BINARY_DIR}/auto_gen/qwen_tts_ascendc_kernels
+        ${CMAKE_BINARY_DIR}/include/qwen_tts_ascendc_kernels)
+    target_compile_definitions(${TARGET} PRIVATE QWEN_TTS_HAS_ASCENDC=1)
 endif()
 target_include_directories(${TARGET} PUBLIC  .)
 target_include_directories(${TARGET} PRIVATE ../.. ../../vendor ${KISSFFT_DIR}
@@ -169,6 +210,13 @@ if(QWEN_TTS_CP_CANN)
     target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_CP_CANN=1)
     target_include_directories(${API_TARGET} PRIVATE
         $ENV{ASCEND_TOOLKIT_HOME}/aarch64-linux/include)
+endif()
+if(QWEN_TTS_ASCENDC)
+    target_link_libraries(${API_TARGET} PRIVATE qwen_tts_ascendc_kernels)
+    target_include_directories(${API_TARGET} PRIVATE
+        ${CMAKE_BINARY_DIR}/auto_gen/qwen_tts_ascendc_kernels
+        ${CMAKE_BINARY_DIR}/include/qwen_tts_ascendc_kernels)
+    target_compile_definitions(${API_TARGET} PRIVATE QWEN_TTS_HAS_ASCENDC=1)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
