@@ -213,8 +213,14 @@ private:
         void *gate_proj_w = nullptr;  // [inter, cp_hidden]
         void *up_proj_w = nullptr;    // [inter, cp_hidden]
         void *down_proj_w = nullptr;  // [cp_hidden, inter]
-        void *input_ln_w = nullptr;   // [cp_hidden]
-        void *post_ln_w = nullptr;    // [cp_hidden]
+        void *input_ln_w = nullptr;   // [cp_hidden] F32
+        void *post_ln_w = nullptr;    // [cp_hidden] F32
+
+        // W3b fusion: F16 copies of the two LN gammas (aclnnAddRmsNorm
+        // requires gamma dtype to match x1/x2, which is F16 here). Allocated
+        // only when cp_fusion_applied_; null otherwise.
+        void *input_ln_w_f16 = nullptr;
+        void *post_ln_w_f16  = nullptr;
 
         // A16W8 (Stretch S1): INT8 [out, in] + F16 per-output-channel scale,
         // allocated alongside the F16 buffers when w8_applied_. Null otherwise.
@@ -234,7 +240,10 @@ private:
         void *down_proj_scale = nullptr;
     };
     std::vector<LayerWeights> layer_w_;
-    void *final_norm_w_dev_ = nullptr;  // [cp_hidden]
+    void *final_norm_w_dev_ = nullptr;  // [cp_hidden] F32
+    // W3b fusion: F16 copy of the final norm gamma, used by the last
+    // layer's post-FFN AddRmsNorm. Null unless cp_fusion_applied_.
+    void *final_norm_w_f16_dev_ = nullptr;
 
     // ---- W1: lm_head weights on NPU ---------------------------------------
     // F16, [vocab_size, cp_hidden] per group. Uploaded during init() /
@@ -324,12 +333,19 @@ private:
         aclTensor *q_norm, *k_norm;
         aclTensor *gate_proj, *up_proj, *down_proj;
         aclTensor *input_ln, *post_ln;
+        // W3b fusion: F16-dtype views over input_ln_w_f16 / post_ln_w_f16.
+        // Only created when cp_fusion_applied_; null otherwise.
+        aclTensor *input_ln_f16 = nullptr;
+        aclTensor *post_ln_f16  = nullptr;
     };
     struct Tensors {
         aclTensor *proj_w;
         aclTensor *proj_b;
         std::vector<LayerTensors> layer;
         aclTensor *final_norm;
+        // W3b fusion: F16-dtype view over final_norm_w_f16_dev_. Null
+        // unless cp_fusion_applied_.
+        aclTensor *final_norm_f16 = nullptr;
 
         aclTensor *cur_row, *cur_flat;
         aclTensor *residual_flat;
@@ -368,6 +384,17 @@ private:
     bool use_w8_weights_ = false;
     bool w8_applied_     = false;
 
+    // ---- CP kernel fusion state (W3b) ---------------------------------------
+    // Gated by env var TALKER_CP_FUSION=1 (opt-in, same pattern as
+    // TALKER_LM_HEAD_NPU). When `cp_fusion_enabled_` is true AND the runtime
+    // exposes `aclnnAddRmsNorm`, the per-layer tail `Add(residual, output) +
+    // RmsNorm(cur, gamma)` collapses into a single `aclnnAddRmsNorm` dispatch
+    // — saving one aclnn launch per sublayer (2/layer × 5 layers × 17 forwards
+    // = 170 dispatches/frame). `cp_fusion_applied_` records whether the
+    // runtime actually enabled fusion after the capability check.
+    bool cp_fusion_enabled_ = false;
+    bool cp_fusion_applied_ = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -395,6 +422,11 @@ private:
     // weights in [n_groups][vocab_size * cp_hidden] row-major layout.
     bool init_lm_head_(const std::vector<std::vector<float>> &lm_head_w,
                         int vocab_size);
+
+    // W3b: allocate F16 copies of the LN gammas via aclnnCast. No-op unless
+    // cp_fusion_applied_. Must be called AFTER the F32 gamma buffers are
+    // uploaded and BEFORE build_persistent_tensors_().
+    void init_fusion_f16_gammas_();
 
     // Create all persistent aclTensor descriptors after weights + buffers
     // have been allocated. Called once at the end of init().

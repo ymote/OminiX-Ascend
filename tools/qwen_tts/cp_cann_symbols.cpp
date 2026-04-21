@@ -209,6 +209,14 @@ bool load_once() {
     resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV2",
                      g_cann.aclnnWeightQuantBatchMatmulV2);
 
+    // Optional: aclnnAddRmsNorm (W3b, CANN 8.5+). Lives in libopapi.so.
+    // Absence means the toolkit predates CANN 8.5 and callers keep the
+    // unfused Add + RmsNorm path. Gated via has_add_rms_norm().
+    resolve_optional(h_op, "aclnnAddRmsNormGetWorkspaceSize",
+                     g_cann.aclnnAddRmsNormGetWorkspaceSize);
+    resolve_optional(h_op, "aclnnAddRmsNorm",
+                     g_cann.aclnnAddRmsNorm);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};

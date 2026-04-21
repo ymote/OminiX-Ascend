@@ -90,6 +90,28 @@ struct CannSyms {
     aclnnStatus (*aclnnRmsNorm)(void *, uint64_t, aclOpExecutor *,
                                  aclrtStream);
 
+    // ---- Fused Add + RmsNorm (W3b, CANN 8.5+) ------------------------------
+    // Collapses the `cur = residual + output; residual = cur; normed =
+    // rmsnorm(cur, gamma)` tail into one kernel. Signature matches
+    // aclnn_add_rms_norm.h:
+    //     xOut = x1 + x2
+    //     yOut = RmsNorm(xOut, gamma, eps)
+    //     rstdOut = 1 / sqrt(mean(xOut^2) + eps)
+    // Inputs/outputs are all F16 (gamma is F32 per the existing RmsNorm
+    // convention). x1 and xOut must NOT alias — the non-inplace variant does
+    // not support in-place updates. Callers wanting inplace semantics should
+    // dispatch `aclnnInplaceAddRmsNorm` instead. Capability flag:
+    // `has_add_rms_norm()`; absence means toolkit predates CANN 8.5 and
+    // callers keep the unfused Add + RmsNorm path.
+    aclnnStatus (*aclnnAddRmsNormGetWorkspaceSize)(
+        const aclTensor *x1, const aclTensor *x2, const aclTensor *gamma,
+        double epsilon, const aclTensor *yOut, const aclTensor *rstdOut,
+        const aclTensor *xOut, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnAddRmsNorm)(void *workspace, uint64_t workspaceSize,
+                                    aclOpExecutor *executor,
+                                    aclrtStream stream);
+
     // Attention-on-NPU ops (added for the v2 engine — no host roundtrips).
     aclnnStatus (*aclnnBatchMatMulGetWorkspaceSize)(const aclTensor *,
                                                      const aclTensor *,
@@ -317,6 +339,16 @@ struct CannSyms {
                 aclnnWeightQuantBatchMatmulV3                 != nullptr) ||
                (aclnnWeightQuantBatchMatmulV2GetWorkspaceSize != nullptr &&
                 aclnnWeightQuantBatchMatmulV2                 != nullptr);
+    }
+
+    // Capability flag for aclnnAddRmsNorm (W3b, CANN 8.5+). When present,
+    // CpCannEngine can fuse the `Add(residual, output) + RmsNorm(cur, gamma)`
+    // tail at the end of each attention/FFN sublayer into one dispatch. Gated
+    // at runtime by TALKER_CP_FUSION=1; absence silently falls back to the
+    // unfused path.
+    bool has_add_rms_norm() const {
+        return aclnnAddRmsNormGetWorkspaceSize != nullptr &&
+               aclnnAddRmsNorm                 != nullptr;
     }
 };
 

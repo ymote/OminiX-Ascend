@@ -159,6 +159,8 @@ CpCannEngine::~CpCannEngine() {
         free_dev(lw.down_proj_w);
         free_dev(lw.input_ln_w);
         free_dev(lw.post_ln_w);
+        free_dev(lw.input_ln_w_f16);
+        free_dev(lw.post_ln_w_f16);
         free_dev(lw.q_proj_w_i8);
         free_dev(lw.k_proj_w_i8);
         free_dev(lw.v_proj_w_i8);
@@ -175,6 +177,7 @@ CpCannEngine::~CpCannEngine() {
         free_dev(lw.down_proj_scale);
     }
     free_dev(final_norm_w_dev_);
+    free_dev(final_norm_w_f16_dev_);
 
     // W1: lm_head weight buffers + logits staging.
     for (auto &p : lm_head_w_dev_) free_dev(p);
@@ -384,6 +387,41 @@ bool CpCannEngine::w8_calibrate_weight_(const float *host_w,
 // A16W8 matmul dispatch. Same contract as the Talker version.
 // ============================================================================
 
+// ============================================================================
+// W3b fusion helper: allocate + populate F16 copies of the LN gammas.
+// aclnnAddRmsNorm requires gamma to match x1/x2 dtype (F16 here); the unfused
+// aclnnRmsNorm path kept them F32. We use aclnnCast to down-convert on device
+// without bouncing through host memory. No-op unless cp_fusion_applied_.
+// ============================================================================
+void CpCannEngine::init_fusion_f16_gammas_() {
+    if (!cp_fusion_applied_) return;
+
+    const size_t E = sizeof(uint16_t);
+    auto cast_gamma = [&](void *src_f32_dev, void **dst_f16_dev_out) {
+        alloc_dev(dst_f16_dev_out, (size_t)cp_hidden_ * E);
+        int64_t shape[1]   = {(int64_t)cp_hidden_};
+        int64_t strides[1] = {1};
+        int64_t storage    = (int64_t)cp_hidden_;
+        aclTensor *t_src = g_cann.aclCreateTensor(
+            shape, 1, ACL_FLOAT, strides, 0, ACL_FORMAT_ND,
+            &storage, 1, src_f32_dev);
+        aclTensor *t_dst = g_cann.aclCreateTensor(
+            shape, 1, ACL_FLOAT16, strides, 0, ACL_FORMAT_ND,
+            &storage, 1, *dst_f16_dev_out);
+        CANN_OP(Cast, t_src, ACL_FLOAT16, t_dst);
+        g_cann.aclDestroyTensor(t_src);
+        g_cann.aclDestroyTensor(t_dst);
+    };
+    for (int il = 0; il < n_layers_; ++il) {
+        cast_gamma(layer_w_[il].input_ln_w, &layer_w_[il].input_ln_w_f16);
+        cast_gamma(layer_w_[il].post_ln_w,  &layer_w_[il].post_ln_w_f16);
+    }
+    cast_gamma(final_norm_w_dev_, &final_norm_w_f16_dev_);
+    // Cast dispatches were queued on stream_; sync so the F16 buffers are
+    // valid before the persistent tensors wrap them.
+    ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+}
+
 void CpCannEngine::w8_matmul_(const aclTensor *x,
                                 void *weight_dev, void *scale_dev,
                                 int64_t out_n, int64_t in_k,
@@ -517,8 +555,21 @@ void CpCannEngine::build_persistent_tensors_() {
         lt.down_proj = tensor_2d(lw.down_proj_w, cp_hidden_, inter_,     ACL_FLOAT16);
         lt.input_ln  = tensor_1d(lw.input_ln_w,  cp_hidden_, ACL_FLOAT);
         lt.post_ln   = tensor_1d(lw.post_ln_w,   cp_hidden_, ACL_FLOAT);
+        // W3b: F16 gamma tensors for aclnnAddRmsNorm. Only when fusion is
+        // applied — otherwise `*_f16` buffers are null and the tensor handles
+        // stay null (unused by the unfused path).
+        if (cp_fusion_applied_) {
+            lt.input_ln_f16 = tensor_1d(lw.input_ln_w_f16, cp_hidden_,
+                                          ACL_FLOAT16);
+            lt.post_ln_f16  = tensor_1d(lw.post_ln_w_f16,  cp_hidden_,
+                                          ACL_FLOAT16);
+        }
     }
     t_.final_norm = tensor_1d(final_norm_w_dev_, cp_hidden_, ACL_FLOAT);
+    if (cp_fusion_applied_) {
+        t_.final_norm_f16 = tensor_1d(final_norm_w_f16_dev_, cp_hidden_,
+                                        ACL_FLOAT16);
+    }
 
     t_.cur_row       = tensor_2d(cur_dev_, 1, cp_hidden_);
     t_.cur_flat      = tensor_1d(cur_dev_, cp_hidden_);
@@ -597,9 +648,11 @@ void CpCannEngine::destroy_persistent_tensors_() {
         drop(lt.q_norm); drop(lt.k_norm);
         drop(lt.gate_proj); drop(lt.up_proj); drop(lt.down_proj);
         drop(lt.input_ln); drop(lt.post_ln);
+        drop(lt.input_ln_f16); drop(lt.post_ln_f16);
     }
     t_.layer.clear();
     drop(t_.final_norm);
+    drop(t_.final_norm_f16);
     drop(t_.cur_row);   drop(t_.cur_flat);
     drop(t_.residual_flat);
     drop(t_.normed_row); drop(t_.normed_col);
@@ -989,6 +1042,28 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
                "dispatch aclnnWeightQuantBatchMatmulV3/V2)\n");
     }
 
+    // W3b: opt-in CP kernel fusion. Gated behind TALKER_CP_FUSION so the
+    // default path is bit-identical to W1. When env is set AND the runtime
+    // exposes aclnnAddRmsNorm, the per-sublayer `Add + RmsNorm` tail collapses
+    // into one dispatch.
+    {
+        const char *env = getenv("TALKER_CP_FUSION");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_fusion_enabled_ = true;
+        }
+    }
+    cp_fusion_applied_ = cp_fusion_enabled_ && g_cann.has_add_rms_norm();
+    if (cp_fusion_enabled_ && !g_cann.has_add_rms_norm()) {
+        printf("[cp_cann] TALKER_CP_FUSION requested but aclnnAddRmsNorm "
+               "symbol absent on this CANN toolkit — staying on unfused "
+               "Add + RmsNorm path\n");
+    }
+    init_fusion_f16_gammas_();
+    if (cp_fusion_applied_) {
+        printf("[cp_cann] CP kernel fusion ENABLED (aclnnAddRmsNorm replaces "
+               "per-sublayer Add+RmsNorm tail; W3b)\n");
+    }
+
     build_persistent_tensors_();
 
     ready_ = true;
@@ -1232,6 +1307,27 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
                "dispatch aclnnWeightQuantBatchMatmulV3/V2)\n");
     }
 
+    // W3b: CP kernel fusion detection. Must run BEFORE build_persistent_tensors_
+    // so the F16 gamma tensors are created when fusion is applied. See
+    // init_from_safetensors() for rationale.
+    {
+        const char *env = getenv("TALKER_CP_FUSION");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_fusion_enabled_ = true;
+        }
+    }
+    cp_fusion_applied_ = cp_fusion_enabled_ && g_cann.has_add_rms_norm();
+    if (cp_fusion_enabled_ && !g_cann.has_add_rms_norm()) {
+        printf("[cp_cann] TALKER_CP_FUSION requested but aclnnAddRmsNorm "
+               "symbol absent on this CANN toolkit — staying on unfused "
+               "Add + RmsNorm path\n");
+    }
+    init_fusion_f16_gammas_();
+    if (cp_fusion_applied_) {
+        printf("[cp_cann] CP kernel fusion ENABLED (aclnnAddRmsNorm replaces "
+               "per-sublayer Add+RmsNorm tail; W3b)\n");
+    }
+
     build_persistent_tensors_();
 
     // W1: opt-in NPU lm_head port. Gated behind TALKER_LM_HEAD_NPU to keep
@@ -1329,19 +1425,41 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
     // Residual saved via F16 d2d memcpy at the start of each sublayer, then
     // added back with aclnnAdd (F16) at the end. This is the ggml-cann/
     // llama.cpp convention — the model was trained with F16 residuals.
+    //
+    // W3b CP kernel fusion (cp_fusion_applied_):
+    //   Layer 0 starts unfused: `residual=cur` d2d + `RmsNorm(cur, input_ln[0])
+    //   → normed`. Layer 1+ skips both — the PREVIOUS layer's post-FFN
+    //   AddRmsNorm already left `normed_dev_` holding rmsnorm(cur, input_ln[il])
+    //   and `cur_dev_` holding the updated residual sum. The per-sublayer
+    //   post-Add+pre-next-norm pair collapses into one aclnnAddRmsNorm call.
     const int layers_to_run = (active_layers_ > 0 && active_layers_ < n_layers_)
                                ? active_layers_ : n_layers_;
     for (int il = 0; il < layers_to_run; ++il) {
         const auto &lt = t_.layer[il];
 
-        // residual = cur (F16 d2d async memcpy)
-        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
-            residual_dev_, cp_hidden_ * sizeof(uint16_t),
-            cur_dev_,      cp_hidden_ * sizeof(uint16_t),
-            ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+        // Layer-start residual save + input RmsNorm. With fusion, this is
+        // only needed for layer 0 (the entry point); subsequent layers have
+        // `normed_dev_` pre-populated by the prior layer's post-FFN
+        // AddRmsNorm.
+        if (!cp_fusion_applied_ || il == 0) {
+            // residual = cur (F16 d2d async memcpy)
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                residual_dev_, cp_hidden_ * sizeof(uint16_t),
+                cur_dev_,      cp_hidden_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
-                t_.normed_row, t_.rstd_11);
+            CANN_OP(RmsNorm, t_.cur_row, lt.input_ln, (double)eps_,
+                    t_.normed_row, t_.rstd_11);
+        } else {
+            // Fused path for il > 0: the prior layer's post-FFN AddRmsNorm
+            // left `cur_dev_ = prev_residual + prev_ffn_out` and
+            // `normed_dev_ = RmsNorm(cur, input_ln[il])`. We still need
+            // `residual = cur` for THIS layer's post-attn Add.
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                residual_dev_, cp_hidden_ * sizeof(uint16_t),
+                cur_dev_,      cp_hidden_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+        }
 
         // Three-way split: W8 (Stretch S1) > NZ (M5.3) > ND (default).
         if (w8_applied_) {
@@ -1553,18 +1671,56 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                     /*cubeMathType=*/0);
         }
 
-        // cur = residual + o_out  (F16 add)
-        CANN_OP(Add, t_.residual_flat, t_.o_out_flat, one_scalar_,
-                t_.cur_flat);
+        if (cp_fusion_applied_) {
+            // W3b: fuse `cur = residual + o_out` + `RmsNorm(cur, post_ln)`
+            // into one aclnnAddRmsNorm. xOut=cur_dev_ holds the sum (still
+            // needed for the next `residual=cur` memcpy); yOut=normed_dev_
+            // is ready for the FFN matmuls.
+            //
+            // Input/output tensors all use the `_row` ([1, cp_hidden]) shape
+            // so the rstdOut scalar [1,1] lines up with the leading-dim
+            // reduction the op expects. Using mixed 1D/2D shapes trips
+            // `coreDim == 0` on CANN 8.5.
+            aclTensor *t_resid_row =
+                tensor_2d(residual_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_o_out_row =
+                tensor_2d(o_out_dev_,    1, cp_hidden_, ACL_FLOAT16);
+            uint64_t ws_needed = 0;
+            aclOpExecutor *exec = nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNormGetWorkspaceSize(
+                t_resid_row, t_o_out_row, lt.post_ln_f16, (double)eps_,
+                t_.normed_row, t_.rstd_11, t_.cur_row,
+                &ws_needed, &exec));
+            if (ws_needed > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = ws_needed;
+            }
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
+                                                   stream_));
+            g_cann.aclDestroyTensor(t_resid_row);
+            g_cann.aclDestroyTensor(t_o_out_row);
+            // residual = cur  (needed to prime the FFN residual Add)
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                residual_dev_, cp_hidden_ * sizeof(uint16_t),
+                cur_dev_,      cp_hidden_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+        } else {
+            // cur = residual + o_out  (F16 add)
+            CANN_OP(Add, t_.residual_flat, t_.o_out_flat, one_scalar_,
+                    t_.cur_flat);
 
-        // residual = cur  (for FFN)
-        ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
-            residual_dev_, cp_hidden_ * sizeof(uint16_t),
-            cur_dev_,      cp_hidden_ * sizeof(uint16_t),
-            ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
+            // residual = cur  (for FFN)
+            ACL_CHECK_RET(g_cann.aclrtMemcpyAsync(
+                residual_dev_, cp_hidden_ * sizeof(uint16_t),
+                cur_dev_,      cp_hidden_ * sizeof(uint16_t),
+                ACL_MEMCPY_DEVICE_TO_DEVICE, stream_));
 
-        CANN_OP(RmsNorm, t_.cur_row, lt.post_ln, (double)eps_,
-                t_.normed_row, t_.rstd_11);
+            CANN_OP(RmsNorm, t_.cur_row, lt.post_ln, (double)eps_,
+                    t_.normed_row, t_.rstd_11);
+        }
 
         // FFN gate/up/down: W8 > NZ > ND.
         if (w8_applied_) {
@@ -1624,14 +1780,50 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                     /*cubeMathType=*/0);
         }
 
-        // cur = residual + ffn_out  (F16 add)
-        CANN_OP(Add, t_.residual_flat, t_.ffn_out_flat, one_scalar_,
-                t_.cur_flat);
+        if (cp_fusion_applied_) {
+            // W3b: fuse `cur = residual + ffn_out` with the NEXT step's
+            // RmsNorm. For il < last layer: gamma = input_ln[il+1], priming
+            // the next layer so its entry can skip both the `residual=cur`
+            // d2d AND the `RmsNorm(cur, input_ln)`. For il == last layer:
+            // gamma = final_norm, subsuming the post-loop RmsNorm.
+            const bool is_last = (il + 1 == layers_to_run);
+            const aclTensor *next_gamma =
+                is_last ? t_.final_norm_f16 : t_.layer[il + 1].input_ln_f16;
+            aclTensor *t_resid_row =
+                tensor_2d(residual_dev_, 1, cp_hidden_, ACL_FLOAT16);
+            aclTensor *t_ffn_row =
+                tensor_2d(ffn_out_dev_,  1, cp_hidden_, ACL_FLOAT16);
+            uint64_t ws_needed = 0;
+            aclOpExecutor *exec = nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNormGetWorkspaceSize(
+                t_resid_row, t_ffn_row, next_gamma, (double)eps_,
+                t_.normed_row, t_.rstd_11, t_.cur_row,
+                &ws_needed, &exec));
+            if (ws_needed > workspace_size_) {
+                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
+                               ACL_MEM_MALLOC_HUGE_FIRST));
+                workspace_size_ = ws_needed;
+            }
+            void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
+                                                   stream_));
+            g_cann.aclDestroyTensor(t_resid_row);
+            g_cann.aclDestroyTensor(t_ffn_row);
+        } else {
+            // cur = residual + ffn_out  (F16 add)
+            CANN_OP(Add, t_.residual_flat, t_.ffn_out_flat, one_scalar_,
+                    t_.cur_flat);
+        }
     }
 
-    // Final RmsNorm (F16 input/output, F32 gamma).
-    CANN_OP(RmsNorm, t_.cur_row, t_.final_norm, (double)eps_,
-            t_.normed_row, t_.rstd_11);
+    // Final RmsNorm: only needed when fusion is OFF. With fusion, the LAST
+    // layer's post-FFN AddRmsNorm already wrote `rmsnorm(cur, final_norm)`
+    // into normed_dev_ (which is what t_.output_f16 views).
+    if (!cp_fusion_applied_) {
+        CANN_OP(RmsNorm, t_.cur_row, t_.final_norm, (double)eps_,
+                t_.normed_row, t_.rstd_11);
+    }
 
     // Cast F16 hidden -> F32 staging (queued async; D2H + sync moved to _fetch).
     CANN_OP(Cast, t_.output_f16, ACL_FLOAT, t_.output_f32);
