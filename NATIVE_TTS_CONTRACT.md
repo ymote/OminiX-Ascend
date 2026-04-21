@@ -14,15 +14,27 @@ C ABI, reaching **≥ 25 fps** end-to-end on Ascend 910B4 with audio quality
 **indistinguishable from MLX golden** (DTW log-mel ≥ 0.85, plus user-ear pass
 on five distinct utterances).
 
-**STATUS (2026-04-20): goal MET at clean quality.** Post-W1 landing
-measurement on canonical mayun xvec Chinese (W8 + TQE=2 +
-**cp_groups=15** + sampling on, ac01): **30.2 fps**, user-ear
-confirmed identical to pre-W1 baseline. The prior S3 citation of
-33.8 fps relied on `--cp_groups 8` which user ear-check rejected for
-low-frequency rumble (see §8 2026-04-20 entry). The honest clean-
-quality number is 30.2 fps; the fps/quality frontier is now documented
-in the CP_FPS_OPTIMIZATION_CONTRACT (OminiX-API repo) rather than
-extended here.
+**STATUS (2026-04-20): goal MET on xvec + customvoice, MISSED on ICL
+by 1 fps.** Post-W1 three-mode sweep (W8+TQE=2+cp_groups=15+sampling
+on, ac01, mayun Chinese canonical):
+
+| mode | fps | vs ≥25 gate |
+|---|---|---|
+| ICL  | **23.9** | MISS by 1 fps |
+| xvec | **29.5** | PASS |
+| CV   | **30.5** | PASS |
+
+ICL carries ~122 frames of ref codec prefix in the Talker KV cache
+that xvec/CV don't, so per-frame Talker forward time is longer for
+ICL. W1's lm_head port is CP-local and doesn't touch that cost. ICL
+parity with xvec at the ≥25 fps gate requires either:
+- W3b kernel fusion (in flight, +3.5 fps projected → ~27 fps ICL), OR
+- A separate Talker-KV-reduction track (currently out of scope).
+
+The prior S3 citation of 33.8 fps relied on `--cp_groups 8` which
+user ear-check rejected (rumble, §8 2026-04-20). 30.2 fps is the
+honest clean-quality peak (xvec). Fps/quality frontier tracked in
+OminiX-API:CP_FPS_OPTIMIZATION_CONTRACT.md.
 
 ## 2. Non-goals
 
