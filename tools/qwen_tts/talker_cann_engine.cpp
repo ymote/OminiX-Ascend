@@ -922,8 +922,8 @@ bool TalkerCannEngine::init_from_gguf(const std::string &gguf_path,
     if (w8_enabled) {
         printf("[talker_cann] A16W8 weight quantization ENABLED "
                "(per-output-channel symmetric INT8 + F16 scales for Q/K/V/O/"
-               "gate/up/down; decode matmul call sites dispatch "
-               "aclnnWeightQuantBatchMatmulV3/V2; prefill stays on F16)\n");
+               "gate/up/down; decode + prefill matmul call sites dispatch "
+               "aclnnWeightQuantBatchMatmulV3/V2 [A4b])\n");
     }
 
     // ---- Per-layer weights ----
@@ -2093,7 +2093,26 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
             return make_tensor(buf, 2, shape, strides, ACL_FLOAT16,
                                 wfmt_prefill);
         };
-        {
+        // A4b: when w8_applied_, prefill dispatches the same per-channel
+        // INT8 + F16 scale path used by decode. aclnnWeightQuantBatchMatmulV3
+        // accepts x:[M, K] with M = seq_len; no reshape needed. The F16
+        // weight_T_tensor descriptors are only built in the fallback branch.
+        if (w8_applied_) {
+            aclTensor *t_normed = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
+            aclTensor *t_q = tensor_2d(q_batch_dev_, seq_len, q_dim_,  ACL_FLOAT16);
+            aclTensor *t_k = tensor_2d(k_batch_dev_, seq_len, kv_dim_, ACL_FLOAT16);
+            aclTensor *t_v = tensor_2d(v_batch_dev_, seq_len, kv_dim_, ACL_FLOAT16);
+            w8_matmul_(t_normed, lw.q_proj_w_i8, lw.q_proj_scale,
+                        q_dim_,  n_embd_, t_q);
+            w8_matmul_(t_normed, lw.k_proj_w_i8, lw.k_proj_scale,
+                        kv_dim_, n_embd_, t_k);
+            w8_matmul_(t_normed, lw.v_proj_w_i8, lw.v_proj_scale,
+                        kv_dim_, n_embd_, t_v);
+            g_cann.aclDestroyTensor(t_normed);
+            g_cann.aclDestroyTensor(t_q);
+            g_cann.aclDestroyTensor(t_k);
+            g_cann.aclDestroyTensor(t_v);
+        } else {
             aclTensor *t_normed = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
             aclTensor *t_wq_T = weight_T_tensor(lw.q_proj_w, q_dim_,  n_embd_);
             aclTensor *t_wk_T = weight_T_tensor(lw.k_proj_w, kv_dim_, n_embd_);
@@ -2292,7 +2311,17 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
 
         // --- O projection (batched): o_out [seq_len, n_embd] = attn [seq_len, q_dim]
         //     @ o_proj^T [q_dim, n_embd] ---
-        {
+        // A4b: W8 branch mirrors decode's o_proj dispatch.
+        if (w8_applied_) {
+            aclTensor *t_attn = tensor_2d(q_batch_dev_, seq_len, q_dim_,
+                                            ACL_FLOAT16);
+            aclTensor *t_o    = tensor_2d(o_out_batch_dev_, seq_len, n_embd_,
+                                            ACL_FLOAT16);
+            w8_matmul_(t_attn, lw.o_proj_w_i8, lw.o_proj_scale,
+                        n_embd_, q_dim_, t_o);
+            g_cann.aclDestroyTensor(t_attn);
+            g_cann.aclDestroyTensor(t_o);
+        } else {
             aclTensor *t_attn = tensor_2d(q_batch_dev_, seq_len, q_dim_,
                                             ACL_FLOAT16);
             aclTensor *t_wo_T = weight_T_tensor(lw.o_proj_w, n_embd_, q_dim_);
@@ -2340,7 +2369,37 @@ void TalkerCannEngine::forward_prefill(const float *input_embeds, int seq_len,
         }
 
         // --- FFN (batched) ---
-        {
+        // A4b: W8 branch mirrors decode's FFN dispatch. Silu/InplaceMul on
+        // the flat gate/up views is dtype-invariant (F16 in both paths).
+        if (w8_applied_) {
+            aclTensor *t_normed  = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
+            aclTensor *t_gate    = tensor_2d(gate_batch_dev_, seq_len, inter_,
+                                               ACL_FLOAT16);
+            aclTensor *t_up      = tensor_2d(up_batch_dev_,   seq_len, inter_,
+                                               ACL_FLOAT16);
+            aclTensor *t_gate_fl = tensor_1d(gate_batch_dev_,
+                                               (size_t)seq_len * inter_,
+                                               ACL_FLOAT16);
+            aclTensor *t_up_fl   = tensor_1d(up_batch_dev_,
+                                               (size_t)seq_len * inter_,
+                                               ACL_FLOAT16);
+            aclTensor *t_ffn     = tensor_2d(ffn_out_batch_dev_, seq_len, n_embd_,
+                                               ACL_FLOAT16);
+            w8_matmul_(t_normed, lw.gate_proj_w_i8, lw.gate_proj_scale,
+                        inter_,  n_embd_, t_gate);
+            w8_matmul_(t_normed, lw.up_proj_w_i8,   lw.up_proj_scale,
+                        inter_,  n_embd_, t_up);
+            CANN_OP(Silu, t_gate_fl, t_gate_fl);
+            CANN_OP(InplaceMul, t_gate_fl, t_up_fl);
+            w8_matmul_(t_gate, lw.down_proj_w_i8, lw.down_proj_scale,
+                        n_embd_, inter_, t_ffn);
+            g_cann.aclDestroyTensor(t_normed);
+            g_cann.aclDestroyTensor(t_gate);
+            g_cann.aclDestroyTensor(t_up);
+            g_cann.aclDestroyTensor(t_gate_fl);
+            g_cann.aclDestroyTensor(t_up_fl);
+            g_cann.aclDestroyTensor(t_ffn);
+        } else {
             aclTensor *t_normed  = tensor_2d(normed_batch_dev_, seq_len, n_embd_, ACL_FLOAT16);
             aclTensor *t_wg_T    = weight_T_tensor(lw.gate_proj_w, inter_, n_embd_);
             aclTensor *t_wu_T    = weight_T_tensor(lw.up_proj_w,   inter_, n_embd_);
