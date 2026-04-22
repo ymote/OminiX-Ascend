@@ -356,6 +356,21 @@ private:
     void *workspace_dev_ = nullptr;
     size_t workspace_size_ = 0;
 
+    // WSPOOL: retain-list for async-safe workspace growth.
+    //
+    // Port of MoYoYoTech/llm_mutil_npu `WorkspacePool` retain pattern. When
+    // `ensure_workspace()` needs a bigger buffer, the OLD buffer may still be
+    // in-flight on `stream_` (aclnn ops dispatch async against the stream).
+    // Freeing from the host side while the device is still reading is UB —
+    // it happens not to have manifested because steady-state workspace sizes
+    // converge post-warmup and growths are rare, but the race is real and
+    // latent under new ops or future stream pipelining.
+    //
+    // Fix: retain the old buffer here; drain the list at a known-safe
+    // barrier (`reset_workspace_retained_()`) — callable only AFTER an
+    // explicit `aclrtSynchronizeStream(stream_)`.
+    std::vector<void *> retained_workspaces_;
+
     // ---- Persistent aclTensor descriptors -------------------------------
     // Building an aclTensor isn't free (it allocates metadata and validates
     // shape/strides). The previous forward_one_token created ~300 of them per
@@ -497,6 +512,10 @@ private:
     void upload(void *dev, const float *host, size_t n_floats);
     void download(float *host, const void *dev, size_t n_floats);
     void ensure_workspace(size_t needed);
+    // WSPOOL: drain the retained workspace list. PRECONDITION: stream_ has
+    // been synchronized since the last ensure_workspace() that produced a
+    // retained buffer. Caller must enforce this invariant.
+    void reset_workspace_retained_();
     // Apply aclnnTransMatmulWeight in place. No-op if runtime lacks has_nz()
     // or if use_nz_weights_ is false. See header comment on
     // set_use_nz_weights() for the full semantics.

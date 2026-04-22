@@ -227,6 +227,14 @@ CpCannEngine::~CpCannEngine() {
     aclgraph_graphs_.clear();
     free_dev(zero_f16_cp_dev_);
 
+    // WSPOOL: drain the retain list before freeing the active workspace.
+    // Be defensive — sync the stream here in case the destructor is called
+    // while a forward was never synced by the caller.
+    if (stream_) {
+        g_cann.aclrtSynchronizeStream(stream_);
+    }
+    reset_workspace_retained_();
+
     free_dev(workspace_dev_);
     free_dev(input_stage_f32_dev_);
     free_dev(output_stage_f32_dev_);
@@ -280,10 +288,47 @@ void CpCannEngine::download(float *host, const void *dev, size_t n_floats) {
 
 void CpCannEngine::ensure_workspace(size_t needed) {
     if (needed <= workspace_size_) return;
-    if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
+
+    // WSPOOL: do NOT free the old buffer here — the device may still be
+    // reading it via an in-flight aclnn op on `stream_`. Retain it; it
+    // will be freed by `reset_workspace_retained_()` at a post-sync
+    // barrier (tail of forward_one_token_sync / destructor).
+    // Reference: MoYoYoTech/llm_mutil_npu `include/workspace_pool.h`
+    // (`WorkspacePool::alloc` / `reset_after_sync`).
+    if (workspace_dev_) {
+        retained_workspaces_.push_back(workspace_dev_);
+    }
     ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, needed,
                                       ACL_MEM_MALLOC_HUGE_FIRST));
     workspace_size_ = needed;
+
+    if (const char *dbg = getenv("TALKER_CP_WSPOOL_DEBUG")) {
+        if (dbg[0] == '1') {
+            fprintf(stderr,
+                "[wspool] grew workspace to %zu B, retained=%zu\n",
+                workspace_size_, retained_workspaces_.size());
+        }
+    }
+
+    // Safety valve: if the retain list explodes (> 8 growths without a
+    // reset) something is wrong with call-site discipline. Pay the stall
+    // to sync + drain rather than leak unbounded.
+    if (retained_workspaces_.size() > 8) {
+        fprintf(stderr,
+            "[wspool] WARNING: retained list > 8 (%zu); forcing stream sync + drain\n",
+            retained_workspaces_.size());
+        ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
+        reset_workspace_retained_();
+    }
+}
+
+void CpCannEngine::reset_workspace_retained_() {
+    // PRECONDITION: stream_ has been synchronized since the most recent
+    // ensure_workspace() that produced a retained buffer. Caller enforces.
+    for (void *p : retained_workspaces_) {
+        g_cann.aclrtFree(p);
+    }
+    retained_workspaces_.clear();
 }
 
 // F16 upload: convert F32 host -> uint16 F16 bit pattern -> device.
@@ -3170,6 +3215,10 @@ void CpCannEngine::forward_one_token_sync() {
     } else {
         ACL_CHECK_RET(g_cann.aclrtSynchronizeStream(stream_));
     }
+    // WSPOOL: after the sync above, no aclnn op is still reading the
+    // workspace — safe to free any buffers retained by growths in this
+    // forward pass.
+    reset_workspace_retained_();
 }
 
 // ============================================================================
