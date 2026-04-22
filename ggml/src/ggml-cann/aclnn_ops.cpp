@@ -2268,6 +2268,110 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                                       dst->nb, src1, dst->type);
                 break;
             }
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+            {
+                // The Q4_0 weight layout on the device is the CANN-transformed variant
+                // (see ggml_backend_cann_transform_q4_0 in ggml-cann.cpp): packed int4 nibbles
+                // re-interleaved so that each byte holds two values from the same 32-element
+                // group, followed by trailing fp16 scales. Q4_1 has no existing transform and
+                // keeps the native block_q4_1 layout end-to-end.
+                //
+                // Neither aclnnMul nor aclnnCast accept DT_INT4 inputs (EZ1001), and there is
+                // no standalone INT4 dequantisation op exposed in CANN 8.3.RC1 at the time of
+                // writing. Rather than open-code nibble extract + sign-extend with the available
+                // bitwise ops, we round-trip the weight through the CPU dequantiser: copy the
+                // on-device buffer back to host, undo the CANN transform (Q4_0 only) to recover
+                // the native block layout, dequantise to FP32 via ggml's type traits, down-cast
+                // to dst->type, upload to a pool buffer, and then reuse the ordinary
+                // aclnn_index_select_4d path.
+                //
+                // This is O(N * K) and uses D2H + H2D once per op call; GET_ROWS is almost
+                // exclusively used for embedding-table lookup at the start of each forward pass
+                // and is not on the diffusion hot loop, so the wall-cost is acceptable. A future
+                // upstream patch can replace this with a pure-device dequant once CANN exposes
+                // a DT_INT4 cast / dequant.
+                const size_t n_elements   = ggml_nelements(src0);
+                const size_t device_size  = ggml_nbytes(src0);  // includes trailing scales
+                const size_t dst_elt_size = ggml_type_size(dst->type);
+                const size_t dst_size     = n_elements * dst_elt_size;
+
+                // 1) D2H: pull the on-device quantised buffer into host memory.
+                std::vector<uint8_t> device_buffer(device_size);
+                ACL_CHECK(aclrtMemcpy(device_buffer.data(), device_size, src0->data, device_size,
+                                      ACL_MEMCPY_DEVICE_TO_HOST));
+
+                // 2) If the layout was CANN-transformed at buffer-copy time, undo the transform
+                //    to recover the native block layout. Inlined rather than calling
+                //    ggml_backend_cann_transform_back_q4_0, which has internal linkage.
+                std::vector<uint8_t> native_quant(device_size);
+                if (src0->type == GGML_TYPE_Q4_0) {
+                    const int64_t groups      = (int64_t) n_elements / QK4_0;
+                    const size_t  quant_bytes = n_elements / 2;  // 4 bits per element
+                    uint8_t *        quant_src = device_buffer.data();
+                    const uint16_t * scale_src = (const uint16_t *) (device_buffer.data() + quant_bytes);
+                    // Undo XOR 0x88 on all packed nibble bytes.
+                    for (size_t i = 0; i < quant_bytes; i++) {
+                        quant_src[i] ^= 0x88;
+                    }
+                    // De-interleave nibbles back into block_q4_0 order.
+                    // Forward transform (from ggml_backend_cann_transform_q4_0):
+                    //   for k in 0..7: lo_byte[k] = (qs[2k] & 0x0F) | ((qs[2k+1] & 0x0F) << 4)
+                    //                  hi_byte[k] = (qs[2k] >> 4)   | (qs[2k+1] & 0xF0)
+                    // where each group's 16 packed bytes are laid out lo_byte[0..7] then hi_byte[0..7].
+                    const size_t bytes_per_group = QK4_0 / 2;  // 16
+                    for (int64_t i = 0; i < groups; i++) {
+                        block_q4_0 * group = (block_q4_0 *) (native_quant.data() + i * sizeof(block_q4_0));
+                        group->d           = scale_src[i];
+                        const uint8_t * lo_src = quant_src + i * bytes_per_group;     // bytes 0..7 of this group
+                        const uint8_t * hi_src = lo_src    + (bytes_per_group / 2);   // bytes 8..15
+                        for (int k = 0; k < QK4_0 / 4; k++) {
+                            const uint8_t lo = lo_src[k];
+                            const uint8_t hi = hi_src[k];
+                            group->qs[2 * k]     = (uint8_t) ((lo & 0x0F)       | ((hi & 0x0F) << 4));
+                            group->qs[2 * k + 1] = (uint8_t) (((lo >> 4) & 0x0F) | (hi & 0xF0));
+                        }
+                    }
+                } else {
+                    // Q4_1 is copied to device untransformed; device_buffer already matches
+                    // block_q4_1 layout.
+                    native_quant = device_buffer;
+                }
+
+                // 3) Dequantise to fp32, then down-convert to dst->type on host.
+                std::vector<float> fp32_buf(n_elements);
+                const auto * traits = ggml_get_type_traits(src0->type);
+                GGML_ASSERT(traits && traits->to_float);
+                traits->to_float(native_quant.data(), fp32_buf.data(), (int64_t) n_elements);
+
+                std::vector<uint8_t> dst_host(dst_size);
+                if (dst->type == GGML_TYPE_F32) {
+                    memcpy(dst_host.data(), fp32_buf.data(), dst_size);
+                } else if (dst->type == GGML_TYPE_F16) {
+                    ggml_fp32_to_fp16_row(fp32_buf.data(), (ggml_fp16_t *) dst_host.data(),
+                                          (int64_t) n_elements);
+                } else if (dst->type == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row(fp32_buf.data(), (ggml_bf16_t *) dst_host.data(),
+                                          (int64_t) n_elements);
+                } else {
+                    GGML_ABORT("unreachable: unsupported dst dtype for Q4 get_rows dequant");
+                }
+
+                // 4) H2D: park the dequantised buffer in a pool alloc and gather-index.
+                ggml_cann_pool_alloc dequant_buffer_allocator(ctx.pool(), dst_size);
+                ACL_CHECK(aclrtMemcpy(dequant_buffer_allocator.get(), dst_size, dst_host.data(), dst_size,
+                                      ACL_MEMCPY_HOST_TO_DEVICE));
+
+                // Contiguous fp buffer layout matches src0->ne/nb with dst_elt_size strides.
+                size_t dequant_nb_[GGML_MAX_DIMS];
+                dequant_nb_[0] = dst_elt_size;
+                for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                    dequant_nb_[i] = dequant_nb_[i - 1] * src0->ne[i - 1];
+                }
+                aclnn_index_select_4d(ctx, dequant_buffer_allocator.get(), src0->ne, dequant_nb_,
+                                      dst->data, dst->ne, dst->nb, src1, dst->type);
+                break;
+            }
         default:
             GGML_ABORT("Unsupported tensor type for GGML_OP_GET_ROWS");
             break;

@@ -2405,6 +2405,16 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q8_0:
                         return true;
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+#ifdef ASCEND_310P
+                        return false;
+#endif
+                        // Q4_0 weights are CANN-transformed at buffer-copy time; keep the
+                        // block structure intact by requiring contiguous src0. Q4_1 is copied
+                        // untransformed but the dequant round-trip still needs a contiguous
+                        // layout for ggml's type traits to walk.
+                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                     default:
                         return false;
                 }
