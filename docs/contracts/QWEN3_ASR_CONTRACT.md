@@ -78,9 +78,13 @@ Same pattern as Q0 (QIE discovery):
 - First-landing scope (full engine rewrite vs incremental stages)
 - Reference dataset
 
-### A1 — Native `AsrCannEngine` bring-up (2-3 weeks, gated on A0 green)
+### A1 — Native `AsrCannEngine` bring-up — **SCOPE CORRECTED (4-7 days, not 2-3 weeks)**
 
-Mirror `CpCannEngine` / `TalkerCannEngine` patterns. Build the decoder forward pass dispatching aclnn directly, bypassing ggml-cann.
+**Architectural correction (Agent A1b-investigation, 2026-04-22)**: Qwen3-ASR-1.7B does **NOT** have cross-attention. The decoder is a plain Qwen3 decoder-only LLM (GGUF arch=`qwen3`). Audio features are projected by encoder's output MLP to decoder hidden dim and **injected as input embeddings via `batch.embd`** — decoder attends to them via standard causal self-attention over concatenated `[text, audio, text, generated]`. No `encoder_attn.*` tensors in `export_decoder_llama.py`.
+
+**Result**: `TalkerCannEngine` from TTS is **functionally identical** to what ASR decoder needs (not "structurally identical modulo cross-attn" as originally scoped). Reuse verbatim; drop 2 workstreams.
+
+Revised A1 workstream:
 
 - [ ] A1.1 Scaffold `tools/asr/asr_cann_engine.{h,cpp}` + `asr_cann_symbols.{h,cpp}` (dlsym pattern per CP convention)
 - [ ] A1.2 Encoder forward (likely already mature in MLX counterpart; port with minimal changes)
