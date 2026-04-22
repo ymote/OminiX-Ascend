@@ -56,12 +56,7 @@
     aclOpExecutor *_exec = nullptr;                                   \
     ACL_CHECK_RET(g_cann.aclnn##OP_NAME##GetWorkspaceSize(             \
         __VA_ARGS__, &_ws_needed, &_exec));                           \
-    if (_ws_needed > workspace_size_) {                               \
-        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);         \
-        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, _ws_needed, \
-                       ACL_MEM_MALLOC_HUGE_FIRST));                   \
-        workspace_size_ = _ws_needed;                                 \
-    }                                                                 \
+    ensure_workspace((size_t)_ws_needed);                             \
     void *_ws = _ws_needed > 0 ? workspace_dev_ : nullptr;            \
     ACL_CHECK_RET(g_cann.aclnn##OP_NAME(_ws, _ws_needed, _exec,       \
                                          stream_));                   \
@@ -592,12 +587,7 @@ void CpCannEngine::w8_matmul_(const aclTensor *x,
             return;
         }
     }
-    if (ws_needed > workspace_size_) {
-        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                                          ACL_MEM_MALLOC_HUGE_FIRST));
-        workspace_size_ = ws_needed;
-    }
+    ensure_workspace((size_t)ws_needed);
     void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
     if (used_v3) {
         s = g_cann.aclnnWeightQuantBatchMatmulV3(ws, ws_needed, exec, stream_);
@@ -798,12 +788,7 @@ void CpCannEngine::ffn_v3_swiglu_(const aclTensor *x_row,
         g_cann.aclDestroyTensor(t_aqs2);
         return;
     }
-    if (ws_needed > workspace_size_) {
-        if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-        ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                                          ACL_MEM_MALLOC_HUGE_FIRST));
-        workspace_size_ = ws_needed;
-    }
+    ensure_workspace((size_t)ws_needed);
     void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
     s = g_cann.aclnnFFNV3(ws, ws_needed, exec, stream_);
     if (s != 0) {
@@ -1929,12 +1914,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
         uint64_t ws = 0; aclOpExecutor *exec = nullptr;
         ACL_CHECK_RET(g_cann.aclnnAddGetWorkspaceSize(t_src, t_zero, alpha,
                                                        t_dst, &ws, &exec));
-        if (ws > workspace_size_) {
-            if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-            ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws,
-                           ACL_MEM_MALLOC_HUGE_FIRST));
-            workspace_size_ = ws;
-        }
+        ensure_workspace((size_t)ws);
         void *ws_ptr = ws > 0 ? workspace_dev_ : nullptr;
         ACL_CHECK_RET(g_cann.aclnnAdd(ws_ptr, ws, exec, stream_));
         g_cann.aclDestroyTensor(t_src);
@@ -2124,12 +2104,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
                 /*softmaxLseFlag*/ false,
                 /*keyAntiquantMode*/ 0, /*valueAntiquantMode*/ 0,
                 t_attn_out_bsnd, nullptr, &fa_ws, &fa_exec));
-            if (fa_ws > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, fa_ws,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = fa_ws;
-            }
+            ensure_workspace((size_t)fa_ws);
             void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
                 ws, fa_ws, fa_exec, stream_));
@@ -2174,12 +2149,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
                 t_x1, t_x2, lt.post_ln_f16, (double)eps_,
                 t_.rstd_11,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnInplaceAddRmsNorm(ws, ws_needed, exec,
                                                           stream_));
@@ -2196,12 +2166,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
                 t_resid_row, t_o_out_row, lt.post_ln_f16, (double)eps_,
                 t_.normed_row, t_.rstd_11, t_.cur_row,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
                                                    stream_));
@@ -2282,12 +2247,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
                 t_x1, t_x2, next_gamma, (double)eps_,
                 t_.rstd_11,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnInplaceAddRmsNorm(ws, ws_needed, exec,
                                                           stream_));
@@ -2305,12 +2265,7 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
                 t_resid_row, t_ffn_row, next_gamma, (double)eps_,
                 t_.normed_row, t_.rstd_11, t_.cur_row,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
                                                    stream_));
@@ -2846,12 +2801,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                 /*attentionOut*/ t_attn_out_bsnd,
                 /*softmaxLse*/ nullptr,
                 &fa_ws, &fa_exec));
-            if (fa_ws > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, fa_ws,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = fa_ws;
-            }
+            ensure_workspace((size_t)fa_ws);
             void *ws = fa_ws > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnFusedInferAttentionScoreV2(
                 ws, fa_ws, fa_exec, stream_));
@@ -2917,12 +2867,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                 t_x1, t_x2, lt.post_ln_f16, (double)eps_,
                 t_.rstd_11,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnInplaceAddRmsNorm(ws, ws_needed, exec,
                                                           stream_));
@@ -2948,12 +2893,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                 t_resid_row, t_o_out_row, lt.post_ln_f16, (double)eps_,
                 t_.normed_row, t_.rstd_11, t_.cur_row,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
                                                    stream_));
@@ -3095,12 +3035,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                 t_x1, t_x2, next_gamma_eager, (double)eps_,
                 t_.rstd_11,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnInplaceAddRmsNorm(ws, ws_needed, exec,
                                                           stream_));
@@ -3122,12 +3057,7 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
                 t_resid_row, t_ffn_row, next_gamma_eager, (double)eps_,
                 t_.normed_row, t_.rstd_11, t_.cur_row,
                 &ws_needed, &exec));
-            if (ws_needed > workspace_size_) {
-                if (workspace_dev_) g_cann.aclrtFree(workspace_dev_);
-                ACL_CHECK_RET(g_cann.aclrtMalloc(&workspace_dev_, ws_needed,
-                               ACL_MEM_MALLOC_HUGE_FIRST));
-                workspace_size_ = ws_needed;
-            }
+            ensure_workspace((size_t)ws_needed);
             void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
             ACL_CHECK_RET(g_cann.aclnnAddRmsNorm(ws, ws_needed, exec,
                                                    stream_));
