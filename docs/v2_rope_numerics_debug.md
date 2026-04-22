@@ -1,3 +1,12 @@
+---
+**SUPERSEDED by `v2_rope_reopen_verdict.md` (2026-04-21)**:
+A2-reopen standalone probe on ac02 falsified this document's
+"packed-UB GQA shared-stride" rootcause hypothesis. `aclnnApplyRotaryPosEmbV2`
+is numerically correct on 16Q/8KV GQA within 1 F16 ulp. Production A.2
+failure was a WIRING bug, not a kernel-level issue. See
+`v2_rope_reopen_verdict.md` for current state.
+---
+
 # aclnnApplyRotaryPosEmbV2 vs aclnnRotaryPositionEmbedding divergence
 
 ## Symptom
