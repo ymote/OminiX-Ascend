@@ -1432,6 +1432,38 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
         }
     }
 
+    // Phase A.2: opt-in aclnnApplyRotaryPosEmbV2 (fused Q+K in-place RoPE).
+    // Re-wire of the original A.2 that was closed with a 457-vs-434 frame
+    // divergence; see docs/v2_rope_reopen_verdict.md — op-level numerics are
+    // correct on our GQA shape, so the divergence was a WIRING bug. The
+    // re-wire (this code) applies five hypothesis fixes:
+    //   1. Workspace via ensure_workspace (WSPOOL retain-list safe).
+    //   2. Descriptor strides mirror v1's t_.q_rope_4d / t_k_rope_src
+    //      exactly.
+    //   3. aclGraph capture disabled while this flag is on (mirrors the A.1
+    //      inplace-ARS gate in capture_aclgraph_forwards_()).
+    //   4. V2 runs on the same stream as everything else — no event sync
+    //      needed.
+    //   5. K in-place target is k_cache_dev_[il] + pos * kv_dim_, which is
+    //      the same slot v1 writes.
+    {
+        const char *env = getenv("TALKER_CP_ROPE_V2");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_rope_v2_enabled_ = true;
+        }
+    }
+    cp_rope_v2_applied_ = cp_rope_v2_enabled_ && g_cann.has_rope_v2();
+    if (cp_rope_v2_enabled_ && !g_cann.has_rope_v2()) {
+        printf("[cp_cann] TALKER_CP_ROPE_V2 requested but "
+               "aclnnApplyRotaryPosEmbV2 symbol absent — staying on the "
+               "two-call aclnnRotaryPositionEmbedding path.\n");
+    }
+    if (cp_rope_v2_applied_) {
+        printf("[cp_cann] Phase A.2 ENABLED: aclnnApplyRotaryPosEmbV2 "
+               "(fused Q+K in-place RoPE) replaces the two NEOX RoPE "
+               "calls.\n");
+    }
+
     // W4.1: opt-in AscendC fused attention sublayer. Requires
     // QWEN_TTS_HAS_ASCENDC (build-time) AND w8_applied_ (weights in INT8
     // layout the kernel consumes) AND TALKER_CP_ASCENDC=1 (runtime gate).
@@ -1804,6 +1836,38 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
         }
     }
 
+    // Phase A.2: opt-in aclnnApplyRotaryPosEmbV2 (fused Q+K in-place RoPE).
+    // Re-wire of the original A.2 that was closed with a 457-vs-434 frame
+    // divergence; see docs/v2_rope_reopen_verdict.md — op-level numerics are
+    // correct on our GQA shape, so the divergence was a WIRING bug. The
+    // re-wire (this code) applies five hypothesis fixes:
+    //   1. Workspace via ensure_workspace (WSPOOL retain-list safe).
+    //   2. Descriptor strides mirror v1's t_.q_rope_4d / t_k_rope_src
+    //      exactly.
+    //   3. aclGraph capture disabled while this flag is on (mirrors the A.1
+    //      inplace-ARS gate in capture_aclgraph_forwards_()).
+    //   4. V2 runs on the same stream as everything else — no event sync
+    //      needed.
+    //   5. K in-place target is k_cache_dev_[il] + pos * kv_dim_, which is
+    //      the same slot v1 writes.
+    {
+        const char *env = getenv("TALKER_CP_ROPE_V2");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_rope_v2_enabled_ = true;
+        }
+    }
+    cp_rope_v2_applied_ = cp_rope_v2_enabled_ && g_cann.has_rope_v2();
+    if (cp_rope_v2_enabled_ && !g_cann.has_rope_v2()) {
+        printf("[cp_cann] TALKER_CP_ROPE_V2 requested but "
+               "aclnnApplyRotaryPosEmbV2 symbol absent — staying on the "
+               "two-call aclnnRotaryPositionEmbedding path.\n");
+    }
+    if (cp_rope_v2_applied_) {
+        printf("[cp_cann] Phase A.2 ENABLED: aclnnApplyRotaryPosEmbV2 "
+               "(fused Q+K in-place RoPE) replaces the two NEOX RoPE "
+               "calls.\n");
+    }
+
     // W4.1: opt-in AscendC fused attention sublayer. Same env+build-gate
     // semantics as the init_from_safetensors path above.
     {
@@ -2018,41 +2082,91 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
         CANN_OP(RmsNorm, t_.k_kv,    lt.k_norm, (double)eps_,
                 t_.k_kv,    t_.rstd_kv);
 
-        // Q RoPE (out -> attn_out_dev_).
-        CANN_OP(RotaryPositionEmbedding,
-                t_.q_rope_4d, t_cos, t_sin,
-                /*mode=*/(int64_t)0, t_.attn_out_4d);
-
-        // K RoPE: write directly into the KV-cache slot (existing behaviour).
+        // RoPE: either v1 two-call NEOX (stock) or V2 fused in-place (Phase A.2).
+        // V2 path rewires Q to live at q_dev_ post-RoPE (in-place) rather than
+        // at attn_out_dev_. FIAv2's Q source + output target swap accordingly,
+        // and O-proj is redirected to read attn_out_dev_ below under the same
+        // gate. Hypothesis-fix rationale in cp_cann_engine.h under
+        // cp_rope_v2_applied_.
         uint16_t *k_cache_slot =
             (uint16_t *)k_cache_dev_[il] + (size_t)pos * kv_dim_;
-        aclTensor *t_k_rope_src = [&]() {
-            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
-                                   (int64_t)head_dim_, 1};
-            return tensor_strided(k_dev_, 4, shape, strides);
-        }();
-        aclTensor *t_k_rope_dst = [&]() {
-            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
-                                   (int64_t)head_dim_, 1};
-            return tensor_strided(k_cache_slot, 4, shape, strides);
-        }();
-        CANN_OP(RotaryPositionEmbedding,
-                t_k_rope_src, t_cos, t_sin,
-                /*mode=*/(int64_t)0, t_k_rope_dst);
-        g_cann.aclDestroyTensor(t_k_rope_src);
-        g_cann.aclDestroyTensor(t_k_rope_dst);
+        if (cp_rope_v2_applied_) {
+            // Build Q and K tensor descriptors that MIRROR the v1 NEOX path
+            // exactly: same shape, same strides, same dtype, same layout.
+            // (Hypothesis-fix #2: descriptor parity.)
+            aclTensor *t_q_rope_v2 = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(q_dev_, 4, shape, strides);
+            }();
+            aclTensor *t_k_rope_v2 = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_cache_slot, 4, shape, strides);
+            }();
+            // V2 GetWorkspaceSize takes non-const queryRef + keyRef since it
+            // writes back into them in place. Invoke explicitly (not via
+            // CANN_OP) because the GetWorkspaceSize arg order differs (layout
+            // + rotaryMode before the ws pointer out-params). Workspace flows
+            // through ensure_workspace() which IS WSPOOL retain-list safe.
+            // (Hypothesis-fix #1: workspace lifetime.)
+            uint64_t v2_ws = 0;
+            aclOpExecutor *v2_exec = nullptr;
+            char rotary_mode[5] = {'h','a','l','f',0};
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2GetWorkspaceSize(
+                t_q_rope_v2, t_k_rope_v2, t_cos, t_sin,
+                /*layout=*/(int64_t)1, rotary_mode, &v2_ws, &v2_exec));
+            ensure_workspace((size_t)v2_ws);
+            void *v2_ws_ptr = v2_ws > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2(
+                v2_ws_ptr, v2_ws, v2_exec, stream_));
+            g_cann.aclDestroyTensor(t_q_rope_v2);
+            g_cann.aclDestroyTensor(t_k_rope_v2);
+        } else {
+            // v1 NEOX path: two aclnnRotaryPositionEmbedding calls.
+            // Q RoPE (out -> attn_out_dev_).
+            CANN_OP(RotaryPositionEmbedding,
+                    t_.q_rope_4d, t_cos, t_sin,
+                    /*mode=*/(int64_t)0, t_.attn_out_4d);
+
+            // K RoPE: write directly into the KV-cache slot.
+            aclTensor *t_k_rope_src = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_dev_, 4, shape, strides);
+            }();
+            aclTensor *t_k_rope_dst = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_cache_slot, 4, shape, strides);
+            }();
+            CANN_OP(RotaryPositionEmbedding,
+                    t_k_rope_src, t_cos, t_sin,
+                    /*mode=*/(int64_t)0, t_k_rope_dst);
+            g_cann.aclDestroyTensor(t_k_rope_src);
+            g_cann.aclDestroyTensor(t_k_rope_dst);
+        }
 
         // V-to-cache-slot D2D memcpy is GONE — V-proj above wrote directly
         // into the slot. This is the key capture-friendly change.
 
         // FIAv2: seq_len baked per pos into the K/V stride-over-seq views.
+        // Q source/output buffers SWAP under V2: v1 had RoPE'd Q at
+        // attn_out_dev_ and FIA output at q_dev_; V2 leaves RoPE'd Q at
+        // q_dev_ in-place, so FIA reads from q_dev_ and writes into
+        // attn_out_dev_. O-proj reads from whichever buffer holds the FIA
+        // output (see `attn_out_src` below).
+        void *fia_q_src_dev = cp_rope_v2_applied_ ? q_dev_ : attn_out_dev_;
+        void *fia_out_dst_dev = cp_rope_v2_applied_ ? attn_out_dev_ : q_dev_;
         aclTensor *t_q_bsnd = [&]() {
             int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
             int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                    (int64_t)head_dim_, 1};
-            return tensor_strided(attn_out_dev_, 4, shape, strides,
+            return tensor_strided(fia_q_src_dev, 4, shape, strides,
                                    ACL_FLOAT16);
         }();
         aclTensor *t_k_bsnd = [&]() {
@@ -2077,7 +2191,8 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
             int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
             int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                    (int64_t)head_dim_, 1};
-            return tensor_strided(q_dev_, 4, shape, strides, ACL_FLOAT16);
+            return tensor_strided(fia_out_dst_dev, 4, shape, strides,
+                                   ACL_FLOAT16);
         }();
 
         aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k_bsnd, 1);
@@ -2120,10 +2235,16 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
         // x1Ref (= normed_dev_) already contains the addend it needs. The
         // previous consumers of normed_dev_ (Q/K/V projections) completed at
         // QKV time above, so overwriting here is safe.
+        //
+        // Phase A.2 (V2 RoPE): O-proj reads from wherever FIAv2 wrote its
+        // output — q_dev_ in the v1 path, attn_out_dev_ in the V2 path (see
+        // `fia_out_dst_dev` swap above).
         void *post_attn_rhs_dev = cp_inplace_ars_applied_ ? normed_dev_
                                                           : o_out_dev_;
+        void *attn_out_src_dev = cp_rope_v2_applied_ ? attn_out_dev_ : q_dev_;
         {
-            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(attn_out_src_dev, 1, q_dim_,
+                                            ACL_FLOAT16);
             aclTensor *t_o_row = tensor_2d(post_attn_rhs_dev, 1, cp_hidden_,
                                             ACL_FLOAT16);
             w8_matmul_(t_q_row, layer_w_[il].o_proj_w_i8,
@@ -2323,6 +2444,21 @@ void CpCannEngine::capture_aclgraph_forwards_() {
                         "TALKER_CP_FFN_V3 is also set — aclgraph capture "
                         "disabled for Phase B landing (re-enabled after "
                         "FFNV3-captured parity verified).\n");
+        return;
+    }
+    // Phase A.2: disable aclGraph capture while V2 RoPE is on. V2 writes Q
+    // AND K in-place; captured tensor descriptors encode the original
+    // read-from-q_dev_ / write-to-attn_out_dev_ binding, which would mis-fire
+    // under V2's write-back-to-q_dev_ pattern. Mirror of the A.1 inplace
+    // AddRmsNorm gate above — the debug doc (v2_rope_numerics_debug.md:152)
+    // notes this was correct in the original A.2 patch, and keeping it off
+    // isolates V2 as a pure op-fusion change without aclGraph-interaction
+    // risk. Re-enable once descriptor-parity is verified under capture.
+    if (cp_rope_v2_applied_) {
+        fprintf(stderr, "[cp_cann] TALKER_CP_ACLGRAPH=1 but "
+                        "TALKER_CP_ROPE_V2 is also set — aclgraph capture "
+                        "disabled for Phase A.2 re-wire (in-place V2 RoPE "
+                        "conflicts with captured descriptor binding).\n");
         return;
     }
 
@@ -2684,30 +2820,59 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         CANN_OP(RmsNorm, t_.k_kv,    lt.k_norm, (double)eps_,
                 t_.k_kv,    t_.rstd_kv);
 
-        // RoPE (F16)
-        CANN_OP(RotaryPositionEmbedding,
-                t_.q_rope_4d, t_cos, t_sin,
-                /*mode=*/(int64_t)0, t_.attn_out_4d);
-
+        // RoPE: v1 two-call NEOX or V2 fused in-place (Phase A.2). See the
+        // capturable mirror above for hypothesis-fix rationale.
         uint16_t *k_cache_slot =
             (uint16_t *)k_cache_dev_[il] + (size_t)pos * kv_dim_;
-        aclTensor *t_k_rope_src = [&]() {
-            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
-                                   (int64_t)head_dim_, 1};
-            return tensor_strided(k_dev_, 4, shape, strides);
-        }();
-        aclTensor *t_k_rope_dst = [&]() {
-            int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
-            int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
-                                   (int64_t)head_dim_, 1};
-            return tensor_strided(k_cache_slot, 4, shape, strides);
-        }();
-        CANN_OP(RotaryPositionEmbedding,
-                t_k_rope_src, t_cos, t_sin,
-                /*mode=*/(int64_t)0, t_k_rope_dst);
-        g_cann.aclDestroyTensor(t_k_rope_src);
-        g_cann.aclDestroyTensor(t_k_rope_dst);
+        if (cp_rope_v2_applied_) {
+            aclTensor *t_q_rope_v2 = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(q_dev_, 4, shape, strides);
+            }();
+            aclTensor *t_k_rope_v2 = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_cache_slot, 4, shape, strides);
+            }();
+            uint64_t v2_ws = 0;
+            aclOpExecutor *v2_exec = nullptr;
+            char rotary_mode[5] = {'h','a','l','f',0};
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2GetWorkspaceSize(
+                t_q_rope_v2, t_k_rope_v2, t_cos, t_sin,
+                /*layout=*/(int64_t)1, rotary_mode, &v2_ws, &v2_exec));
+            ensure_workspace((size_t)v2_ws);
+            void *v2_ws_ptr = v2_ws > 0 ? workspace_dev_ : nullptr;
+            ACL_CHECK_RET(g_cann.aclnnApplyRotaryPosEmbV2(
+                v2_ws_ptr, v2_ws, v2_exec, stream_));
+            g_cann.aclDestroyTensor(t_q_rope_v2);
+            g_cann.aclDestroyTensor(t_k_rope_v2);
+        } else {
+            // RoPE (F16) — v1 NEOX two-call path.
+            CANN_OP(RotaryPositionEmbedding,
+                    t_.q_rope_4d, t_cos, t_sin,
+                    /*mode=*/(int64_t)0, t_.attn_out_4d);
+
+            aclTensor *t_k_rope_src = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_dev_, 4, shape, strides);
+            }();
+            aclTensor *t_k_rope_dst = [&]() {
+                int64_t shape[4]   = {1, 1, (int64_t)n_kv_, (int64_t)head_dim_};
+                int64_t strides[4] = {(int64_t)kv_dim_, (int64_t)kv_dim_,
+                                       (int64_t)head_dim_, 1};
+                return tensor_strided(k_cache_slot, 4, shape, strides);
+            }();
+            CANN_OP(RotaryPositionEmbedding,
+                    t_k_rope_src, t_cos, t_sin,
+                    /*mode=*/(int64_t)0, t_k_rope_dst);
+            g_cann.aclDestroyTensor(t_k_rope_src);
+            g_cann.aclDestroyTensor(t_k_rope_dst);
+        }
 
         // V -> cache slot
         uint16_t *v_cache_slot =
@@ -2726,15 +2891,19 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         // because it was a custom attention with subtly-different numerics.
         //
         // Input layouts (BSND with B=1):
-        //   Q:   [1, 1, n_heads, head_dim]  over attn_out_dev_ (RoPE'd Q)
+        //   Q:   [1, 1, n_heads, head_dim]  over attn_out_dev_ (v1) or
+        //        q_dev_ (V2 in-place RoPE)
         //   K:   [1, seq_len, n_kv, head_dim] view of KV cache (native)
         //   V:   same as K, over v_cache_dev_
-        //   Out: [1, 1, n_heads, head_dim]  into q_dev_
+        //   Out: [1, 1, n_heads, head_dim]  into q_dev_ (v1) or
+        //        attn_out_dev_ (V2 — Q source/dst swap to avoid aliasing)
+        void *fia_q_src_dev = cp_rope_v2_applied_ ? q_dev_ : attn_out_dev_;
+        void *fia_out_dst_dev = cp_rope_v2_applied_ ? attn_out_dev_ : q_dev_;
         aclTensor *t_q_bsnd = [&]() {
             int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
             int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                    (int64_t)head_dim_, 1};
-            return tensor_strided(attn_out_dev_, 4, shape, strides,
+            return tensor_strided(fia_q_src_dev, 4, shape, strides,
                                    ACL_FLOAT16);
         }();
         aclTensor *t_k_bsnd = [&]() {
@@ -2759,7 +2928,8 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
             int64_t shape[4]   = {1, 1, (int64_t)n_heads_, (int64_t)head_dim_};
             int64_t strides[4] = {(int64_t)q_dim_, (int64_t)q_dim_,
                                    (int64_t)head_dim_, 1};
-            return tensor_strided(q_dev_, 4, shape, strides, ACL_FLOAT16);
+            return tensor_strided(fia_out_dst_dev, 4, shape, strides,
+                                   ACL_FLOAT16);
         }();
 
         aclTensorList *t_k_list = g_cann.aclCreateTensorList(&t_k_bsnd, 1);
@@ -2816,10 +2986,14 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         // O projection: W8 > NZ > ND. Phase A.1: under inplace AddRmsNorm,
         // redirect the O-proj output into normed_dev_ so it becomes the
         // x1Ref addend for the subsequent InplaceAddRmsNorm call.
+        // Phase A.2 (V2 RoPE): O-proj reads from whichever buffer holds the
+        // FIAv2 output — attn_out_dev_ under V2, q_dev_ under v1.
         void *post_attn_rhs_dev = cp_inplace_ars_applied_ ? normed_dev_
                                                           : o_out_dev_;
+        void *attn_out_src_dev = cp_rope_v2_applied_ ? attn_out_dev_ : q_dev_;
         if (w8_applied_) {
-            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+            aclTensor *t_q_row = tensor_2d(attn_out_src_dev, 1, q_dim_,
+                                            ACL_FLOAT16);
             aclTensor *t_o_row = tensor_2d(post_attn_rhs_dev, 1, cp_hidden_,
                                             ACL_FLOAT16);
             w8_matmul_(t_q_row, layer_w_[il].o_proj_w_i8,
@@ -2832,25 +3006,41 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
             aclTensor *t_wo_T = make_tensor(layer_w_[il].o_proj_w, 2, wT_shape,
                                              wT_strides, ACL_FLOAT16,
                                              ACL_FORMAT_FRACTAL_NZ);
-            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_);
+            aclTensor *t_q_row = tensor_2d(attn_out_src_dev, 1, q_dim_);
             aclTensor *t_o_row = tensor_2d(post_attn_rhs_dev, 1, cp_hidden_);
             CANN_OP(Mm, t_q_row, t_wo_T, t_o_row, (int8_t)0);
             g_cann.aclDestroyTensor(t_wo_T);
             g_cann.aclDestroyTensor(t_q_row);
             g_cann.aclDestroyTensor(t_o_row);
         } else {
-            // ND fallback — O-proj target descriptor must also respect the
-            // inplace redirect when active.
-            if (cp_inplace_ars_applied_) {
-                aclTensor *t_o_col = tensor_2d(normed_dev_, cp_hidden_, 1,
-                                                ACL_FLOAT16);
-                CANN_OP(Mm, lt.o_proj, t_.q_col, t_o_col,
-                        /*cubeMathType=*/0);
-                g_cann.aclDestroyTensor(t_o_col);
+            // ND fallback. t_.q_col is a persistent tensor_2d over q_dev_;
+            // under V2 we must build a matching view over attn_out_dev_
+            // instead. O-proj target descriptor also respects the inplace
+            // redirect when active.
+            aclTensor *t_o_col = cp_inplace_ars_applied_
+                ? tensor_2d(normed_dev_, cp_hidden_, 1, ACL_FLOAT16)
+                : nullptr;
+            if (cp_rope_v2_applied_) {
+                aclTensor *t_attn_col = tensor_2d(attn_out_dev_, q_dim_, 1,
+                                                   ACL_FLOAT16);
+                if (t_o_col) {
+                    CANN_OP(Mm, lt.o_proj, t_attn_col, t_o_col,
+                            /*cubeMathType=*/0);
+                } else {
+                    CANN_OP(Mm, lt.o_proj, t_attn_col, t_.o_out_col,
+                            /*cubeMathType=*/0);
+                }
+                g_cann.aclDestroyTensor(t_attn_col);
             } else {
-                CANN_OP(Mm, lt.o_proj, t_.q_col, t_.o_out_col,
-                        /*cubeMathType=*/0);
+                if (t_o_col) {
+                    CANN_OP(Mm, lt.o_proj, t_.q_col, t_o_col,
+                            /*cubeMathType=*/0);
+                } else {
+                    CANN_OP(Mm, lt.o_proj, t_.q_col, t_.o_out_col,
+                            /*cubeMathType=*/0);
+                }
             }
+            if (t_o_col) g_cann.aclDestroyTensor(t_o_col);
         }
 
         if (cp_fusion_applied_ && cp_inplace_ars_applied_) {

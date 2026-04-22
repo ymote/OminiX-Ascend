@@ -249,6 +249,14 @@ bool load_once() {
     resolve_optional(h_op, "aclnnFFNV3",
                      g_cann.aclnnFFNV3);
 
+    // Optional: aclnnApplyRotaryPosEmbV2 (Phase A.2, CANN 8.3+). Fused Q+K
+    // in-place RoPE. Absence means callers stay on the two-call
+    // aclnnRotaryPositionEmbedding path. Gated via has_rope_v2().
+    resolve_optional(h_op, "aclnnApplyRotaryPosEmbV2GetWorkspaceSize",
+                     g_cann.aclnnApplyRotaryPosEmbV2GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnApplyRotaryPosEmbV2",
+                     g_cann.aclnnApplyRotaryPosEmbV2);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};

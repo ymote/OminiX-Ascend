@@ -507,6 +507,30 @@ private:
     bool cp_ffn_v3_enabled_ = false;
     bool cp_ffn_v3_applied_ = false;
 
+    // ---- Phase A.2: aclnnApplyRotaryPosEmbV2 fused Q+K in-place RoPE
+    // (TALKER_CP_ROPE_V2) ----
+    // When set AND g_cann.has_rope_v2(), the two per-step NEOX
+    // aclnnRotaryPositionEmbedding calls (Q then K) collapse into a single
+    // fused in-place V2 call. This is a re-wire of the original Phase A.2
+    // work (closed in 2026-04 with a 457 vs 434 frame divergence). The
+    // A2-reopen probe (tools/qwen_tts/test_rope_v2_reopen.cpp) proved the
+    // op is numerically correct on talker's 16Q/8KV GQA shape within 1 F16
+    // ulp; the original divergence was a WIRING bug. Key re-wire choices:
+    //   1. Workspace via CANN_OP macro (ensure_workspace path, WSPOOL
+    //      retain-list safe).
+    //   2. Q/K/cos/sin tensor descriptors mirror the v1 NEOX path's
+    //      tensor_strided views exactly (same shape, strides, dtype).
+    //   3. Q is in-place at q_dev_ post-V2 (not attn_out_dev_ as in v1) so
+    //      FIAv2 reads Q from q_dev_ and writes output to attn_out_dev_;
+    //      O-proj is redirected to read attn_out_dev_ under this gate.
+    //   4. aclGraph capture is disabled while this flag is on (same as the
+    //      A.1 inplace-ARS pattern) to avoid captured descriptor staleness.
+    //   5. K is in-place into the KV-cache slot at
+    //      k_cache_dev_[il] + pos * kv_dim_ with strides
+    //      {kv_dim_, kv_dim_, head_dim_, 1} — identical to v1's K-dst.
+    bool cp_rope_v2_enabled_ = false;
+    bool cp_rope_v2_applied_ = false;
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);

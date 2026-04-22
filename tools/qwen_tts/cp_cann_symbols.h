@@ -161,6 +161,38 @@ struct CannSyms {
                                                  aclOpExecutor *,
                                                  aclrtStream);
 
+    // ---- Fused in-place Q+K rotary position embedding (Phase A.2, CANN 8.3+) --
+    // aclnnApplyRotaryPosEmbV2 fuses two aclnnRotaryPositionEmbedding calls
+    // (one for Q, one for K) into a single op with in-place writes back into
+    // the queryRef / keyRef buffers. Matches NEOX rotation when invoked with
+    // rotaryMode="half" and half-duplicated cos/sin tables (see probe at
+    // tools/qwen_tts/test_rope_v2_reopen.cpp for byte-level equivalence).
+    //
+    // Layout semantics:
+    //   layout=0: BNSD (batch, n_heads, seq, head_dim)
+    //   layout=1: BSND (batch, seq, n_heads, head_dim)  <- we use this
+    //
+    // GQA is supported natively: Q and K may have different n_heads. Probe
+    // result on 16Q/8KV (talker shape): max_abs vs v1 NEOX = 4.88e-4 = 1 F16
+    // ulp on both Q and K outputs.
+    //
+    // Q and K are both in-place: queryRef and keyRef are the input AND output
+    // buffers. Callers must ensure there are no concurrent reads of the Q/K
+    // slots on the same stream until the op completes.
+    //
+    // Capability flag: has_rope_v2(); absence means the toolkit predates the
+    // V2 op and callers stay on the two-call aclnnRotaryPositionEmbedding
+    // path. Gated by TALKER_CP_ROPE_V2=1 at runtime (Phase A.2).
+    aclnnStatus (*aclnnApplyRotaryPosEmbV2GetWorkspaceSize)(
+        aclTensor *queryRef, aclTensor *keyRef,
+        const aclTensor *cos, const aclTensor *sin,
+        int64_t layout, char *rotaryMode,
+        uint64_t *workspaceSize, aclOpExecutor **executor);
+    aclnnStatus (*aclnnApplyRotaryPosEmbV2)(void *workspace,
+                                             uint64_t workspaceSize,
+                                             aclOpExecutor *executor,
+                                             aclrtStream stream);
+
     // Dtype conversion (used to cast the F32 input embedding down to F16 at
     // engine entry, and the F16 final hidden back to F32 at exit).
     aclnnStatus (*aclnnCastGetWorkspaceSize)(const aclTensor *self,
@@ -444,6 +476,16 @@ struct CannSyms {
     bool has_ffn_v3() const {
         return aclnnFFNV3GetWorkspaceSize != nullptr &&
                aclnnFFNV3                 != nullptr;
+    }
+
+    // Capability flag for aclnnApplyRotaryPosEmbV2 (Phase A.2, CANN 8.3+).
+    // When present + TALKER_CP_ROPE_V2=1, the two per-step
+    // aclnnRotaryPositionEmbedding calls (Q + K) collapse into a single
+    // fused in-place V2 call. Absence means the toolkit predates the V2
+    // op and callers stay on the two-call path.
+    bool has_rope_v2() const {
+        return aclnnApplyRotaryPosEmbV2GetWorkspaceSize != nullptr &&
+               aclnnApplyRotaryPosEmbV2                 != nullptr;
     }
 };
 
