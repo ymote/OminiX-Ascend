@@ -222,6 +222,9 @@ CpCannEngine::~CpCannEngine() {
     aclgraph_graphs_.clear();
     free_dev(zero_f16_cp_dev_);
 
+    // Phase GMM-wire: shared zero-F16 antiquantOffset buffer.
+    free_dev(antiquant_zero_offset_dev_);
+
     // WSPOOL: drain the retain list before freeing the active workspace.
     // Be defensive — sync the stream here in case the destructor is called
     // while a forward was never synced by the caller.
@@ -600,6 +603,129 @@ void CpCannEngine::w8_matmul_(const aclTensor *x,
     }
     g_cann.aclDestroyTensor(t_w);
     g_cann.aclDestroyTensor(t_scale);
+}
+
+// ============================================================================
+// Phase GMM-wire: aclnnGroupedMatmulV3 fused Q/K/V
+// ============================================================================
+//
+// Replaces the three sequential w8_matmul_ calls that produce Q/K/V at the
+// attention-sublayer entry with a single aclnnGroupedMatmulV3 dispatch. All
+// three "groups" share the same activation — we pass three distinct
+// aclTensor views wrapping the same device buffer (aclDestroyTensorList
+// consumes the contained tensors, so fresh views must be built every call).
+//
+// The shared zero-F16 antiquantOffset buffer is allocated once at init
+// (size = q_dim_ = max(Nq, Nk, Nv)); each group wraps a prefix view whose
+// length matches that group's N.
+//
+// Preconditions enforced at the call site:
+//   * cp_gmm_qkv_applied_
+//   * antiquant_zero_offset_dev_ != nullptr
+//   * layer_w_[il].{q,k,v}_proj_{w_i8,scale} populated (w8_applied_)
+//
+// Argument semantics mirror the probe at /tmp/qkv_grouped_probe/
+// test_qkv_grouped.cpp: x_dev is the activation (F16 [1, cp_hidden]);
+// q_out_dev / k_out_dev / v_out_dev are the destination buffers sized
+// q_dim_, kv_dim_, kv_dim_ respectively.
+void CpCannEngine::gmm_qkv_(void *x_dev, int64_t il,
+                             void *q_out_dev, void *k_out_dev,
+                             void *v_out_dev) {
+    // Fresh tensor views. Per the probe: aclDestroyTensorList consumes the
+    // contained tensors and the op pipeline cannot reuse stale handles, so
+    // every dispatch rebuilds its own.
+    auto mk_x = [&]() {
+        int64_t shape[2]   = {1, (int64_t)cp_hidden_};
+        int64_t strides[2] = {(int64_t)cp_hidden_, 1};
+        int64_t storage    = cp_hidden_;
+        return g_cann.aclCreateTensor(shape, 2, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, x_dev);
+    };
+    auto mk_w = [&](void *w_dev, int64_t N) {
+        // Mirror w8_matmul_'s weight layout: logical [K,N] over a physical
+        // [N,K] INT8 blob via strides {1, K}.
+        int64_t shape[2]   = {(int64_t)cp_hidden_, N};
+        int64_t strides[2] = {1, (int64_t)cp_hidden_};
+        int64_t storage    = N * (int64_t)cp_hidden_;
+        return g_cann.aclCreateTensor(shape, 2, ACL_INT8, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, w_dev);
+    };
+    auto mk_1d_f16 = [&](void *d, int64_t N) {
+        int64_t shape[1]   = {N};
+        int64_t strides[1] = {1};
+        int64_t storage    = N;
+        return g_cann.aclCreateTensor(shape, 1, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, d);
+    };
+    auto mk_y = [&](void *buf, int64_t N) {
+        int64_t shape[2]   = {1, N};
+        int64_t strides[2] = {N, 1};
+        int64_t storage    = N;
+        return g_cann.aclCreateTensor(shape, 2, ACL_FLOAT16, strides, 0,
+                                       ACL_FORMAT_ND, &storage, 1, buf);
+    };
+
+    std::vector<const aclTensor *> xs  = {mk_x(), mk_x(), mk_x()};
+    std::vector<const aclTensor *> ws_ = {mk_w(layer_w_[il].q_proj_w_i8, q_dim_),
+                                          mk_w(layer_w_[il].k_proj_w_i8, kv_dim_),
+                                          mk_w(layer_w_[il].v_proj_w_i8, kv_dim_)};
+    std::vector<const aclTensor *> asc = {mk_1d_f16(layer_w_[il].q_proj_scale, q_dim_),
+                                          mk_1d_f16(layer_w_[il].k_proj_scale, kv_dim_),
+                                          mk_1d_f16(layer_w_[il].v_proj_scale, kv_dim_)};
+    // Shared zero-F16 antiquantOffset buffer. Each group wraps a prefix view
+    // sized to that group's N. Identical dev pointers across groups are
+    // accepted by the runtime so long as the aclTensor handles are distinct.
+    std::vector<const aclTensor *> aoc = {mk_1d_f16(antiquant_zero_offset_dev_, q_dim_),
+                                          mk_1d_f16(antiquant_zero_offset_dev_, kv_dim_),
+                                          mk_1d_f16(antiquant_zero_offset_dev_, kv_dim_)};
+    std::vector<const aclTensor *> ys  = {mk_y(q_out_dev, q_dim_),
+                                          mk_y(k_out_dev, kv_dim_),
+                                          mk_y(v_out_dev, kv_dim_)};
+
+    aclTensorList *x_list  = g_cann.aclCreateTensorList(xs.data(),  xs.size());
+    aclTensorList *w_list  = g_cann.aclCreateTensorList(ws_.data(), ws_.size());
+    aclTensorList *as_list = g_cann.aclCreateTensorList(asc.data(), asc.size());
+    aclTensorList *ao_list = g_cann.aclCreateTensorList(aoc.data(), aoc.size());
+    aclTensorList *y_list  = g_cann.aclCreateTensorList(ys.data(),  ys.size());
+
+    uint64_t ws_needed = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnGroupedMatmulV3GetWorkspaceSize(
+        x_list, w_list,
+        /*biasOptional*/             nullptr,
+        /*scaleOptional*/            nullptr,   // post-quant scale (W8A8 lane)
+        /*offsetOptional*/           nullptr,
+        /*antiquantScaleOptional*/   as_list,
+        /*antiquantOffsetOptional*/  ao_list,
+        /*groupListOptional*/        nullptr,
+        /*splitItem*/                0,
+        /*groupType*/                -1,
+        y_list, &ws_needed, &exec);
+    if (s != 0) {
+        fprintf(stderr,
+                "[cp_cann] gmm_qkv V3 GetWorkspaceSize status=%d (il=%ld)\n",
+                (int)s, (long)il);
+        g_cann.aclDestroyTensorList(x_list);
+        g_cann.aclDestroyTensorList(w_list);
+        g_cann.aclDestroyTensorList(as_list);
+        g_cann.aclDestroyTensorList(ao_list);
+        g_cann.aclDestroyTensorList(y_list);
+        return;
+    }
+
+    ensure_workspace((size_t)ws_needed);
+    void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
+    s = g_cann.aclnnGroupedMatmulV3(ws, ws_needed, exec, stream_);
+    if (s != 0) {
+        fprintf(stderr, "[cp_cann] gmm_qkv V3 launch status=%d (il=%ld)\n",
+                (int)s, (long)il);
+    }
+
+    g_cann.aclDestroyTensorList(x_list);
+    g_cann.aclDestroyTensorList(w_list);
+    g_cann.aclDestroyTensorList(as_list);
+    g_cann.aclDestroyTensorList(ao_list);
+    g_cann.aclDestroyTensorList(y_list);
 }
 
 // ============================================================================
@@ -1464,6 +1590,47 @@ bool CpCannEngine::init_from_safetensors(const std::string &path,
                "calls.\n");
     }
 
+    // Phase GMM-wire: opt-in aclnnGroupedMatmulV3 for Q/K/V. Requires
+    // w8_applied_ (antiquantScale path) and the runtime symbol. Allocates a
+    // shared zero-F16 antiquantOffset buffer of length q_dim_ (= max of the
+    // three per-group Ns). See docs/qkv_grouped_probe_verdict.md for the
+    // probe-verified A16W8 configuration (groupType=-1, splitItem=0,
+    // antiquantOffset list of 3 zero views). Default off; caller sets
+    // TALKER_CP_GMM_QKV=1 to opt in.
+    {
+        const char *env = getenv("TALKER_CP_GMM_QKV");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_gmm_qkv_enabled_ = true;
+        }
+    }
+    cp_gmm_qkv_applied_ = cp_gmm_qkv_enabled_ &&
+                          w8_applied_ &&
+                          g_cann.has_grouped_matmul_v3();
+    if (cp_gmm_qkv_enabled_ && !w8_applied_) {
+        printf("[cp_cann] TALKER_CP_GMM_QKV requested but A16W8 is not "
+               "active — aclnnGroupedMatmulV3 requires INT8 weights + F16 "
+               "antiquant scales. Staying on 3× aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (cp_gmm_qkv_enabled_ && w8_applied_ && !g_cann.has_grouped_matmul_v3()) {
+        printf("[cp_cann] TALKER_CP_GMM_QKV requested but "
+               "aclnnGroupedMatmulV3 symbol absent — staying on 3× "
+               "aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (cp_gmm_qkv_applied_) {
+        // Allocate + zero-fill the shared F16 antiquantOffset buffer. Size
+        // q_dim_ (largest of Nq/Nk/Nv); K/V groups wrap prefix views.
+        alloc_dev(&antiquant_zero_offset_dev_,
+                  (size_t)q_dim_ * sizeof(uint16_t));
+        std::vector<uint16_t> zeros((size_t)q_dim_, 0);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            antiquant_zero_offset_dev_, (size_t)q_dim_ * sizeof(uint16_t),
+            zeros.data(), (size_t)q_dim_ * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        printf("[cp_cann] Phase GMM-wire ENABLED: aclnnGroupedMatmulV3 "
+               "replaces the 3 per-layer QKV w8_matmul_ calls (projected "
+               "+0.3 fps; ~1.7e-3 relative drift vs 3-call reference).\n");
+    }
+
     // W4.1: opt-in AscendC fused attention sublayer. Requires
     // QWEN_TTS_HAS_ASCENDC (build-time) AND w8_applied_ (weights in INT8
     // layout the kernel consumes) AND TALKER_CP_ASCENDC=1 (runtime gate).
@@ -1868,6 +2035,41 @@ bool CpCannEngine::init(const CpWeightsF32 &w, const CodePredictorConfig &cfg,
                "calls.\n");
     }
 
+    // Phase GMM-wire: opt-in aclnnGroupedMatmulV3 (mirror of the
+    // init_from_safetensors path above). Allocates the shared zero-F16
+    // antiquantOffset buffer when the flag is on.
+    {
+        const char *env = getenv("TALKER_CP_GMM_QKV");
+        if (env && env[0] != '\0' && env[0] != '0') {
+            cp_gmm_qkv_enabled_ = true;
+        }
+    }
+    cp_gmm_qkv_applied_ = cp_gmm_qkv_enabled_ &&
+                          w8_applied_ &&
+                          g_cann.has_grouped_matmul_v3();
+    if (cp_gmm_qkv_enabled_ && !w8_applied_) {
+        printf("[cp_cann] TALKER_CP_GMM_QKV requested but A16W8 is not "
+               "active — aclnnGroupedMatmulV3 requires INT8 weights + F16 "
+               "antiquant scales. Staying on 3× aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (cp_gmm_qkv_enabled_ && w8_applied_ && !g_cann.has_grouped_matmul_v3()) {
+        printf("[cp_cann] TALKER_CP_GMM_QKV requested but "
+               "aclnnGroupedMatmulV3 symbol absent — staying on 3× "
+               "aclnnWeightQuantBatchMatmul.\n");
+    }
+    if (cp_gmm_qkv_applied_) {
+        alloc_dev(&antiquant_zero_offset_dev_,
+                  (size_t)q_dim_ * sizeof(uint16_t));
+        std::vector<uint16_t> zeros((size_t)q_dim_, 0);
+        ACL_CHECK_RET(g_cann.aclrtMemcpy(
+            antiquant_zero_offset_dev_, (size_t)q_dim_ * sizeof(uint16_t),
+            zeros.data(), (size_t)q_dim_ * sizeof(uint16_t),
+            ACL_MEMCPY_HOST_TO_DEVICE));
+        printf("[cp_cann] Phase GMM-wire ENABLED: aclnnGroupedMatmulV3 "
+               "replaces the 3 per-layer QKV w8_matmul_ calls (projected "
+               "+0.3 fps; ~1.7e-3 relative drift vs 3-call reference).\n");
+    }
+
     // W4.1: opt-in AscendC fused attention sublayer. Same env+build-gate
     // semantics as the init_from_safetensors path above.
     {
@@ -2056,24 +2258,34 @@ void CpCannEngine::forward_one_token_capturable_(int pos) {
         // slot for this (layer, pos), removing the need for a D2D memcpy
         // post-hoc. Since `pos` is baked per-captured-graph, the tensor
         // descriptor below locks in the right slot at capture time.
+        //
+        // GMM-wire variant: one aclnnGroupedMatmulV3 dispatch instead of
+        // three w8_matmul_ calls. V destination is still the per-(il,pos)
+        // cache slot — gmm_qkv_ takes a raw device pointer so the slot
+        // address can be baked into the captured graph just like above.
         {
-            aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
-            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
-            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
-            // V-proj output view into v_cache_dev_[il] + pos*kv_dim (F16).
             uint16_t *v_slot_ptr =
                 (uint16_t *)v_cache_dev_[il] + (size_t)pos * kv_dim_;
-            aclTensor *t_v_row = tensor_2d(v_slot_ptr, 1, kv_dim_, ACL_FLOAT16);
-            w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
-                        layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
-            w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
-                        layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
-            w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
-                        layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
-            g_cann.aclDestroyTensor(t_n_row);
-            g_cann.aclDestroyTensor(t_q_row);
-            g_cann.aclDestroyTensor(t_k_row);
-            g_cann.aclDestroyTensor(t_v_row);
+            if (cp_gmm_qkv_applied_) {
+                gmm_qkv_(normed_dev_, il,
+                          q_dev_, k_dev_, (void *)v_slot_ptr);
+            } else {
+                aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+                aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+                aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+                // V-proj output view into v_cache_dev_[il] + pos*kv_dim (F16).
+                aclTensor *t_v_row = tensor_2d(v_slot_ptr, 1, kv_dim_, ACL_FLOAT16);
+                w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
+                            layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
+                w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
+                            layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
+                w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
+                            layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
+                g_cann.aclDestroyTensor(t_n_row);
+                g_cann.aclDestroyTensor(t_q_row);
+                g_cann.aclDestroyTensor(t_k_row);
+                g_cann.aclDestroyTensor(t_v_row);
+            }
         }
 
         // q_norm / k_norm (per-head / per-kv-head RmsNorm).
@@ -2461,6 +2673,21 @@ void CpCannEngine::capture_aclgraph_forwards_() {
                         "conflicts with captured descriptor binding).\n");
         return;
     }
+    // Phase GMM-wire: disable aclGraph capture while GMM is on. GMM replaces
+    // 3 separate WQBMMv3 calls (op-count change, same as FFN_V3 above) and
+    // its outputs differ by 1-2 F16 ulp from the reference, so any previously
+    // captured graphs would drift out of the byte-identical window that G2/G3
+    // parity gates lock in. Conservative: eager-only for first landing; a
+    // follow-up can re-capture with GMM in place once drift is characterised
+    // under replay.
+    if (cp_gmm_qkv_applied_) {
+        fprintf(stderr, "[cp_cann] TALKER_CP_ACLGRAPH=1 but "
+                        "TALKER_CP_GMM_QKV is also set — aclgraph capture "
+                        "disabled for Phase GMM-wire landing (op-count "
+                        "change + 1.7e-3 relative drift vs 3-call reference "
+                        "conflicts with byte-identical parity gates).\n");
+        return;
+    }
 
     // Allocate the zero-buffer used by aclnn_copy_cp_ (aclnnAdd with
     // `self + 1.0 * zero = self` pattern).
@@ -2771,20 +2998,28 @@ void CpCannEngine::forward_one_token_launch(const float *input_talker_space,
         {
         // Three-way split: W8 (Stretch S1) > NZ (M5.3) > ND (default).
         if (w8_applied_) {
-            aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
-            aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
-            aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
-            aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_, ACL_FLOAT16);
-            w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
-                        layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
-            w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
-                        layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
-            w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
-                        layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
-            g_cann.aclDestroyTensor(t_n_row);
-            g_cann.aclDestroyTensor(t_q_row);
-            g_cann.aclDestroyTensor(t_k_row);
-            g_cann.aclDestroyTensor(t_v_row);
+            // GMM-wire variant: one aclnnGroupedMatmulV3 dispatch replaces
+            // the three w8_matmul_ calls. Outputs go to the canonical
+            // q_dev_ / k_dev_ / v_dev_ buffers (same destinations the
+            // stock path writes to).
+            if (cp_gmm_qkv_applied_) {
+                gmm_qkv_(normed_dev_, il, q_dev_, k_dev_, v_dev_);
+            } else {
+                aclTensor *t_n_row = tensor_2d(normed_dev_, 1, cp_hidden_, ACL_FLOAT16);
+                aclTensor *t_q_row = tensor_2d(q_dev_, 1, q_dim_, ACL_FLOAT16);
+                aclTensor *t_k_row = tensor_2d(k_dev_, 1, kv_dim_, ACL_FLOAT16);
+                aclTensor *t_v_row = tensor_2d(v_dev_, 1, kv_dim_, ACL_FLOAT16);
+                w8_matmul_(t_n_row, layer_w_[il].q_proj_w_i8,
+                            layer_w_[il].q_proj_scale, q_dim_, cp_hidden_, t_q_row);
+                w8_matmul_(t_n_row, layer_w_[il].k_proj_w_i8,
+                            layer_w_[il].k_proj_scale, kv_dim_, cp_hidden_, t_k_row);
+                w8_matmul_(t_n_row, layer_w_[il].v_proj_w_i8,
+                            layer_w_[il].v_proj_scale, kv_dim_, cp_hidden_, t_v_row);
+                g_cann.aclDestroyTensor(t_n_row);
+                g_cann.aclDestroyTensor(t_q_row);
+                g_cann.aclDestroyTensor(t_k_row);
+                g_cann.aclDestroyTensor(t_v_row);
+            }
         } else if (nz_applied_) {
             auto wT_nz = [&](void *buf, int64_t rows, int64_t cols) {
                 int64_t shape[2]   = {cols, rows};

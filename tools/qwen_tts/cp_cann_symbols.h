@@ -335,6 +335,38 @@ struct CannSyms {
                                                   aclOpExecutor *executor,
                                                   aclrtStream stream);
 
+    // ---- aclnnGroupedMatmulV3 (Phase GMM-wire, CANN 8.3+) ------------------
+    // Fused multi-group matmul. Canonical contract: y[i] = x[i] @ weight[i].
+    // For our QKV projection use we pass three "groups" sharing the same
+    // activation (three distinct aclTensor views of the same device buffer)
+    // and three distinct weights w_q / w_k / w_v — then the op emits one
+    // kernel per group with the group scheduling decided on-device.
+    //
+    // Probe finding (docs/qkv_grouped_probe_verdict.md, GREEN 2026-04):
+    //   - A16W8 accepted when groupType=-1 + groupListOptional=nullptr.
+    //   - antiquantOffset is Optional in the header but
+    //     CheckGroupedMatmulAntiQuant runtime check requires non-null. Pass a
+    //     shared zero-filled F16 offset tensor list (one per group).
+    //   - ~94-100 μs median vs ~98-102 μs for 3 × aclnnWeightQuantBatchMatmulV3.
+    //   - Numerical drift 1.53e-5 .. 6.13e-5 abs (~1-2 F16 ulp, ~1.7e-3 rel)
+    //     vs 3× WQBMMv3 reference — NOT bit-exact; non-canonical fusion.
+    //
+    // Capability gated via has_grouped_matmul_v3().
+    aclnnStatus (*aclnnGroupedMatmulV3GetWorkspaceSize)(
+        const aclTensorList *x, const aclTensorList *weight,
+        const aclTensorList *biasOptional,
+        const aclTensorList *scaleOptional,
+        const aclTensorList *offsetOptional,
+        const aclTensorList *antiquantScaleOptional,
+        const aclTensorList *antiquantOffsetOptional,
+        const aclTensor *groupListOptional,
+        int64_t splitItem, int64_t groupType,
+        const aclTensorList *y, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnGroupedMatmulV3)(void *workspace, uint64_t workspaceSize,
+                                         aclOpExecutor *executor,
+                                         aclrtStream stream);
+
     // ---- aclnnFFNV3 (Phase B, CANN 8.5+) -----------------------------------
     // Fused FFN: y = activation(x @ W1 + b1) @ W2 + b2.
     // For our TTS CP path we dispatch it as the no-expert SwiGLU variant:
@@ -446,6 +478,16 @@ struct CannSyms {
                 aclnnWeightQuantBatchMatmulV3                 != nullptr) ||
                (aclnnWeightQuantBatchMatmulV2GetWorkspaceSize != nullptr &&
                 aclnnWeightQuantBatchMatmulV2                 != nullptr);
+    }
+
+    // Capability flag for aclnnGroupedMatmulV3 (Phase GMM-wire, CANN 8.3+).
+    // True iff both the workspace-size entry point and the launch entry
+    // point resolved. Callers (CpCannEngine) gate the fused QKV path on
+    // (TALKER_CP_GMM_QKV=1 + w8_applied_ + has_grouped_matmul_v3()); absence
+    // falls back silently to the 3 × aclnnWeightQuantBatchMatmulV3 path.
+    bool has_grouped_matmul_v3() const {
+        return aclnnGroupedMatmulV3GetWorkspaceSize != nullptr &&
+               aclnnGroupedMatmulV3                 != nullptr;
     }
 
     // Capability flag for aclnnAddRmsNorm (W3b, CANN 8.5+). When present,

@@ -531,6 +531,26 @@ private:
     bool cp_rope_v2_enabled_ = false;
     bool cp_rope_v2_applied_ = false;
 
+    // ---- Phase GMM-wire: aclnnGroupedMatmulV3 fused Q/K/V (TALKER_CP_GMM_QKV)
+    // Probe verdict: docs/qkv_grouped_probe_verdict.md (GREEN 2026-04). When
+    // TALKER_CP_GMM_QKV=1 AND g_cann.has_grouped_matmul_v3() AND w8_applied_,
+    // the three per-layer QKV w8_matmul_ calls collapse into a single
+    // aclnnGroupedMatmulV3 dispatch with three groups sharing the same
+    // activation view. Numerical drift is 1-2 F16 ulp (~1.7e-3 rel) vs the
+    // 3-call reference — NOT bit-identical, which is why aclGraph capture
+    // and byte-identical parity gates are incompatible with this flag in
+    // this first landing (token-drift gate relaxed to max_drift <= 1).
+    //
+    // Shared zero F16 antiquantOffset buffer: the header marks the
+    // antiquantOffset arg Optional, but the runtime antiquant check
+    // (CheckGroupedMatmulAntiQuant) rejects null with errno 161002. We
+    // allocate a single zero-filled F16 buffer of length max(Nq, Nk, Nv)
+    // = q_dim_ once at init and wrap it in three views (one per group) at
+    // dispatch time. Trivial memory cost (~4 KiB) and reused forever.
+    bool cp_gmm_qkv_enabled_ = false;
+    bool cp_gmm_qkv_applied_ = false;
+    void *antiquant_zero_offset_dev_ = nullptr;  // F16 [q_dim_] zero buffer
+
     // ---- Internal helpers ----
     void alloc_dev(void **ptr, size_t bytes);
     void upload(void *dev, const float *host, size_t n_floats);
@@ -556,6 +576,25 @@ private:
     // TalkerCannEngine equivalent for the full shape contract.
     void w8_matmul_(const aclTensor *x, void *weight_dev, void *scale_dev,
                      int64_t out_n, int64_t in_k, const aclTensor *y);
+
+    // Phase GMM-wire: fused Q/K/V grouped matmul. Replaces the three
+    // sequential w8_matmul_ calls at the attention-sublayer entry with one
+    // aclnnGroupedMatmulV3 dispatch.
+    //
+    // Takes device pointers (not aclTensor handles) so the helper can build
+    // fresh tensor views internally — aclDestroyTensorList consumes its
+    // contents, so views cannot be reused across calls.
+    //
+    // Preconditions:
+    //   * cp_gmm_qkv_applied_ == true (caller's responsibility).
+    //   * x_dev is the F16 [1, cp_hidden] activation device buffer.
+    //   * q_out_dev / k_out_dev / v_out_dev are F16 destination buffers of
+    //     sizes q_dim_ / kv_dim_ / kv_dim_ respectively. They may alias
+    //     independent buffers (eager path: q_dev_/k_dev_/v_dev_) or a
+    //     v_cache slot (capturable path for V).
+    //   * il indexes into layer_w_.
+    void gmm_qkv_(void *x_dev, int64_t il,
+                   void *q_out_dev, void *k_out_dev, void *v_out_dev);
 
     // Phase B: at engine init under cp_ffn_v3_applied_, walk every layer_w_
     // slot and build its gate||up concatenated INT8 weight blob +

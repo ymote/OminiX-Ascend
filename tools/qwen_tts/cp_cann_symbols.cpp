@@ -224,6 +224,15 @@ bool load_once() {
     resolve_optional(h_op, "aclnnWeightQuantBatchMatmulV2",
                      g_cann.aclnnWeightQuantBatchMatmulV2);
 
+    // Optional: aclnnGroupedMatmulV3 (Phase GMM-wire, CANN 8.3+). Fused
+    // multi-group matmul; our use wires three Q/K/V groups sharing the same
+    // activation. Absence means the toolkit lacks the op and callers stay on
+    // 3 × aclnnWeightQuantBatchMatmulV3. Gated via has_grouped_matmul_v3().
+    resolve_optional(h_op, "aclnnGroupedMatmulV3GetWorkspaceSize",
+                     g_cann.aclnnGroupedMatmulV3GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnGroupedMatmulV3",
+                     g_cann.aclnnGroupedMatmulV3);
+
     // Optional: aclnnAddRmsNorm (W3b, CANN 8.5+). Lives in libopapi.so.
     // Absence means the toolkit predates CANN 8.5 and callers keep the
     // unfused Add + RmsNorm path. Gated via has_add_rms_norm().
