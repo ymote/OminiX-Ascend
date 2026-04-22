@@ -1,9 +1,9 @@
-# Qwen-Image-Edit-2512 Optimization on Ascend 910B4 (ac02)
+# Qwen-Image-Edit-2511 Optimization on Ascend 910B4 (ac02)
 
 ## 1. Status & mandate
 
 **Status**: NEW (drafted 2026-04-22, PM signed).
-**Target**: optimize Qwen-Image-Edit-2512 image-editing inference on Ascend NPU, starting with 910B4 (32 GB HBM constraint — Q4 quant mandatory) via `tools/ominix_diffusion/` as the starting surface.
+**Target**: optimize Qwen-Image-Edit-2511 image-editing inference on Ascend NPU, starting with 910B4 (32 GB HBM constraint — Q4 quant mandatory) via `tools/ominix_diffusion/` as the starting surface.
 
 **Goal** (subject to Q0-v2 calibration):
 - **A) First-landing arc**: current `ominix_diffusion` ggml-cann baseline → native `ImageDiffusionEngine` with aclGraph step-keyed capture + playbook transfer
@@ -14,7 +14,7 @@
 
 ## 2. Background
 
-Qwen-Image-Edit-2512 is Qwen team's image-editing model (Dec 2025 release). Architecture is DiT (Diffusion Transformer) or UNet-based diffusion with reference-image conditioning.
+Qwen-Image-Edit-2511 is Qwen team's image-editing model (Dec 2025 release). Architecture is DiT (Diffusion Transformer) or UNet-based diffusion with reference-image conditioning.
 
 **Sizing constraint (critical)**:
 
@@ -68,17 +68,31 @@ Qwen-Image-Edit-2512 is Qwen team's image-editing model (Dec 2025 release). Arch
 
 ## 5. Workstreams with gates
 
-### Q0-v2 — Discovery + baseline (in flight, 1-2 days)
+### Q0-v2 — Discovery + baseline — **DONE (YELLOW)**
 
-Per `docs/qie_q0v2_discovery.md` (pending). Answers:
-- ac02 variant confirmation (expected 910B4)
-- `ominix_diffusion` state on ac02
-- Qwen-Image-Edit-2512-4bit weight availability (HF vs internal)
-- Baseline run feasibility at Q4 quant; steps/sec number
+Per `docs/qie_q0v2_discovery.md` (verified-by Agent Q0-v2, 2026-04-22, ac02):
+- ✅ ac02 confirmed 910B4 / 32 GB HBM / CANN 8.3.RC1 idle
+- ✅ `ominix_diffusion` has full QIE support (`QwenImageEditPlusPipeline` + `-r/--ref-image`)
+- ✅ **Weights fit at Q4 — 18-20 GB used, 12 GB margin.** 32 GB HBM is NOT the blocker. Earlier "procure 910B2 for 64 GB" framing was wrong.
+- ❌ **All 3 baseline runs crashed** — 3 ggml-cann backend bugs block zero-image output:
+  1. `ggml_cann_mul_mat` (`aclnn_ops.cpp:2670`): no Q4_K/Q5_K/Q6_K support
+  2. `ggml_cann_get_rows` (`aclnn_ops.cpp:2272`): no Q4_0/Q4_1 support — text-encoder embedding abort
+  3. `ascendc/gather_v3`: Qwen2.5-VL vision-encoder crash on float-bit-pattern indices (edit-mode specific)
 
-**Gate**: GREEN / YELLOW / RED to dispatch Q1. RED = weights unavailable OR binary broken OR Q4 doesn't fit.
+**Verdict**: YELLOW. Contract **restructured** — must unblock backend before baseline makes sense.
 
-### Q1 — Native `ImageDiffusionEngine` bring-up (2-3 weeks, gated on Q0-v2 green)
+### Q1 — **ggml-cann backend unblock** (1-2 weeks, HARD GATE, replaces original Q1)
+
+Fix the 3 blockers above IN `ggml-cann` (llama.cpp Ascend backend). Upstream-worthy contribution once validated.
+
+- [ ] Q1.1 Add Q4_K / Q5_K / Q6_K dispatch in `ggml_cann_mul_mat` (K-quant variants are HF-common for Qwen-Image; without them Q4 is stuck on Q4_0 which has its own get_rows issue)
+- [ ] Q1.2 Add Q4_0 / Q4_1 dispatch in `ggml_cann_get_rows` — text-encoder embedding-table path MUST accept common quant formats
+- [ ] Q1.3 Debug `ascendc/gather_v3` crash on float-bit-pattern indices in Qwen2.5-VL vision-encoder. Likely indices-as-int32 vs indices-as-float confusion in the op's input handling.
+- [ ] Q1.4 Runtime smoke: canonical edit task ("convert cat to black and white") completes without crash on ac02 at Q4. First successful baseline run.
+
+**Gate**: baseline run produces a valid output image (any quality, any steps/sec — just "doesn't crash"). Fork commit pushed with the 3 bug fixes isolated as separate commits for upstream review.
+
+### Q2 — Native `ImageDiffusionEngine` bring-up (2-3 weeks, gated on Q1 green, previously Q1)
 
 Mirror TTS `CpCannEngine` / `TalkerCannEngine` patterns. Build DiT decoder forward pass dispatching aclnn directly, bypassing ggml-cann.
 

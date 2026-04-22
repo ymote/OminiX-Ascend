@@ -7,7 +7,7 @@
 CHANGELOG
 v3 polish (2026-04-21): sharpened baseline-noise honesty on Slide 9 (A.1 +0.3 and M3'new' +0.3 within ~1 fps run-to-run variance; final number is 31-32.2 fps band, not a crisp 32.2); folded Talker aclGraph scaffold probe (TALKER_CANN_GRAPH=1 → 30→18 fps, 40% regression from lazy-capture-on-first-touch) into Slide 5 failing-fast-as-feature list; reconciled projection-vs-reality meta-pattern (G0: +6-10 → +1.15; M3N: +1 → +0.3; ~3-10× optimism) as explicit Slide 9 meta-finding; Appendix B updated with A.1 / M3'new' / M1.B FFNV3 / CannFusion #26 rows marked as single source of truth for Q&A.
 v3.1 (2026-04-21): pie-project appendix + Slide 2/6/8/10 Pie-integration edits removed per PM directive; reverted to 5-layer stack and single hardware-scaling axis.
-v3.2 (2026-04-21): added Slide 7b (MLX vs Ascend as AI-coding targets — answers "why 9 MLX crates vs ~32 fps Ascend in same calendar window?" via DX-gap framing, not hardware-gap); added Appendix C (Qwen-Image-Edit-2512 forward-look — structurally-ported via tools/ominix_diffusion, not-yet-optimized, demonstrates playbook applies beyond autoregressive token gen to diffusion image/video); Appendix A artefact list adds tools/ominix_diffusion/ reference. Cross-references to Slide 3/9 stable; no existing numbering changed.
+v3.2 (2026-04-21): added Slide 7b (MLX vs Ascend as AI-coding targets — answers "why 9 MLX crates vs ~32 fps Ascend in same calendar window?" via DX-gap framing, not hardware-gap); added Appendix C (Qwen-Image-Edit-2511 forward-look — structurally-ported via tools/ominix_diffusion, not-yet-optimized, demonstrates playbook applies beyond autoregressive token gen to diffusion image/video); Appendix A artefact list adds tools/ominix_diffusion/ reference. Cross-references to Slide 3/9 stable; no existing numbering changed.
 v3.3 (2026-04-21): Slide 7b "what closes the gap" gains CannFusion-as-CUTLASS-analogue subsection (aspirational, v0.2.5 pre-release, unblocked when upstream ships A16W8 — we filed GitCode #26, maintainer decomposed into #27-30); added Slide 9.5 "10 orchestration modes" between Slide 9 and Slide 10 (probe-first, parallel dispatch, gate-stop, patch-file review, contract-per-track, kill-cleanly, scaffold-probe, projection discount, noise-band characterization, frame-count identity gate — each with a project-receipt citation). Slide 9 closing bullet cross-references Slide 9.5. Main slide numbering preserved (Slide 7b, 9.5 suffix pattern).
 v3.4 (2026-04-21): added Slide 5.5 architecture map with mermaid flowchart + optimization heat-map table; no renumbering
 v3.6 (2026-04-21): Slide 8 — added HCCL env-tuning cheatsheet to speaker notes (5 vars, +89% TG measured on 16 × 910 gen1 Qwen3-235B, with fullmesh-garbage + AICPU-gen1-crash correctness landmines) + one body bullet cross-referencing `docs/llm_mutil_npu_brief.md` §Q2 as single source of truth; no renumbering
@@ -424,9 +424,9 @@ Pattern: agent ceiling estimates are consistently 3-10× optimistic. Cause varie
 
 ---
 
-## Appendix C — Next Workload, Same Playbook: Qwen-Image-Edit-2512 on Ascend (Forward-Looking)
+## Appendix C — Next Workload, Same Playbook: Qwen-Image-Edit-2511 on Ascend (Forward-Looking)
 
-**Title**: "Next workload, same playbook: Qwen-Image-Edit-2512 on Ascend."
+**Title**: "Next workload, same playbook: Qwen-Image-Edit-2511 on Ascend."
 
 **Framing**: this is a **forward-looking design sketch**, not a shipped case study. No perf numbers, no contract, no gates yet. The point is to show the TTS-on-Ascend playbook applies to a *structurally different* workload class: a diffusion model with reference-image conditioning (image-in → image-out), not autoregressive token generation (audio-token-by-token).
 
