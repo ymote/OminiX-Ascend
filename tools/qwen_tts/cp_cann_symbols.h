@@ -303,6 +303,34 @@ struct CannSyms {
                                                   aclOpExecutor *executor,
                                                   aclrtStream stream);
 
+    // ---- aclnnFFNV3 (Phase B, CANN 8.5+) -----------------------------------
+    // Fused FFN: y = activation(x @ W1 + b1) @ W2 + b2.
+    // For our TTS CP path we dispatch it as the no-expert SwiGLU variant:
+    //   x:              F16 [1, cp_hidden]
+    //   weight1:        INT8 [cp_hidden, 2*inter]  (gate||up concatenated on N)
+    //   weight2:        INT8 [inter, cp_hidden]    (down_proj)
+    //   antiquantScale1: F16 [2*inter]             (per-channel, gate||up concat)
+    //   antiquantScale2: F16 [cp_hidden]           (per-channel, down_proj)
+    //   activation:     "swiglu"
+    //   y:              F16 [1, cp_hidden]
+    // This replaces the 5-op chain (gate-Mm + up-Mm + SiLU + mul + down-Mm)
+    // behind the TALKER_CP_FFN_V3=1 env gate. Capability flag: has_ffn_v3().
+    aclnnStatus (*aclnnFFNV3GetWorkspaceSize)(
+        const aclTensor *x, const aclTensor *weight1, const aclTensor *weight2,
+        const aclTensor *expertTokensOptional,
+        const aclTensor *bias1Optional, const aclTensor *bias2Optional,
+        const aclTensor *scaleOptional, const aclTensor *offsetOptional,
+        const aclTensor *deqScale1Optional, const aclTensor *deqScale2Optional,
+        const aclTensor *antiquantScale1Optional,
+        const aclTensor *antiquantScale2Optional,
+        const aclTensor *antiquantOffset1Optional,
+        const aclTensor *antiquantOffset2Optional,
+        const char *activation, int64_t innerPrecise, bool tokensIndexFlag,
+        const aclTensor *y, uint64_t *workspaceSize,
+        aclOpExecutor **executor);
+    aclnnStatus (*aclnnFFNV3)(void *workspace, uint64_t workspaceSize,
+                               aclOpExecutor *executor, aclrtStream stream);
+
     // ---- aclGraph (aclmdlRI*) — runtime graph capture/replay ---------------
     // Present on CANN 8.3+. The aclmdlRI / aclmdlRICaptureMode types come from
     // `acl/acl_rt.h` (pulled in transitively by `acl/acl.h` above). If the
@@ -406,6 +434,16 @@ struct CannSyms {
     bool has_inplace_add_rms_norm() const {
         return aclnnInplaceAddRmsNormGetWorkspaceSize != nullptr &&
                aclnnInplaceAddRmsNorm                 != nullptr;
+    }
+
+    // Capability flag for aclnnFFNV3 (Phase B, CANN 8.5+). When present +
+    // TALKER_CP_FFN_V3=1 + w8_applied_, the 5-op FFN chain (gate-Mm +
+    // up-Mm + SiLU + mul + down-Mm) collapses into a single aclnnFFNV3
+    // call with activation="swiglu". Absence means caller stays on the
+    // per-op W8 matmul path.
+    bool has_ffn_v3() const {
+        return aclnnFFNV3GetWorkspaceSize != nullptr &&
+               aclnnFFNV3                 != nullptr;
     }
 };
 

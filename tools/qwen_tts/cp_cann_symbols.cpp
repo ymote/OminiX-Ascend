@@ -241,6 +241,14 @@ bool load_once() {
     resolve_optional(h_op, "aclnnInplaceAddRmsNorm",
                      g_cann.aclnnInplaceAddRmsNorm);
 
+    // Optional: aclnnFFNV3 (Phase B, CANN 8.5+). Lives in libopapi.so.
+    // Fused SwiGLU FFN with per-channel antiquant dequant. Absence means
+    // callers stay on the 5-op W8 matmul chain. Gated via has_ffn_v3().
+    resolve_optional(h_op, "aclnnFFNV3GetWorkspaceSize",
+                     g_cann.aclnnFFNV3GetWorkspaceSize);
+    resolve_optional(h_op, "aclnnFFNV3",
+                     g_cann.aclnnFFNV3);
+
     if (!ok) {
         // Wipe partial state so is_ready() reports false.
         g_cann = {};
