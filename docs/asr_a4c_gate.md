@@ -125,10 +125,16 @@ close 0.190 → 0.142.
 mabaoguo / shenyi / zhoujielun produce non-zero CER in C (F16, unset)
 AND A (W8, A4b-equivalent) AND B (W8+GMM). Parity reference
 (`docs/asr_a1a_data/tier1_q8_cann_clean.json`) has CER=0 on all three.
-The drift is pre-existing and independent of A4c — the Config A
-W8-off baseline reproduces it too. Out of A4c scope; flag to PM for
-a separate investigation (likely decoder GGUF or CANN toolkit version
-skew on ac03 vs the environment that produced the parity reference).
+
+Root-caused 2026-04-22 in `docs/asr_regression_drift_investigation.md`:
+the A4c sweep harness `/tmp/run_a4c_native.py` dropped the
+`--mel_filters <whisper.npy>` flag that the A1a / A4 / A4b harnesses
+passed. Without it, `MelSpectrogram` falls back to its HTK-spaced
+default filterbank instead of the Slaney-spaced npy, producing
+slightly different mel features that flip greedy-argmax at one token
+on these three clips. No code, weight, or toolkit drift — harness
+regression only. Fix: add `--mel_filters` to the harness. Parity
+reference is valid; A4 / A4b's CER=0 claims are genuine.
 
 TTS regression cross-check (ac01, PM-verified post-landing):
 - `TALKER_W8_QUANT` unset + F16 Talker GGUF → wall-time delta must be 0
