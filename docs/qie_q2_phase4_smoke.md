@@ -544,3 +544,19 @@ Diagnose NaN origin:
 3. Try BF16 accumulator path for WQBMMv3 (if op supports it) and aclnnMm variants (MatmulV2 has dtype options)
 
 Phase 4.5 cat-edit BLOCKED on Phase 4.4b.
+
+### §4.4b NaN bisect — linear magnitude growth confirmed
+
+Bisect at N={1, 5, 10, 30, 60} with default F16-accum AND F32-accum both reveal same pattern. F32 matmul accumulator does NOT fix this — overflow is in the residual stream itself.
+
+| N | std | min/max | max vs F16 (65504) |
+|---|---|---|---|
+| 1 | 6.89 | −225/+90 | 0.3% |
+| 5 | 125.2 | −387/+6792 | 10% |
+| 10 | 237.7 | −489/+12912 | 20% |
+| 30 | 900.1 | −1251/+48512 | 74% |
+| 60 | NaN | NaN | overflow |
+
+Verdict: classical DiT precision issue — residual stream accumulates information layer-by-layer; F16 can't hold 60-layer depth. CPU reference runs F32 throughout; matches Phase 4.2 synthetic-weight GREEN where magnitudes happened to stay small.
+
+**Phase 4.4c fix**: promote residual stream (`img_hidden`, `txt_hidden`) to F32 on device. Keep per-block matmul inputs/outputs F16 for WQBMMv3 compatibility. Add F32→F16 Cast before matmul, F16→F32 Cast after residual add. Cost: +50 MiB HBM at production seq=4352 × H=3072; negligible vs 17.86 GiB peak.
