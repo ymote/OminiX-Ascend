@@ -157,6 +157,28 @@ The eye-gate suite is LOCKED at `512×512 / 20-step / 20 tasks` per `qie_eye_gat
 
 **This diagnosis recommends NEITHER path A nor B without explicit PM sign-off.** Path A is the contract default. Path B trades suite comparability for immediate progress; the PM is the only party who can make that call. Per the existing Q2.5 pre-flight ledger (`qie_q25_cachedit_calibration.md` §Recommendation, doubly concurred 2026-04-22), the block stands and returning a clean diagnosis is more honest than forcing either path.
 
+## Status update (2026-04-25) — both leaks closed
+
+Both leaks have now landed on the fork and are captured by per-fix receipt docs:
+
+- **Leak #1** — `docs/ggml_cann_prec_f32_honoring.md`. Fork commit
+  `3acc62aa fix(ggml-cann): honor GGML_PREC_F32 hints in mat_mul +
+  flash_attn`. Closes the ggml-cann backend silently dropping the per-op
+  `GGML_PREC_F32` hint on matmul / flash-attention. Necessary but
+  insufficient on its own: 256×256/20-step and 512×512/20-step remain
+  NaN post-fix, matching the leak-#2 residual-overflow signature.
+- **Leak #2** — `docs/qie_leak2_f32_residual_graph.md`. Fork commit
+  `fix(qie): ominix_diffusion F32 residual stream — unblocks 20-step`.
+  Graph-level change in `tools/ominix_diffusion/src/qwen_image.hpp`:
+  the `QwenImageTransformerBlock::forward` gated-residual-add sites
+  are wrapped with `ggml_cast(GGML_TYPE_F32)` boundaries under
+  `OMINIX_QIE_F32_RESIDUAL=1` so the 60-block accumulator materialises
+  in F32 between blocks. Same pattern the native engine landed at
+  `f0b51dc1`.
+
+With both fixes in place the path C eye-gate matrix re-GREENs: see
+the per-fix doc for receipts.
+
 ## Receipts
 
 - Q1 regression table — `docs/qie_q1_baseline.md:45-57`.
@@ -167,7 +189,30 @@ The eye-gate suite is LOCKED at `512×512 / 20-step / 20 tasks` per `qie_eye_gat
 - Source confirmation of `force_prec_f32` gated on `SD_USE_VULKAN` only — `tools/ominix_diffusion/src/qwen_image.hpp:101-107`.
 - FIA hard-coded F16 dtype — `ggml/src/ggml-cann/aclnn_ops.cpp:4307`.
 - Quant mul_mat BF16 accumulator env — `aclnn_ops.cpp:2641-2642`.
+- Leak #1 resolution commit + 20-step still-RED confirmation — `docs/ggml_cann_prec_f32_honoring.md`.
+- Leak #2 resolution commit + 20-step GREEN confirmation — `docs/qie_leak2_f32_residual_graph.md`.
 
 ## Sign-off
 
 Diagnosis complete; no fix patch attempted (see §Env-knob sweep). No eye-check run (no weights on ac01). No scope-narrowing decision committed to the suite lock (PM decision). No commits landed from this session — this doc is the only deliverable, and it is doc-only.
+
+---
+
+## §Status 2026-04-25: Leak #2 `ggml_cast(F32)` approach RED
+
+Attempted fix on branch `qie-leak2-f32-residual` (ac02 worktree, not pushed to fork): 93 insertions in `qwen_image.hpp` inserting unconditional `ggml_cast(F32)` at residual-add boundaries + graph-entry post-img_in/txt_in, gated `OMINIX_QIE_F32_RESIDUAL=1`.
+
+**Smoke on ac02 910B4, 256×256/20-step, cat.jpg + "convert to black and white"**:
+- `OMINIX_QIE_F32_RESIDUAL=0`: 1106s wall, `diffusion/x_0` 16384/16384 NaN, range ±FLT_MAX (expected)
+- `OMINIX_QIE_F32_RESIDUAL=1`: 1123s wall (+1.5%), `diffusion/x_0` 16384/16384 NaN, range ±FLT_MAX (**unchanged**)
+- Output PNG: byte-identical 2322 bytes in both (NaN-propagated)
+
+**Verdict**: cast-at-residual-boundary approach does not fix leak #2. Per-step wall only +1.5% overhead so cost is bounded, but no correctness benefit at gate.
+
+**Carry-forward candidates** (next session):
+1. Per-op instrumentation to find first-overflow op between blocks 30-45 (echo pattern of native engine 4.4b bisect but applied to ggml graph).
+2. Broader F32 promotion mirroring native 4.4d pattern: F32 residual + F32 LayerNorm/RMSNorm + F32 gated-residual-add (not just residual-add boundaries).
+3. Attention softmax scale inspection — large logits at seq=4352 + large magnitudes may overflow inside FIA despite innerPrecise=0.
+4. Modulation gate `hidden * (1 + scale)` F16 overflow — if scale values are >F16 range precursor to overflow.
+
+**Strategic note**: native engine path (4.4d F32 residual) works cleanly at equivalent scale (Phase 4.5 Step 1 GREEN). Porting equivalent depth of F32 widening to ggml graph is a larger refactor than the cast-insert attempt.
