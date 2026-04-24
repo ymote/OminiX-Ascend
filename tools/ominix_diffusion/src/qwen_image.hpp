@@ -1,7 +1,11 @@
 #ifndef __QWEN_IMAGE_HPP__
 #define __QWEN_IMAGE_HPP__
 
+#include <cstdlib>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "common_block.hpp"
 #include "flux.hpp"
@@ -480,6 +484,30 @@ namespace Qwen {
         std::vector<float> modulate_index_vec;
         SDVersion version;
 
+        // ----------------------------------------------------------------
+        // RoPE pe-vector cache (OMINIX_QIE_ROPE_PRECOMPUTE).
+        // `gen_qwen_image_pe` depends only on positional metadata
+        // (h, w, bs, context_len, ref-latent shapes, circular flags,
+        // theta, axes_dim, patch_size). None of these vary across
+        // denoise steps or CFG branches of a single request, so we
+        // lift the compute out of the per-step build_graph hot path
+        // and memoize keyed on the shape tuple. Cache invalidates
+        // automatically on shape/flag change (different request).
+        // See docs/qie_rope_precompute_lift.md for receipts.
+        // MLX-measured analogous refactor: +10-25% per step.
+        // ----------------------------------------------------------------
+        bool pe_cache_valid_                         = false;
+        int pe_cache_h_                              = 0;
+        int pe_cache_w_                              = 0;
+        int pe_cache_bs_                             = 0;
+        int pe_cache_context_len_                    = 0;
+        std::vector<std::pair<int64_t, int64_t>> pe_cache_ref_shapes_;
+        bool pe_cache_increase_ref_index_            = false;
+        bool pe_cache_circular_x_                    = false;
+        bool pe_cache_circular_y_                    = false;
+        uint64_t pe_cache_miss_count_                = 0;
+        uint64_t pe_cache_hit_count_                 = 0;
+
         QwenImageRunner(ggml_backend_t backend,
                         bool offload_params_to_cpu,
                         const String2TensorStorage& tensor_storage_map = {},
@@ -541,17 +569,85 @@ namespace Qwen {
                 ref_latents[i] = to_backend(ref_latents[i]);
             }
 
-            pe_vec      = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
-                                                  static_cast<int>(x->ne[0]),
-                                                  qwen_image_params.patch_size,
-                                                  static_cast<int>(x->ne[3]),
-                                                  static_cast<int>(context->ne[1]),
-                                                  ref_latents,
-                                                  increase_ref_index,
-                                                  qwen_image_params.theta,
-                                                  circular_y_enabled,
-                                                  circular_x_enabled,
-                                                  qwen_image_params.axes_dim);
+            // RoPE pe-vector: either re-compute every step (legacy path,
+            // default) or read from shape-keyed cache (Q2 must-have
+            // structural refactor). Gated by OMINIX_QIE_ROPE_PRECOMPUTE=1
+            // so flag-unset builds remain byte-identical to pre-patch.
+            const char* qie_rope_precompute_env   = std::getenv("OMINIX_QIE_ROPE_PRECOMPUTE");
+            const bool qie_rope_precompute_on    = qie_rope_precompute_env != nullptr &&
+                                                   std::string(qie_rope_precompute_env) == "1";
+
+            if (qie_rope_precompute_on) {
+                const int cur_h           = static_cast<int>(x->ne[1]);
+                const int cur_w           = static_cast<int>(x->ne[0]);
+                const int cur_bs          = static_cast<int>(x->ne[3]);
+                const int cur_context_len = static_cast<int>(context->ne[1]);
+                std::vector<std::pair<int64_t, int64_t>> cur_ref_shapes;
+                cur_ref_shapes.reserve(ref_latents.size());
+                for (ggml_tensor* ref : ref_latents) {
+                    cur_ref_shapes.emplace_back(ref ? ref->ne[1] : 0,
+                                                ref ? ref->ne[0] : 0);
+                }
+
+                const bool shape_match = pe_cache_valid_ &&
+                                         pe_cache_h_ == cur_h &&
+                                         pe_cache_w_ == cur_w &&
+                                         pe_cache_bs_ == cur_bs &&
+                                         pe_cache_context_len_ == cur_context_len &&
+                                         pe_cache_ref_shapes_ == cur_ref_shapes &&
+                                         pe_cache_increase_ref_index_ == increase_ref_index &&
+                                         pe_cache_circular_x_ == circular_x_enabled &&
+                                         pe_cache_circular_y_ == circular_y_enabled;
+
+                if (!shape_match) {
+                    pe_vec = Rope::gen_qwen_image_pe(cur_h,
+                                                     cur_w,
+                                                     qwen_image_params.patch_size,
+                                                     cur_bs,
+                                                     cur_context_len,
+                                                     ref_latents,
+                                                     increase_ref_index,
+                                                     qwen_image_params.theta,
+                                                     circular_y_enabled,
+                                                     circular_x_enabled,
+                                                     qwen_image_params.axes_dim);
+                    pe_cache_valid_              = true;
+                    pe_cache_h_                  = cur_h;
+                    pe_cache_w_                  = cur_w;
+                    pe_cache_bs_                 = cur_bs;
+                    pe_cache_context_len_        = cur_context_len;
+                    pe_cache_ref_shapes_         = std::move(cur_ref_shapes);
+                    pe_cache_increase_ref_index_ = increase_ref_index;
+                    pe_cache_circular_x_         = circular_x_enabled;
+                    pe_cache_circular_y_         = circular_y_enabled;
+                    ++pe_cache_miss_count_;
+                    LOG_INFO("qwen_image pe_cache MISS (refill) #%llu: h=%d w=%d ctx=%d nrefs=%zu -> pe_vec=%zu floats",
+                             (unsigned long long)pe_cache_miss_count_,
+                             cur_h, cur_w, cur_context_len,
+                             pe_cache_ref_shapes_.size(), pe_vec.size());
+                } else {
+                    ++pe_cache_hit_count_;
+                    if (pe_cache_hit_count_ == 1 ||
+                        pe_cache_hit_count_ % 10 == 0) {
+                        LOG_INFO("qwen_image pe_cache HIT count=%llu (miss=%llu)",
+                                 (unsigned long long)pe_cache_hit_count_,
+                                 (unsigned long long)pe_cache_miss_count_);
+                    }
+                }
+                // else: pe_vec retained from prior build_graph call (cache hit)
+            } else {
+                pe_vec = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
+                                                 static_cast<int>(x->ne[0]),
+                                                 qwen_image_params.patch_size,
+                                                 static_cast<int>(x->ne[3]),
+                                                 static_cast<int>(context->ne[1]),
+                                                 ref_latents,
+                                                 increase_ref_index,
+                                                 qwen_image_params.theta,
+                                                 circular_y_enabled,
+                                                 circular_x_enabled,
+                                                 qwen_image_params.axes_dim);
+            }
             int pos_len = static_cast<int>(pe_vec.size() / qwen_image_params.axes_dim_sum / 2);
             // LOG_DEBUG("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, qwen_image_params.axes_dim_sum / 2, pos_len);
