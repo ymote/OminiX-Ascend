@@ -100,6 +100,192 @@ void suppress_pp(int step, int steps, float time, void* data) {
     return;
 }
 
+// =============================================================================
+// Q4 CFG batching helpers (OMINIX_CFG_BATCHED=1).
+// Stacks cond + uncond along ne[3]=2 for a single batched compute() per step.
+// All helpers operate on work_ctx tensors (CPU-resident, raw ->data writes).
+// Default code path (env unset) never calls these; they contribute zero bytes
+// to the unset-env execution.
+// =============================================================================
+
+// Duplicate a 4-D tensor along ne[3] by memcpy, yielding a new work_ctx tensor
+// of shape [ne0, ne1, ne2, 2] with batch-0 = batch-1 = src.
+__STATIC_INLINE__ struct ggml_tensor* cfg_dup_on_ne3(struct ggml_context* work_ctx,
+                                                     struct ggml_tensor* src) {
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(src->ne[3] == 1);
+    struct ggml_tensor* dst = ggml_new_tensor_4d(work_ctx, src->type,
+                                                 src->ne[0], src->ne[1], src->ne[2], 2);
+    size_t per_item = ggml_nbytes(src);
+    memcpy((char*)dst->data + 0 * per_item, src->data, per_item);
+    memcpy((char*)dst->data + 1 * per_item, src->data, per_item);
+    return dst;
+}
+
+// Stack two 3-D tensors (context-like: [D, S, 1]) of equal dtype along ne[2]=2
+// with right-padding of the shorter tensor's S-axis to max(S_a, S_b) using
+// zero-fill (valid under mask). Returns a new work_ctx tensor of shape
+// [D, Smax, N=2, 1]. Batch axis is ne[2] to match the DiT's img-side layout
+// (pad_and_patchify emits [hidden, n_tokens, N, 1]) so that reshape_4d +
+// concat on the head axis in QwenImageAttention::forward sees consistent N
+// position across txt and img.
+__STATIC_INLINE__ struct ggml_tensor* cfg_stack_context_padded(struct ggml_context* work_ctx,
+                                                               struct ggml_tensor* ctx_cond,
+                                                               struct ggml_tensor* ctx_uncond,
+                                                               int64_t& out_s_cond,
+                                                               int64_t& out_s_uncond,
+                                                               int64_t& out_s_max) {
+    GGML_ASSERT(ctx_cond != nullptr && ctx_uncond != nullptr);
+    GGML_ASSERT(ctx_cond->type == ctx_uncond->type);
+    GGML_ASSERT(ctx_cond->ne[0] == ctx_uncond->ne[0]);
+    GGML_ASSERT(ctx_cond->ne[2] == 1 && ctx_uncond->ne[2] == 1);
+    GGML_ASSERT(ctx_cond->ne[3] == 1 && ctx_uncond->ne[3] == 1);
+    const int64_t D    = ctx_cond->ne[0];
+    const int64_t Sc   = ctx_cond->ne[1];
+    const int64_t Su   = ctx_uncond->ne[1];
+    const int64_t Smax = std::max(Sc, Su);
+    out_s_cond   = Sc;
+    out_s_uncond = Su;
+    out_s_max    = Smax;
+
+    // Layout: [D, Smax, 2, 1] — N in ne[2] to match img-side pad_and_patchify output.
+    struct ggml_tensor* dst = ggml_new_tensor_4d(work_ctx, ctx_cond->type, D, Smax, 2, 1);
+    std::memset(dst->data, 0, ggml_nbytes(dst));
+
+    const size_t elem_sz = ggml_type_size(ctx_cond->type);
+    // Row stride of dst: Smax rows of D elements each. Row = ne[0] * elem_sz.
+    const size_t row_bytes = D * elem_sz;
+    // Contiguous layout: batch-0 occupies [0, Smax*D*esz), batch-1 occupies
+    // [Smax*D*esz, 2*Smax*D*esz). Within each batch, rows are dense.
+    memcpy((char*)dst->data + 0 * Smax * row_bytes,
+           ctx_cond->data,
+           Sc * row_bytes);
+    memcpy((char*)dst->data + 1 * Smax * row_bytes,
+           ctx_uncond->data,
+           Su * row_bytes);
+    return dst;
+}
+
+// Duplicate a 1-D tensor (timesteps-like: [T]) along ne[0] = 2. The resulting
+// tensor is 1-D with 2 elements, both equal to src[0]. Used for timesteps in
+// Q4 CFG batching where cond and uncond share the same timestep.
+__STATIC_INLINE__ struct ggml_tensor* cfg_dup_timesteps(struct ggml_context* work_ctx,
+                                                        struct ggml_tensor* src) {
+    GGML_ASSERT(src != nullptr);
+    // timesteps is expected to be 1-D with 1 element under CFG-batched (single step).
+    GGML_ASSERT(src->ne[0] == 1 && src->ne[1] == 1 && src->ne[2] == 1 && src->ne[3] == 1);
+    struct ggml_tensor* dst = ggml_new_tensor_1d(work_ctx, src->type, 2);
+    const size_t elem_sz = ggml_type_size(src->type);
+    memcpy((char*)dst->data + 0 * elem_sz, src->data, elem_sz);
+    memcpy((char*)dst->data + 1 * elem_sz, src->data, elem_sz);
+    return dst;
+}
+
+// Build an additive attention mask of shape [L_total, L_total, n_head*N, 1]
+// (F32) for the Q4 batched attention. L_total = S_max + n_img_tokens +
+// n_ref_tokens. The mask has 0 (keep) everywhere except the KEY columns that
+// correspond to padded-text slots for that batch item, which are set to
+// -INFINITY so softmax drives them to zero. Returns nullptr when S_cond ==
+// S_uncond (no padding → no mask needed, byte-identical math to unbatched).
+//
+// Shape rationale: ggml's mul_mat path flattens q/k/v as [d_head, L_q,
+// n_head*N, 1] with batch-outer / head-inner layout (see apply_rope +
+// ggml_ext_attention_ext). ggml broadcasts the mask via (iq2 % mask->ne[2]),
+// so to cleanly assign a per-batch mask we must have mask->ne[2] == n_head*N
+// with the pattern {batch0 mask × n_head, batch1 mask × n_head}. We duplicate
+// each batch's mask n_head times on host since the ggml CPU add-broadcast
+// cannot express batch-outer / head-inner broadcast from a more compact
+// representation.
+//
+// Memory: 48 × L_total² × 4 bytes. At 256×256 QIE-edit (~520 tokens) = 48 MiB
+// — trivial. At 1024×1024 (~8200 tokens) ≈ 12.6 GiB — too large; callers
+// should fall back to sequential when resolution pushes the mask budget (see
+// CFG_BATCHED_MAX_MASK_BYTES guard in the dispatch site).
+__STATIC_INLINE__ struct ggml_tensor* cfg_build_attention_mask(struct ggml_context* work_ctx,
+                                                               int64_t s_cond,
+                                                               int64_t s_uncond,
+                                                               int64_t s_max,
+                                                               int64_t n_non_text_tokens,
+                                                               int64_t n_head) {
+    if (s_cond == s_uncond) {
+        return nullptr;
+    }
+    const int64_t L_total = s_max + n_non_text_tokens;
+    const int64_t N       = 2;
+    // Mask shape: [L_k, L_q, n_head*N, 1].
+    struct ggml_tensor* mask = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32,
+                                                  L_total, L_total, n_head * N, 1);
+    float* mdata               = (float*)mask->data;
+    const int64_t stride_head  = L_total * L_total;
+    const int64_t stride_batch = n_head * stride_head;
+
+    // Build a single-batch mask template once, then memcpy-tile it n_head
+    // times per batch. Template: all zeros except columns [s_valid, s_max) =
+    // -INFINITY.
+    auto fill_batch = [&](int64_t batch_idx, int64_t s_valid) {
+        // First head slot for this batch: compute once.
+        float* head0 = mdata + batch_idx * stride_batch;
+        for (int64_t q = 0; q < L_total; ++q) {
+            float* row = head0 + q * L_total;
+            for (int64_t k = 0; k < L_total; ++k) {
+                row[k] = 0.0f;
+            }
+            for (int64_t k = s_valid; k < s_max; ++k) {
+                row[k] = -INFINITY;
+            }
+        }
+        // Tile head0 across remaining heads in this batch.
+        for (int64_t h = 1; h < n_head; ++h) {
+            memcpy(head0 + h * stride_head, head0, stride_head * sizeof(float));
+        }
+    };
+    fill_batch(0, s_cond);
+    fill_batch(1, s_uncond);
+    return mask;
+}
+
+// HBM budget guard for the mask: fall back to sequential when the mask alone
+// would exceed this many bytes. Keeps us within the +2 GiB activation budget
+// called out in docs/qie_q4_cfg_batching.md §6 even at 1024×1024.
+static constexpr int64_t CFG_BATCHED_MAX_MASK_BYTES = 256LL * 1024LL * 1024LL;  // 256 MiB
+
+// Split a batched output tensor of shape [ne0, ne1, ne2, 2] into two scalars.
+// Copies into pre-allocated out_cond (batch 0) and out_uncond (batch 1), which
+// must already have compatible shape [ne0, ne1, ne2, 1] and matching dtype.
+__STATIC_INLINE__ void cfg_split_batch_on_ne3(struct ggml_tensor* src,
+                                              struct ggml_tensor* out_cond,
+                                              struct ggml_tensor* out_uncond) {
+    GGML_ASSERT(src != nullptr && out_cond != nullptr && out_uncond != nullptr);
+    GGML_ASSERT(src->ne[3] == 2);
+    GGML_ASSERT(out_cond->ne[3] == 1 && out_uncond->ne[3] == 1);
+    GGML_ASSERT(src->type == out_cond->type && src->type == out_uncond->type);
+    const size_t per_item = ggml_nbytes(out_cond);
+    GGML_ASSERT(per_item * 2 == ggml_nbytes(src));
+    memcpy(out_cond->data,   (const char*)src->data + 0 * per_item, per_item);
+    memcpy(out_uncond->data, (const char*)src->data + 1 * per_item, per_item);
+}
+
+// Count image + ref tokens inside the DiT for mask construction. Mirrors the
+// token accounting in qwen_image.hpp::QwenImageModel::forward (ceil-div after
+// patchify). For QIE patch_size == 2 with canonical latent resolutions (H, W
+// divisible by 2 × vae-scale-factor), ceil_div and round-half-up agree; we
+// use ceil_div for correctness across any conceivable non-canonical resize.
+__STATIC_INLINE__ int64_t cfg_count_non_text_tokens_qwen_image(struct ggml_tensor* noised_input,
+                                                               const std::vector<ggml_tensor*>& ref_latents,
+                                                               int patch_size) {
+    auto count = [&](int64_t H, int64_t W) -> int64_t {
+        int64_t h_len = (H + patch_size - 1) / patch_size;
+        int64_t w_len = (W + patch_size - 1) / patch_size;
+        return h_len * w_len;
+    };
+    int64_t total = count(noised_input->ne[1], noised_input->ne[0]);
+    for (ggml_tensor* ref : ref_latents) {
+        if (ref == nullptr) continue;
+        total += count(ref->ne[1], ref->ne[0]);
+    }
+    return total;
+}
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
@@ -2129,84 +2315,154 @@ public:
             // When set to 1, cond + uncond are stacked on ne[3]=2 and dispatched in a single
             // diffusion-model compute, halving graph-build + mul-mat dispatch overhead per step.
             // Eligibility: QIE-only (VERSION_QWEN_IMAGE), has_unconditioned && !has_img_cond
-            // && !has_skiplayer && no controlnet. Step 2 wires the actual batched path; Step 1
-            // scaffold emits a log on first step and falls through to sequential.
+            // && !has_skiplayer && no controlnet && no cache && not id_cond merge step.
             const char* cfg_batched_env        = getenv("OMINIX_CFG_BATCHED");
             const bool cfg_batched_requested   = cfg_batched_env != nullptr && cfg_batched_env[0] == '1';
+            const bool cache_branches_asym     = easycache_enabled || ucache_enabled || cachedit_enabled;
+            const bool on_merge_step           = !(start_merge_step == -1 || step <= start_merge_step);
             const bool cfg_batched_eligible    = cfg_batched_requested
                                                 && has_unconditioned
                                                 && !has_img_cond
                                                 && !has_skiplayer
                                                 && (control_hint == nullptr || control_net == nullptr)
-                                                && version == VERSION_QWEN_IMAGE;
+                                                && version == VERSION_QWEN_IMAGE
+                                                && !cache_branches_asym
+                                                && !on_merge_step;
             static bool cfg_batched_logged_once = false;
             if (cfg_batched_requested && !cfg_batched_logged_once) {
                 cfg_batched_logged_once = true;
                 if (cfg_batched_eligible) {
-                    LOG_INFO("OMINIX_CFG_BATCHED=1: CFG batching eligible (QIE + CFG on, no SLG/img_cond/ctrlnet). "
-                             "Step-1 scaffold active — sequential path still in use until Step-2 tensor plumbing lands.");
+                    LOG_INFO("OMINIX_CFG_BATCHED=1: CFG batching ACTIVE — cond+uncond stacked on ne[3]=2, one compute() per step.");
                 } else {
                     LOG_WARN("OMINIX_CFG_BATCHED=1 requested but NOT eligible this run "
-                             "(need: VERSION_QWEN_IMAGE + has_unconditioned + !has_img_cond + !has_skiplayer + no controlnet). "
+                             "(need: VERSION_QWEN_IMAGE + has_unconditioned + !has_img_cond + !has_skiplayer + no controlnet + no cache + not in id_cond merge). "
                              "Falling back to sequential cond/uncond.");
                 }
             }
-            (void)cfg_batched_eligible;  // reserved for Step 2
-
-            const SDCondition* active_condition = nullptr;
-            struct ggml_tensor** active_output  = &out_cond;
-            if (start_merge_step == -1 || step <= start_merge_step) {
-                // cond
-                diffusion_params.context  = cond.c_crossattn;
-                diffusion_params.c_concat = cond.c_concat;
-                diffusion_params.y        = cond.c_vector;
-                active_condition          = &cond;
-            } else {
-                diffusion_params.context  = id_cond.c_crossattn;
-                diffusion_params.c_concat = cond.c_concat;
-                diffusion_params.y        = id_cond.c_vector;
-                active_condition          = &id_cond;
-            }
-
-            bool skip_model = cache_before_condition(active_condition, *active_output);
-            if (!skip_model) {
-                if (!work_diffusion_model->compute(n_threads,
-                                                   diffusion_params,
-                                                   active_output)) {
-                    LOG_ERROR("diffusion model compute failed");
-                    return nullptr;
-                }
-                cache_after_condition(active_condition, *active_output);
-            }
-
-            bool current_step_skipped = cache_step_is_skipped();
 
             float* negative_data = nullptr;
-            if (has_unconditioned) {
-                // uncond
-                if (!current_step_skipped && control_hint != nullptr && control_net != nullptr) {
-                    if (control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector)) {
-                        controls = control_net->controls;
-                    } else {
-                        LOG_ERROR("controlnet compute failed");
+            bool took_batched_path = false;
+            if (cfg_batched_eligible) {
+                // -------- Batched path --------
+                // Stack cond + uncond context with right-padding on S-axis, build additive
+                // attention mask when S_cond != S_uncond, duplicate x / timesteps / refs
+                // across ne[3]=2, dispatch one compute(), then split output into cond/uncond.
+                int64_t s_cond   = 0;
+                int64_t s_uncond = 0;
+                int64_t s_max    = 0;
+                struct ggml_tensor* ctx_batched =
+                    cfg_stack_context_padded(work_ctx, cond.c_crossattn, uncond.c_crossattn,
+                                             s_cond, s_uncond, s_max);
+
+                int64_t non_text_tokens = cfg_count_non_text_tokens_qwen_image(noised_input, ref_latents, /*patch_size=*/2);
+                // Qwen-Image has 24 attention heads (see QwenImageParams::num_attention_heads).
+                constexpr int64_t kQwenImageNumHeads = 24;
+                struct ggml_tensor* attn_mask =
+                    cfg_build_attention_mask(work_ctx, s_cond, s_uncond, s_max, non_text_tokens, kQwenImageNumHeads);
+                // Budget guard: at high resolution the 48-slot mask footprint dominates. Fall
+                // back to sequential if the mask would blow past CFG_BATCHED_MAX_MASK_BYTES.
+                const bool mask_over_budget =
+                    attn_mask != nullptr &&
+                    ggml_nbytes(attn_mask) > CFG_BATCHED_MAX_MASK_BYTES;
+                if (mask_over_budget) {
+                    static bool mask_budget_logged_once = false;
+                    if (!mask_budget_logged_once) {
+                        mask_budget_logged_once = true;
+                        LOG_WARN("OMINIX_CFG_BATCHED=1: mask footprint %.1f MiB > %.1f MiB budget — falling back to sequential this run.",
+                                 (double)ggml_nbytes(attn_mask) / (1024.0 * 1024.0),
+                                 (double)CFG_BATCHED_MAX_MASK_BYTES / (1024.0 * 1024.0));
                     }
+                } else {
+                    struct ggml_tensor* x_batched = cfg_dup_on_ne3(work_ctx, noised_input);
+                    struct ggml_tensor* t_batched = cfg_dup_timesteps(work_ctx, timesteps);
+                    std::vector<ggml_tensor*> refs_batched;
+                    refs_batched.reserve(ref_latents.size());
+                    for (ggml_tensor* ref : ref_latents) {
+                        refs_batched.push_back(cfg_dup_on_ne3(work_ctx, ref));
+                    }
+
+                    // Allocate batched output. out_cond already exists (shape-of-x, ne[3]=1);
+                    // we allocate a shape-of-x, ne[3]=2 scratch that we split back afterwards.
+                    struct ggml_tensor* out_batched = ggml_new_tensor_4d(work_ctx, out_cond->type,
+                                                                        out_cond->ne[0], out_cond->ne[1],
+                                                                        out_cond->ne[2], 2);
+
+                    DiffusionParams dp             = diffusion_params;
+                    dp.x                           = x_batched;
+                    dp.timesteps                   = t_batched;
+                    dp.context                     = ctx_batched;
+                    dp.ref_latents                 = refs_batched;
+                    dp.c_concat                    = cond.c_concat;   // null for QIE
+                    dp.y                           = cond.c_vector;   // null for QIE
+                    dp.attention_mask              = attn_mask;
+
+                    if (!work_diffusion_model->compute(n_threads, dp, &out_batched)) {
+                        LOG_ERROR("Q4 batched diffusion model compute failed");
+                        return nullptr;
+                    }
+                    cfg_split_batch_on_ne3(out_batched, out_cond, out_uncond);
+                    negative_data     = (float*)out_uncond->data;
+                    took_batched_path = true;
+                    // No cache interaction: cfg_batched_eligible requires cache_branches_asym == false.
                 }
-                current_step_skipped      = cache_step_is_skipped();
-                diffusion_params.controls = controls;
-                diffusion_params.context  = uncond.c_crossattn;
-                diffusion_params.c_concat = uncond.c_concat;
-                diffusion_params.y        = uncond.c_vector;
-                bool skip_uncond          = cache_before_condition(&uncond, out_uncond);
-                if (!skip_uncond) {
+            }
+
+            if (!took_batched_path) {
+                // -------- Sequential path (byte-identical to pre-Q4 HEAD) --------
+                const SDCondition* active_condition = nullptr;
+                struct ggml_tensor** active_output  = &out_cond;
+                if (start_merge_step == -1 || step <= start_merge_step) {
+                    // cond
+                    diffusion_params.context  = cond.c_crossattn;
+                    diffusion_params.c_concat = cond.c_concat;
+                    diffusion_params.y        = cond.c_vector;
+                    active_condition          = &cond;
+                } else {
+                    diffusion_params.context  = id_cond.c_crossattn;
+                    diffusion_params.c_concat = cond.c_concat;
+                    diffusion_params.y        = id_cond.c_vector;
+                    active_condition          = &id_cond;
+                }
+
+                bool skip_model = cache_before_condition(active_condition, *active_output);
+                if (!skip_model) {
                     if (!work_diffusion_model->compute(n_threads,
                                                        diffusion_params,
-                                                       &out_uncond)) {
+                                                       active_output)) {
                         LOG_ERROR("diffusion model compute failed");
                         return nullptr;
                     }
-                    cache_after_condition(&uncond, out_uncond);
+                    cache_after_condition(active_condition, *active_output);
                 }
-                negative_data = (float*)out_uncond->data;
+
+                bool current_step_skipped = cache_step_is_skipped();
+
+                if (has_unconditioned) {
+                    // uncond
+                    if (!current_step_skipped && control_hint != nullptr && control_net != nullptr) {
+                        if (control_net->compute(n_threads, noised_input, control_hint, timesteps, uncond.c_crossattn, uncond.c_vector)) {
+                            controls = control_net->controls;
+                        } else {
+                            LOG_ERROR("controlnet compute failed");
+                        }
+                    }
+                    current_step_skipped      = cache_step_is_skipped();
+                    diffusion_params.controls = controls;
+                    diffusion_params.context  = uncond.c_crossattn;
+                    diffusion_params.c_concat = uncond.c_concat;
+                    diffusion_params.y        = uncond.c_vector;
+                    bool skip_uncond          = cache_before_condition(&uncond, out_uncond);
+                    if (!skip_uncond) {
+                        if (!work_diffusion_model->compute(n_threads,
+                                                           diffusion_params,
+                                                           &out_uncond)) {
+                            LOG_ERROR("diffusion model compute failed");
+                            return nullptr;
+                        }
+                        cache_after_condition(&uncond, out_uncond);
+                    }
+                    negative_data = (float*)out_uncond->data;
+                }
             }
 
             float* img_cond_data = nullptr;

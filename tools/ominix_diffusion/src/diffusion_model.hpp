@@ -24,6 +24,10 @@ struct DiffusionParams {
     struct ggml_tensor* vace_context          = nullptr;
     float vace_strength                       = 1.f;
     std::vector<int> skip_layers              = {};
+    // Q4 CFG batching (OMINIX_CFG_BATCHED=1): additive attention mask of shape
+    // [N, L_q, L_k] used to mask padded-text positions when cond+uncond are stacked
+    // on ne[3]=2. Null when not batching (default), or when S_cond == S_uncond.
+    struct ggml_tensor* attention_mask        = nullptr;
 };
 
 struct DiffusionModel {
@@ -447,7 +451,8 @@ struct QwenImageModel : public DiffusionModel {
                                   diffusion_params.ref_latents,
                                   true,  // increase_ref_index
                                   output,
-                                  output_ctx);
+                                  output_ctx,
+                                  diffusion_params.attention_mask);
     }
 };
 

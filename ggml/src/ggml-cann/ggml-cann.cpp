@@ -2434,15 +2434,17 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
                         // CPU-dequant fallback path (see ggml_cann_mul_mat_quant_cpu_dequant).
-                        // Restricted to 2D weights/inputs; the mixed-precision GGUF exports
-                        // that need this fallback only have 2D weight tensors and this lets
-                        // the fallback skip the broadcast / batched-matmul plumbing.
+                        // Weight must be 2D. Input/dst may be 3D/4D when the caller stacks
+                        // CFG cond+uncond along ne[2]/ne[3] (Q4 CFG-batching path) — the
+                        // fallback loops internally over src1's outer axes. At
+                        // op->src[1]->ne[2]==ne[3]==1 this is byte-identical to the pre-
+                        // batching behaviour (single iteration of the internal loop).
 #ifdef ASCEND_310P
                         return false;
 #endif
                         return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
-                               op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1;
+                               op->src[1]->ne[2] == op->ne[2] && op->src[1]->ne[3] == op->ne[3];
                     default:
                         return false;
                 }

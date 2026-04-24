@@ -2792,10 +2792,13 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     ggml_tensor * src1 = dst->src[1];  // input (fp)
 
     GGML_ASSERT(ggml_is_contiguous(src0));
-    // Supported-op predicate restricts this path to 2D weights/inputs.
+    // Weight must be 2D. Input/dst may be 3D/4D when the caller stacks CFG cond+uncond
+    // along ne[2] (Q4 CFG-batching path). We loop over src1's outer batch axes (ne[2],
+    // ne[3]) and dispatch one aclnnMm per slice. Weight dequant happens exactly once
+    // before the loop. This is ~free at N=1 (one iteration) and O(N) at N>1, which is
+    // the intended speedup regime.
     GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
-    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
-    GGML_ASSERT(dst->ne[2]  == 1 && dst->ne[3]  == 1);
+    GGML_ASSERT(src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]);
 
     const size_t n_elements     = ggml_nelements(src0);
     const size_t device_q_bytes = ggml_nbytes(src0);
@@ -2833,30 +2836,36 @@ static void ggml_cann_mul_mat_quant_cpu_dequant(ggml_backend_cann_context & ctx,
     ACL_CHECK(aclrtMemcpy(weight_fp16_alloc.get(), fp16_bytes, fp16_buf.data(), fp16_bytes,
                           ACL_MEMCPY_HOST_TO_DEVICE));
 
-    // ggml stores these tensors as [K, M, 1, 1] (ne[0]=K row-fastest, ne[1]=M).
-    // ggml_cann_create_tensor(tensor) emits a 4D ACL tensor, but aclnnMm wants exactly 2D,
-    // so build strict 2D views by hand.
-    int64_t input_ne[2] = { src1->ne[0], src1->ne[1] };
-    size_t  input_nb[2] = { src1->nb[0], src1->nb[1] };
-    acl_tensor_ptr acl_input =
-        ggml_cann_create_tensor(src1->data, ggml_cann_type_mapping(src1->type), ggml_type_size(src1->type),
-                                input_ne, input_nb, 2);
-
     // Weight FP16 buffer on device is native (K, N); aclnnMm expects (N, K) → swap ne/nb[0..1].
     size_t fp16_nb[2] = { sizeof(ggml_fp16_t), sizeof(ggml_fp16_t) * (size_t) src0->ne[0] };
     int64_t weight_t_ne[2] = { src0->ne[1], src0->ne[0] };
     size_t  weight_t_nb[2] = { fp16_nb[1],   fp16_nb[0] };
-    acl_tensor_ptr acl_weight =
-        ggml_cann_create_tensor(weight_fp16_alloc.get(), ACL_FLOAT16, sizeof(ggml_fp16_t), weight_t_ne, weight_t_nb, 2);
 
-    int64_t dst_ne[2] = { dst->ne[0], dst->ne[1] };
-    size_t  dst_nb[2] = { dst->nb[0], dst->nb[1] };
-    acl_tensor_ptr acl_dst =
-        ggml_cann_create_tensor(dst->data, ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
-                                dst_ne, dst_nb, 2);
+    // Per-slice matmul loop over src1's outer axes. At N=1 this runs exactly once.
+    for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+            char * src1_base = (char *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2];
+            char * dst_base  = (char *) dst->data  + i3 * dst->nb[3]  + i2 * dst->nb[2];
 
-    // cubeMathType = 2 (ALLOW_FP32_DOWN_PRECISION): matches mat_mul_fp 2D path.
-    GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), 2);
+            int64_t input_ne[2] = { src1->ne[0], src1->ne[1] };
+            size_t  input_nb[2] = { src1->nb[0], src1->nb[1] };
+            acl_tensor_ptr acl_input =
+                ggml_cann_create_tensor(src1_base, ggml_cann_type_mapping(src1->type), ggml_type_size(src1->type),
+                                        input_ne, input_nb, 2);
+
+            acl_tensor_ptr acl_weight =
+                ggml_cann_create_tensor(weight_fp16_alloc.get(), ACL_FLOAT16, sizeof(ggml_fp16_t), weight_t_ne, weight_t_nb, 2);
+
+            int64_t dst_ne[2] = { dst->ne[0], dst->ne[1] };
+            size_t  dst_nb[2] = { dst->nb[0], dst->nb[1] };
+            acl_tensor_ptr acl_dst =
+                ggml_cann_create_tensor(dst_base, ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
+                                        dst_ne, dst_nb, 2);
+
+            // cubeMathType = 2 (ALLOW_FP32_DOWN_PRECISION): matches mat_mul_fp 2D path.
+            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_dst.get(), 2);
+        }
+    }
 
     // The pool buffer for the dequantised FP16 weight is owned by weight_fp16_alloc and will
     // be returned to the pool at the end of this scope. Sync the backend stream before then

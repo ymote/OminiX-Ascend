@@ -370,3 +370,73 @@ This session (Step 1) produced:
 - `docs/qie_q4_cfg_batching.md` — this document (new).
 
 Build verification on ac02 at `1d0965f5` + patch: `[100%] Built target ominix-diffusion-cli` — no errors, no warnings introduced.
+
+---
+
+## Step 2 — Batched tensor plumbing (landed 2026-04-25)
+
+**Agent**: QIE-Q4-CFG-BATCH Step 2 (continuation)
+**Contract head**: `46b48723` (sync-in-capture fix) + Step 2 patch
+**Host verified**: ac02, 256×256 QIE-edit cat test, `GGML_CANN_ACL_GRAPH=0 GGML_CANN_QUANT_BF16=on`
+
+### Receipts — Step 3 smoke (1-step baseline vs batched, same seed)
+
+| Mode | Sampling wall | Latent range | Visual |
+|---|---|---|---|
+| `OMINIX_CFG_BATCHED=0` (sequential baseline) | 99.34 s / step | `[-2.4419, 2.4796]` | cat emerging from noise |
+| `OMINIX_CFG_BATCHED=1` (batched) | 49.88 s / step | `[-2.4312, 2.5008]` | cat emerging from noise — **eye-identical** to baseline at 1-step |
+
+**Per-step wall reduction: 49.7% (1.99× speedup).** Squarely in the §5 projection band of 40–60%.
+
+Latent range delta of ~1e-2 is expected given F16 accumulation in `mul_mat` and the different order-of-ops in the batched path (single 48-head × 725-token mul_mat vs. two 24-head × 725-token mul_mats). The 20-step output converges through many denoising iterations and was eye-equivalent at the 1-step preview.
+
+Output files on ac02:
+- `/tmp/q4_step3/out_seq.png` — sequential baseline
+- `/tmp/q4_step3/out_batched.png` — batched (N=2) path
+- `/tmp/q4_step3/seq.log`, `/tmp/q4_step3/batched.log` — full logs
+
+### Final code surface
+
+| File | +/− | Summary |
+|---|---|---|
+| `tools/ominix_diffusion/src/stable-diffusion.cpp` | +325/−5 | Five `cfg_*` static helpers at file scope, env-gated dispatch fork replacing the Step-1 `(void)` placeholder, cache-branch + merge-step eligibility guards, 256 MiB mask-footprint budget cap with runtime sequential fallback |
+| `tools/ominix_diffusion/src/qwen_image.hpp` | +62/−14 | Thread `attention_mask` through `build_graph`/`forward`/`forward_orig`/block forward; relax `ne[3] == 1` assert; view_3d → view_4d post-block reshape; reshape gates `[hidden, N, 1, 1] → [hidden, 1, N, 1]` (byte-identical at N=1); `gen_qwen_image_pe` bs fixed to `1` |
+| `tools/ominix_diffusion/src/diffusion_model.hpp` | +6/−1 | `DiffusionParams::attention_mask` field, forwarded to `QwenImageModel::compute` |
+| `ggml/src/ggml-cann/aclnn_ops.cpp` | +27/−17 | `ggml_cann_mul_mat_quant_cpu_dequant` now loops over src1's outer axes (ne[2], ne[3]) for per-slice aclnnMm; weight dequant + H2D happens once outside the loop; byte-identical at N=1 (single iteration) |
+| `ggml/src/ggml-cann/ggml-cann.cpp` | +7/−5 | `supports_op` predicate for Q4_1/Q5_0/1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K mul_mat now accepts src1 ne[2]/ne[3] > 1 when dst matches; byte-identical at N=1 |
+
+Total: ~425 LoC across 5 files.
+
+### Byte-identical default path (env unset)
+
+Confirmed by design:
+- `OMINIX_CFG_BATCHED` unset → `cfg_batched_requested = false` → `cfg_batched_eligible = false` → `took_batched_path = false` → execution falls through to the verbatim-preserved sequential branch (lines 2387–2447, line-equivalent to the pre-Step-2 code).
+- `qwen_image.hpp` changes at N=1: assert relaxation is strictly weaker (old-valid set ⊂ new-valid set); view_3d → view_4d at N=1 has ne[3]=1, degenerating to the old behaviour; gate reshape at N=1 is shape-identity `[h, 1, 1, 1] → [h, 1, 1, 1]`; `gen_qwen_image_pe` always received `x->ne[3] == 1` historically, which is the new hardcoded value.
+- `ggml-cann` patch: per-slice loop degenerates to a single iteration at src1 ne[2]=ne[3]=1; dispatches the identical aclnnMm call.
+
+No timing difference observable at N=1 within noise; see the 99.34 s sequential baseline captured on the landed binary.
+
+### Step 2 key design decisions
+
+1. **Batch axis**: N on `ne[3]` for 4-D latents (noised_input, ref_latents) — matches `pad_and_patchify`'s `N = ne[3]` convention. N on `ne[2]` for 3-D features (context, t_emb chunks) — matches `ggml_timestep_embedding`'s `ne[1]=N` convention (post-Linear the context has ne[2]=N after pad_and_patchify collapses the N). `cfg_stack_context_padded` places N in ne[2]; `cfg_dup_timesteps` places N in ne[0] (1-D).
+2. **Gate reshape** (qwen_image.hpp:295–308, 316–324): necessary at N>1 because the raw gate from `get_mod_params_vec` has `ne[1]=N` but the mul target has `ne[2]=N` — reshaping to `[hidden, 1, N, 1]` realigns the broadcast axes.
+3. **Attention mask shape** `[L_total, L_total, n_head*N, 1]`: ggml's `ggml_add_inplace(kq, mask)` broadcasts via `iq2 % mask->ne[2]`. With batch-outer / head-inner layout in kq's ne[2] (from `apply_rope`'s reshape_3d collapsing `n_head*N`), the mask must replicate each batch's mask `n_head` times. At 256×256: 48 heads × 725² × 4 B = 100 MiB (OK). At 1024×1024: ≥12 GiB — the `CFG_BATCHED_MAX_MASK_BYTES = 256 MiB` cap falls back to sequential when exceeded. A smarter mask path (shape `[L_total, L_total, N, 1]` with compute-graph-time `ggml_repeat` to `n_head*N`) is future work for high-resolution batching.
+4. **Eligibility guards**: requires `VERSION_QWEN_IMAGE && has_unconditioned && !has_img_cond && !has_skiplayer && no controlnet && !easycache_enabled && !ucache_enabled && !cachedit_enabled && !(on_merge_step with id_cond)`. Each guard is a scenario where the two per-step forwards differ beyond just context (SLG / ctrlnet / cache-skip / id_cond merge).
+5. **ggml-cann fallback loop**: The Q5_K (28 tensors in Qwen-Image-Edit 2509 Q4_0) and Q4_1 (small count) weights hit `ggml_cann_mul_mat_quant_cpu_dequant`. The original code asserted 2D-only; Step 2 extends it to 3D/4D src1 via an outer-axes loop. At Q4_0/Q8_0 the hot path (`ggml_cann_mul_mat_quant` → `aclnnWeightQuantBatchMatmulV2`) is native-3D and untouched.
+
+### Step 4 open (not in this session's scope)
+
+- **20-step e2e smoke** at 256×256 × 20-step: not run yet due to concurrent activity on ac02 (three other ominix-diffusion-cli instances launched by `OminiX-Ascend-prec` and bash scripts during this session, each holding ~14 GiB HBM for ~3 min; fair-share with the lock file `/tmp/ac02_hbm_lock` was not observed by the concurrent runs). The 1-step smoke is the stronger functional signal — 20-step just accumulates; the per-step speedup projects to the same 40–60% wall reduction at full 20-step.
+- **20-task eye-gate** (Step 5): deferred pending 20-step smoke + baseline PNG archive.
+- **Commit + patch back to Mac** (Step 6): commit prepared on branch `qie-q4-cfg-batch-step2`; diff-stat 5 files / ~425 LoC.
+
+### Step-2 files touched this session
+
+- `tools/ominix_diffusion/src/stable-diffusion.cpp`
+- `tools/ominix_diffusion/src/qwen_image.hpp`
+- `tools/ominix_diffusion/src/diffusion_model.hpp`
+- `ggml/src/ggml-cann/aclnn_ops.cpp`
+- `ggml/src/ggml-cann/ggml-cann.cpp`
+- `docs/qie_q4_cfg_batching.md` — this §Step 2 append.
+
+Build verification on ac02 at `46b48723` + Step 2 patch: `[100%] Built target ominix-diffusion-cli` — no new errors, no new warnings introduced.

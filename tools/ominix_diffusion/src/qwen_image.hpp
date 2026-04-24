@@ -257,10 +257,12 @@ namespace Qwen {
                                                               struct ggml_tensor* txt,
                                                               struct ggml_tensor* t_emb,
                                                               struct ggml_tensor* pe,
-                                                              struct ggml_tensor* modulate_index = nullptr) {
+                                                              struct ggml_tensor* modulate_index = nullptr,
+                                                              struct ggml_tensor* attention_mask = nullptr) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
+            // attention_mask: [N, L_q, L_k] additive mask (0 keep, -inf mask); optional — only needed when N>1 with unequal per-batch valid-token counts (Q4 CFG batching).
             // return: ([N, n_img_token, hidden_size], [N, n_txt_token, hidden_size])
 
             auto img_mod_1 = std::dynamic_pointer_cast<Linear>(blocks["img_mod.1"]);
@@ -295,7 +297,22 @@ namespace Qwen {
             auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_param_vec[0], txt_mod_param_vec[1]);
             auto txt_gate1     = txt_mod_param_vec[2];
 
-            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe);
+            // Q4 CFG batching: gates arrive as [hidden, N, 1, 1]. At N==1 the subsequent
+            // mul with img/txt [hidden, n_tokens, 1, 1] broadcasts correctly via the
+            // ne[1]=1 slot. At N>1 we must re-home N to ne[2] so ne[1]=1 broadcasts
+            // across tokens and ne[2]=N differentiates batch. Reshape is a no-op at N=1
+            // (ne becomes [hidden, 1, 1, 1]) — byte-identical to pre-patch. In the
+            // modulate_index != nullptr branch these gates are used differently
+            // (get_mod_params_vec returns [N*hidden*n_img_token] layouts) and should
+            // not be reshaped here.
+            if (modulate_index == nullptr) {
+                img_gate1 = ggml_reshape_4d(ctx->ggml_ctx, img_gate1,
+                                            img_gate1->ne[0], 1, img_gate1->ne[1], img_gate1->ne[2]);
+                txt_gate1 = ggml_reshape_4d(ctx->ggml_ctx, txt_gate1,
+                                            txt_gate1->ne[0], 1, txt_gate1->ne[1], txt_gate1->ne[2]);
+            }
+
+            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe, attention_mask);
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
@@ -307,6 +324,13 @@ namespace Qwen {
             auto txt_normed2    = txt_norm2->forward(ctx, txt);
             auto txt_modulated2 = Flux::modulate(ctx->ggml_ctx, txt_normed2, txt_mod_param_vec[3], txt_mod_param_vec[4]);
             auto txt_gate2      = txt_mod_param_vec[5];
+
+            if (modulate_index == nullptr) {
+                img_gate2 = ggml_reshape_4d(ctx->ggml_ctx, img_gate2,
+                                            img_gate2->ne[0], 1, img_gate2->ne[1], img_gate2->ne[2]);
+                txt_gate2 = ggml_reshape_4d(ctx->ggml_ctx, txt_gate2,
+                                            txt_gate2->ne[0], 1, txt_gate2->ne[1], txt_gate2->ne[2]);
+            }
 
             auto img_mlp_out = img_mlp->forward(ctx, img_modulated2);
             auto txt_mlp_out = txt_mlp->forward(ctx, txt_modulated2);
@@ -398,7 +422,8 @@ namespace Qwen {
                                          struct ggml_tensor* timestep,
                                          struct ggml_tensor* context,
                                          struct ggml_tensor* pe,
-                                         struct ggml_tensor* modulate_index = nullptr) {
+                                         struct ggml_tensor* modulate_index = nullptr,
+                                         struct ggml_tensor* attention_mask = nullptr) {
             auto time_text_embed = std::dynamic_pointer_cast<QwenTimestepProjEmbeddings>(blocks["time_text_embed"]);
             auto txt_norm        = std::dynamic_pointer_cast<RMSNorm>(blocks["txt_norm"]);
             auto img_in          = std::dynamic_pointer_cast<Linear>(blocks["img_in"]);
@@ -418,7 +443,7 @@ namespace Qwen {
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<QwenImageTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
 
-                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index);
+                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index, attention_mask);
                 img         = result.first;
                 txt         = result.second;
             }
@@ -439,12 +464,14 @@ namespace Qwen {
                                     struct ggml_tensor* context,
                                     struct ggml_tensor* pe,
                                     std::vector<ggml_tensor*> ref_latents = {},
-                                    struct ggml_tensor* modulate_index    = nullptr) {
+                                    struct ggml_tensor* modulate_index    = nullptr,
+                                    struct ggml_tensor* attention_mask    = nullptr) {
             // Forward pass of DiT.
             // x: [N, C, H, W]
             // timestep: [N,]
             // context: [N, L, D]
             // pe: [L, d_head/2, 2, 2]
+            // attention_mask: [N, L_q, L_k] additive mask; optional, only required for Q4 CFG batching with unequal text lengths.
             // return: [N, C, H, W]
 
             int64_t W = x->ne[0];
@@ -462,12 +489,18 @@ namespace Qwen {
                 }
             }
 
-            auto out = forward_orig(ctx, img, timestep, context, pe, modulate_index);  // [N, h_len*w_len, ph*pw*C]
+            auto out = forward_orig(ctx, img, timestep, context, pe, modulate_index, attention_mask);  // [N, h_len*w_len, ph*pw*C]
 
             if (out->ne[1] > img_tokens) {
-                out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [num_tokens, N, C * patch_size * patch_size]
-                out = ggml_view_3d(ctx->ggml_ctx, out, out->ne[0], out->ne[1], img_tokens, out->nb[1], out->nb[2], 0);
-                out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [N, h*w, C * patch_size * patch_size]
+                // Q4 CFG batching: N may be 2. The post-block reshape slices the token dim
+                // to discard ref_latents/txt trailing tokens. Use view_4d so the trailing ne[3]
+                // (always 1 at this point — N is in ne[2]) survives the slice unchanged.
+                // At N=1 this is shape-equivalent to the original view_3d.
+                out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [C*ph*pw, N, total_tokens, 1]
+                out = ggml_view_4d(ctx->ggml_ctx, out,
+                                   out->ne[0], out->ne[1], img_tokens, out->ne[3],
+                                   out->nb[1], out->nb[2], out->nb[3], 0);                    // [C*ph*pw, N, img_tokens, 1]
+                out = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 2, 1, 3));  // [C*ph*pw, img_tokens, N, 1]
             }
 
             out = DiT::unpatchify_and_crop(ctx->ggml_ctx, out, H, W, params.patch_size, params.patch_size);  // [N, C, H, W]
@@ -496,10 +529,12 @@ namespace Qwen {
         // See docs/qie_rope_precompute_lift.md for receipts.
         // MLX-measured analogous refactor: +10-25% per step.
         // ----------------------------------------------------------------
+        // Cache key excludes bs: gen_qwen_image_pe is now always called with bs=1
+        // (CFG batching relies on pe broadcasting across ne[3], so pe is shape-
+        // independent of N). See build_graph below.
         bool pe_cache_valid_                         = false;
         int pe_cache_h_                              = 0;
         int pe_cache_w_                              = 0;
-        int pe_cache_bs_                             = 0;
         int pe_cache_context_len_                    = 0;
         std::vector<std::pair<int64_t, int64_t>> pe_cache_ref_shapes_;
         bool pe_cache_increase_ref_index_            = false;
@@ -557,13 +592,21 @@ namespace Qwen {
                                         struct ggml_tensor* timesteps,
                                         struct ggml_tensor* context,
                                         std::vector<ggml_tensor*> ref_latents = {},
-                                        bool increase_ref_index               = false) {
-            GGML_ASSERT(x->ne[3] == 1);
+                                        bool increase_ref_index               = false,
+                                        struct ggml_tensor* attention_mask    = nullptr) {
+            // Q4 CFG batching: N==2 is permitted when the host has stacked cond+uncond
+            // along ne[3] and supplied an attention_mask that masks padded-text positions
+            // per batch. All other axes (context->ne[1], timesteps, ref_latents) must be
+            // consistent across batches (host responsibility).
+            GGML_ASSERT(x->ne[3] == 1 || x->ne[3] == 2);
             struct ggml_cgraph* gf = new_graph_custom(QWEN_IMAGE_GRAPH_SIZE);
 
             x         = to_backend(x);
             context   = to_backend(context);
             timesteps = to_backend(timesteps);
+            if (attention_mask != nullptr) {
+                attention_mask = to_backend(attention_mask);
+            }
 
             for (int i = 0; i < ref_latents.size(); i++) {
                 ref_latents[i] = to_backend(ref_latents[i]);
@@ -573,6 +616,15 @@ namespace Qwen {
             // default) or read from shape-keyed cache (Q2 must-have
             // structural refactor). Gated by OMINIX_QIE_ROPE_PRECOMPUTE=1
             // so flag-unset builds remain byte-identical to pre-patch.
+            //
+            // Q4 CFG batching note: pe is broadcast across the batch dim N
+            // in apply_rope (pe is [2, L, d_head/2, 2], independent of N).
+            // Passing bs=1 yields a single copy of positions that applies
+            // to both batch items; passing bs=x->ne[3] would double the
+            // positions for N=2 and mis-shape the pe tensor
+            // (ne[3]=2*pos_len instead of pos_len). For N=1, bs=1 is byte
+            // identical to the historical behaviour. Because bs is now
+            // always 1, the cache key excludes it.
             const char* qie_rope_precompute_env   = std::getenv("OMINIX_QIE_ROPE_PRECOMPUTE");
             const bool qie_rope_precompute_on    = qie_rope_precompute_env != nullptr &&
                                                    std::string(qie_rope_precompute_env) == "1";
@@ -580,7 +632,6 @@ namespace Qwen {
             if (qie_rope_precompute_on) {
                 const int cur_h           = static_cast<int>(x->ne[1]);
                 const int cur_w           = static_cast<int>(x->ne[0]);
-                const int cur_bs          = static_cast<int>(x->ne[3]);
                 const int cur_context_len = static_cast<int>(context->ne[1]);
                 std::vector<std::pair<int64_t, int64_t>> cur_ref_shapes;
                 cur_ref_shapes.reserve(ref_latents.size());
@@ -592,7 +643,6 @@ namespace Qwen {
                 const bool shape_match = pe_cache_valid_ &&
                                          pe_cache_h_ == cur_h &&
                                          pe_cache_w_ == cur_w &&
-                                         pe_cache_bs_ == cur_bs &&
                                          pe_cache_context_len_ == cur_context_len &&
                                          pe_cache_ref_shapes_ == cur_ref_shapes &&
                                          pe_cache_increase_ref_index_ == increase_ref_index &&
@@ -603,7 +653,7 @@ namespace Qwen {
                     pe_vec = Rope::gen_qwen_image_pe(cur_h,
                                                      cur_w,
                                                      qwen_image_params.patch_size,
-                                                     cur_bs,
+                                                     1,
                                                      cur_context_len,
                                                      ref_latents,
                                                      increase_ref_index,
@@ -614,7 +664,6 @@ namespace Qwen {
                     pe_cache_valid_              = true;
                     pe_cache_h_                  = cur_h;
                     pe_cache_w_                  = cur_w;
-                    pe_cache_bs_                 = cur_bs;
                     pe_cache_context_len_        = cur_context_len;
                     pe_cache_ref_shapes_         = std::move(cur_ref_shapes);
                     pe_cache_increase_ref_index_ = increase_ref_index;
@@ -639,7 +688,7 @@ namespace Qwen {
                 pe_vec = Rope::gen_qwen_image_pe(static_cast<int>(x->ne[1]),
                                                  static_cast<int>(x->ne[0]),
                                                  qwen_image_params.patch_size,
-                                                 static_cast<int>(x->ne[3]),
+                                                 1,
                                                  static_cast<int>(context->ne[1]),
                                                  ref_latents,
                                                  increase_ref_index,
@@ -689,7 +738,8 @@ namespace Qwen {
                                                          context,
                                                          pe,
                                                          ref_latents,
-                                                         modulate_index);
+                                                         modulate_index,
+                                                         attention_mask);
 
             ggml_build_forward_expand(gf, out);
 
@@ -703,12 +753,14 @@ namespace Qwen {
                      std::vector<ggml_tensor*> ref_latents = {},
                      bool increase_ref_index               = false,
                      struct ggml_tensor** output           = nullptr,
-                     struct ggml_context* output_ctx       = nullptr) {
+                     struct ggml_context* output_ctx       = nullptr,
+                     struct ggml_tensor* attention_mask    = nullptr) {
             // x: [N, in_channels, h, w]
             // timesteps: [N, ]
             // context: [N, max_position, hidden_size]
+            // attention_mask: optional [N, L_q, L_k] additive mask for Q4 CFG batching.
             auto get_graph = [&]() -> struct ggml_cgraph* {
-                return build_graph(x, timesteps, context, ref_latents, increase_ref_index);
+                return build_graph(x, timesteps, context, ref_latents, increase_ref_index, attention_mask);
             };
 
             return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
