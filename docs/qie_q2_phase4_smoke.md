@@ -3230,3 +3230,160 @@ A future probe should:
   no projection bug to fix.
 
 
+
+
+### §5.5.14 Step 4m — end-to-end re-run with corrected harness — RED, real engine bug confirmed
+
+§5.5.13 closed the §5.5.7–§5.5.11 saga: the `ggml_cont` fix on
+the CPU-reference probe recovered substep-08 cos to +0.80–0.97 across
+all six QKV projections, and the analytical Q5_K oracle confirmed
+the native projection is bit-for-bit correct (cos=1.000000).  But the
+end-to-end PNG was never re-shot after the harness fix — the only
+existing PNG (`/tmp/qie_q45_step4d_allbf16_cat.png`, §5.5.5, commit
+cf16f83e) was generated **before** the discovery that the harness
+itself was broken.  This step closes that loop.
+
+#### What ran
+
+Re-built `qwen_image_edit_native` at fork HEAD (post-merge of
+`origin/main` 10a87c0 — `Q2.4.5.4l Python QKV oracle retracts §5.5.11`)
+on ac03 build-w1.  Re-ran the full Phase 4.5 Step 4 pipeline at
+production shape end-to-end:
+
+  1. `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` with
+     `QIE_ALL_BF16=1 GGML_CANN_QUANT_BF16=on` — 20-step flow Euler
+     denoise on real Q4_0 weights, real host conditioning from
+     `/tmp/qie_q45_inputs`, single-forward (no uncond dump → cfg=1.0).
+  2. `ominix-diffusion-cli` with `OMINIX_QIE_DECODE_ONLY_LATENT=
+     /tmp/qie_q45_step4_latent.f32.bin` to VAE-decode the dumped
+     latent without re-running diffusion.
+
+#### Numerical gate (unchanged from §5.5.5 — still GREEN)
+
+```
+[smoke45s4] init_latent: mean=0.0031 std=0.9969 min/max=-3.9269/3.9313 nan=0 inf=0
+[smoke45s4] ref_latent:  mean=-0.0689 std=0.4674 min/max=-1.6444/1.6830
+[smoke45s4] dispatching denoise_full (real Q4_0 weights, 20-step flow Euler, cfg=1.00)...
+[smoke45s4] denoise_full OK (29263.60 ms)
+out_latent: mean=-2.4559 std=4.8611 min/max=-13.3203/7.6250 NaN=0 inf=0
+VERDICT: GREEN  (gate: NaN=0, inf=0, std>0.0010, |min|<20, |max|<20)
+```
+
+Wall: `init=110.0s, denoise_full=29.26s, per-step
+min=1209ms median=1232ms max=2202ms`.  VAE decode (decode-only
+path): 20.23 s.  Total decode-only CLI wall: 32.58 s.
+
+#### Eye-check verdict — RED
+
+Output PNG `/tmp/qie_native_e2e_rerun.png` (256x256 RGB, range
+[0.000, 1.000]) compared to:
+
+  - `/tmp/qie_q45_step4d_allbf16_cat.png` (§5.5.5, broken-harness
+    era):
+  - `/tmp/phase1_baseline_1024_20step.png` (CUDA codex reference,
+    recognizable B&W cat).
+
+Pixel-level diff vs the §5.5.5 PNG (Mac, PIL):
+
+```
+rerun     mean=125.14 std=72.06
+old §5.5.5 mean=125.16 std=72.08
+abs diff  mean=0.367  max=3  fraction_identical=0.3356
+```
+
+The two outputs are functionally **identical** — diff is bounded by
+±3/255 round-off across 33% of pixels, with the rest exactly equal.
+Both show the same blue tile / cushion pattern, no cat, no edit.
+Reference is a recognizable grey-tabby cat.
+
+Verdict: **the native engine deterministically produces the wrong
+image.** The "tile pattern" is not a measurement artefact, not a
+harness bug, and not driven by anything that §5.5.7–§5.5.13
+investigated — those probes worked downstream of the wrong
+intermediate values regardless of harness aliasing.
+
+#### What this rules in / rules out
+
+Ruled OUT by §5.5.13 + this re-run:
+  - QKV projection (cos=1.000 vs analytical oracle).
+  - Gate-allocator dump aliasing (was the only fix between §5.5.5
+    and this step — applied, eye-check unchanged).
+  - Numerical NaN/inf leak (gate GREEN throughout 60 blocks × 20
+    steps).
+  - BF16 widening regression (`QIE_ALL_BF16=1` flag exercised; gate
+    still GREEN).
+  - Output latent magnitude collapse (std=4.86, min/max=±13).
+
+Still RULED IN as candidate root causes:
+  1. **Substep 11/24 cos = 0.48 / 0.61** (§5.5.9 / §5.5.13 carryover):
+     attention output and post-MLP residual diverge from CPU
+     reference even when QKV projection is bit-correct.  Most likely
+     surface: F16-accumulator rounding through Q-rmsnorm → RoPE →
+     softmax → V-matmul → out-proj chain at K=3072, where each step
+     amplifies upstream drift.  Probe to write next:
+     **direct Python attention oracle** that takes the F32 dump of
+     `09_*_Q_rmsn`, `09_*_K_rmsn`, `08_*_V` and runs
+     `torch.softmax(Q@K.T/sqrt(HD)) @ V` in F32 — compare to native
+     `11_attn_out`.  This isolates whether 0.48 is a real divergence
+     or compounded F16 round-off through the FIA kernel.
+  2. **`QIE_MATMUL_CUBE_MATH=0` (KEEP_DTYPE)** on aclnnMm — every QKV
+     and FFN projection runs F16-accumulator on the cube units.
+     §5.5.13 already named this as the recommended next probe:
+     re-run with `QIE_MATMUL_CUBE_MATH=1` (ALLOW_FP32_DOWN_PRECISION)
+     for the QKV projection only and re-shoot the PNG.  This is a
+     **single-flag re-run** (no code change) and will tell us
+     whether the F16-accumulator path is the bottleneck.
+  3. **RoPE pe-table drift** (§5.5.6 documented YELLOW): pe-table is
+     computed once at init (pos=4352, head_dim/2=64) but the
+     production shape uses 256+256=512 image tokens + 214 text =
+     726 — well within 4352 — so this should be benign, but the
+     table layout `[seq, hd/2, 2, 2] F16` might mis-index for the
+     (img,txt) joint-attention layout.  Lower-priority probe: dump
+     `applied_q_after_rope` and compare against a Python rotary
+     oracle.
+  4. **`init_from_dump` text conditioning** (`txt_cond:
+     mean=-0.1363 std=4.3879 min/max=-151.25/104.41`): the magnitudes
+     are surprisingly large.  Worth cross-checking against the CUDA
+     reference's text-cond dump — if the §5.5.5-era dump is itself
+     stale or wrongly normalised, every block downstream is fed
+     bad conditioning.
+
+#### Recommendation — next investigation surface
+
+Priority order, lowest-cost first:
+
+  - **§5.5.15** — single-flag re-run with `QIE_MATMUL_CUBE_MATH=1`
+    on QKV projection only.  Cost: ~12 min wall (skip init: re-use
+    cached dump).  Outcome decides: F16-accumulator drift (fix in
+    one config flip) vs deeper algorithmic bug.
+  - **§5.5.16** — direct Python attention oracle vs native
+    `11_attn_out`.  Cost: ~30 min wall + ~1 hr code.  Outcome
+    decides: real attention divergence vs compounded F16 noise.
+  - **§5.5.17** — text-conditioning provenance check: re-extract
+    `txt_cond` from the QIE-Edit pipeline (Python ref) and compare
+    byte-for-byte to `/tmp/qie_q45_inputs/txt_cond.f32.bin`.  Cost:
+    ~30 min.  Outcome decides: stale upstream dump vs intra-engine
+    bug.
+  - **§5.5.18** — only if .15–.17 all return GREEN: add post-RoPE
+    Q/K dumps (with the §5.5.13 `ggml_cont` pattern) and a Python
+    rotary oracle.
+
+#### Strategic note
+
+The week of "QKV projection bugs" was a measurement artefact, but
+the underlying engine bug was real and is still here.  The eye-check
+PNG diff (=0 mean, 33% pixel-identical to the §5.5.5 PNG) shows the
+engine is **deterministic and bug-stable** — re-runs do not
+introduce noise, which is itself useful: any future fix that moves
+the PNG by more than the 0.367 round-off floor is a real signal.
+
+#### Artefacts (this step)
+
+- `/tmp/qie_q45_step4_e2e_rerun.log` (probe stdout, 3741 B).
+- `/tmp/qie_native_e2e_rerun_decode.log` (decode-only stdout, 13994 B).
+- `/tmp/qie_q45_step4_latent.f32.bin` (16384 F32, regenerated at
+  fork HEAD post-§5.5.13).
+- `/tmp/qie_native_e2e_rerun.png` (112103 B, 256x256 RGB).
+- Mac copies of all four under matching paths.
+
+No code changes — pure verification re-run.
