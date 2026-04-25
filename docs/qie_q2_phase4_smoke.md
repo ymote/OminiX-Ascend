@@ -3705,3 +3705,135 @@ norm_added_q swap), or epsilon mismatch.
   diagnostic completeness; not exercised since primary config is
   cos = 1.000000.
 
+
+---
+
+### §5.5.17 Step 4p — RmsNorm Q/K oracle vs native `09_*_rmsnorm` — GREEN-B (RmsNorm bit-accurate)
+
+**Hypothesis under test.**  Final probe of the §5.5.13→§5.5.16→§5.5.18
+bisect.  After 08-V (§5.5.13 cos=1.000), FIA kernel (§5.5.16
+cos=1.000), and RoPE (§5.5.18 cos=1.000) were each shown bit-accurate
+when replayed against their *own* native dumps, the only unverified
+link between native 08 (post-projection) and native 11 (post-FIA) was
+the RmsNorm-on-Q/K stage at substep 09.  Build a pure-F32 numpy
+RmsNorm oracle, feed it native 08_*_Q/K and the GGUF γ vectors, and
+cosine-compare against native 09_*_rmsnorm.
+
+**Engine wiring (verified at `image_diffusion_engine.cpp`).**
+
+  - `rms_norm_head_` (line 2553): F16 input, F16 output, F32 γ, F32
+    rstd; calls `aclnnRmsNorm` with `eps = cfg_.rms_norm_eps = 1e-6f`
+    (declared `image_diffusion_engine.h:126`).
+  - img stream uses γ from `transformer_blocks.{il}.attn.norm_q.weight`
+    / `…norm_k.weight` (loaded into `lw.norm_q_w` / `lw.norm_k_w`).
+  - txt stream uses γ from `…norm_added_q.weight` / `…norm_added_k.weight`
+    (loaded into `lw.norm_added_q_w` / `lw.norm_added_k_w`).
+  - dump 08 is pre-RmsNorm, dump 09 is post-RmsNorm (line 3471-3482).
+
+**Oracle.**  `tools/probes/qie_rmsnorm_oracle/qie_rmsnorm_oracle.py`.
+
+  - Loads 08_*_Q/K and 09_*_Q/K_rmsnorm (F32 dumps via F16 device
+    storage path).
+  - Loads γ from GGUF for `transformer_blocks.0.attn.{norm_q,norm_k,
+    norm_added_q,norm_added_k}.weight` (all F32, shape [HD=128]).
+  - Computes `out = x / sqrt(mean(x²) + eps) * γ` over last-axis
+    HD=128, all F32.
+  - Compares primary wiring + alt-configs (γ swap, alt-ε grid,
+    F16-input rounding, F16-reduction).
+
+**Result — GREEN-B.**
+
+| metric                           | value         |
+| :------------------------------- | :------------ |
+| **global Q+K cos**               | **1.000000**  |
+| img_Q (γ=norm_q)       cos       | 1.000000      |
+| img_K (γ=norm_k)       cos       | 1.000000      |
+| txt_Q (γ=norm_added_q) cos       | 1.000000      |
+| txt_K (γ=norm_added_k) cos       | 1.000000      |
+| per-head img_Q (24 heads)        | 1.0000 uniform |
+| per-head txt_Q (24 heads)        | 1.0000 uniform |
+| max-abs diff img_Q               | 0.2476        |
+| max-abs diff txt_Q               | 0.0020        |
+| γ-swap alt-config (img↔txt)      | cos=0.10/0.38/0.24/0.31 (catastrophic) |
+| ε ∈ {0, 1e-7, 1e-6, 5e-6, 1e-5, 1e-4} | cos=1.000 across the board |
+
+**γ stats (block 0).**  norm_q has dynamic range 143× (min 0.447,
+max 64.0); norm_k similar.  norm_added_q/k bounded ~1.5.  This
+explains why post-RmsNorm |img_Q|_max = 723 (γ_max=64 amplifying
+small ratios) — it is *correct* by-design for this checkpoint.
+
+**Decision matrix.**
+  - **GREEN-A** (cos < 0.99): RmsNorm bug — RULED OUT.
+  - **AMBER**  (0.95 ≤ cos < 0.99): partial — RULED OUT.
+  - **GREEN-B** (cos ≥ 0.99): **CONFIRMED.**  RmsNorm is
+    mathematically bit-accurate.  γ wiring is correct (swap test
+    catastrophically diverges).  ε is irrelevant at this magnitude
+    (whole grid converges to 1.000).
+
+**Bisect post-mortem — the original premise was wrong.**
+
+The §5.5.13/16/18 oracles each replayed native dumps against
+themselves: V → V, FIA(Q,K,V) → FIA, RoPE(K) → K_rope,
+RmsNorm(Q) → Q_rmsn.  All four came back cos=1.000.  But the
+§5.5.10 substep bisect compared native dumps to **CPU reference
+dumps** (`/tmp/qie_block0_outputs/cpu_*`) and showed
+`08_img_Q cos=0.80`, `09_img_Q_rmsn cos=0.40`, `11_attn_out cos=0.48`.
+
+A fresh substep cossim sweep at HEAD `3909eaa` (run today against
+`/tmp/qie_dumps_5516/` vs `/tmp/qie_block0_outputs/`) confirms:
+
+| substep            | cos vs CPU | verdict |
+| :----------------- | :--------- | :------ |
+| 04_img_LN1         | 1.0000     | GREEN   |
+| 05_img_mod1        | 0.9859     | YELLOW (drift starts) |
+| 07_txt_mod1        | 0.9800     | YELLOW  |
+| 08_img_Q           | 0.8000     | YELLOW  |
+| 08_img_K           | 0.8502     | YELLOW  |
+| 08_img_V           | 0.9775     | YELLOW  |
+| 08_txt_Q           | 0.9102     | YELLOW  |
+| 09_img_Q_rmsn      | 0.3961     | RED     |
+| 09_img_K_rmsn      | 0.3440     | RED     |
+| 09_txt_Q_rmsn      | 0.9209     | YELLOW  |
+| 11_attn_out_img    | 0.4780     | RED     |
+| 11_attn_out_txt    | 0.4130     | RED     |
+
+The drift enters at **05_img_mod1 / 07_txt_mod1** (cos~0.98) and
+gets amplified at 08 (cos~0.80-0.91) and catastrophically blown up
+at 09_img by RmsNorm because `norm_q` γ has max=64.0 / min=0.447
+(143× dynamic range): tiny pre-RmsNorm channel errors get
+multiplied by γ-channels of magnitude 64 post-normalisation.
+
+`norm_added_q/k` γ stay bounded ~1.5, which is why txt-side 09
+holds cos=0.92 instead of dropping like img-side.
+
+**Where the bug actually lives.**
+
+The drift entry is **`05_img_mod1` (cos=0.9859) and
+`07_txt_mod1` (cos=0.9800)** — NOT a downstream attention bug.
+The drift then compounds through QKV-projection (already YELLOW
+at 08) and RmsNorm amplifies it to RED.  The ~0.98 modulation
+divergence is itself a pre-existing latent bug (likely in `silu`
++ `mod1.{shift,scale,gate}` Q4_0 dispatch) that was masked because
+all prior bisects either (a) replayed against native, or (b)
+stopped looking once 11 went RED.
+
+**Recommended next probe.**
+
+Build an oracle for substep 05/07: take native 04_img_LN1 +
+load `transformer_blocks.0.{img_mod,txt_mod}` weights from GGUF,
+compute `LN1 + silu(t_emb) @ mod1_w → split → mod1` in pure F32,
+compare to native 05_img_mod1 / 07_txt_mod1.  If cos < 0.99, the
+mod1 dispatch is the entry-point bug.  If cos = 1.000, the drift
+is already in 04 LN1 vs CPU (i.e., the LN1 kernel itself is the
+bug, or the timestep embedding upstream).
+
+**Artefacts (this step).**
+
+- `tools/probes/qie_rmsnorm_oracle/qie_rmsnorm_oracle.py` —
+  pure-F32 numpy RmsNorm oracle with γ-swap / ε-grid / F16-reduction
+  alt-configs (cos=1.000 only on primary wiring; γ-swap → 0.10).
+
+- Substep cossim sweep run at HEAD `3909eaa` confirms 08 already
+  YELLOW vs CPU; the bisect-narrowing premise that "08 cos=1.000"
+  was an artefact of native-vs-native replay, not native-vs-CPU.
+
