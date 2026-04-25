@@ -3387,3 +3387,110 @@ the PNG by more than the 0.367 round-off floor is a real signal.
 - Mac copies of all four under matching paths.
 
 No code changes — pure verification re-run.
+
+### §5.5.15 Step 4n — single-flag `QIE_MATMUL_CUBE_MATH=1` re-run — RED, F16-cube-accumulator ruled out
+
+§5.5.14 ranked four candidate root causes for the deterministic
+tile-pattern output.  This step exercises the lowest-cost probe in
+priority order: re-run the Phase 4.5 Step 4 native end-to-end pipeline
+with `QIE_MATMUL_CUBE_MATH=1` (`ALLOW_FP32_DOWN_PRECISION` on
+aclnnMm cube path) ADDED to the existing BF16 widening flags.  Pure
+config flip, no code change.
+
+#### What ran
+
+ac03 build-w1, fork HEAD `c79dca9`.  Same launcher
+(`tools/probes/qie_q45_step4_full_denoise/build_and_run.sh`), env:
+
+```
+QIE_MATMUL_CUBE_MATH=1 QIE_ALL_BF16=1 GGML_CANN_QUANT_BF16=on
+```
+
+Engine confirms the flag at startup:
+`dispatch_matmul_: QIE_MATMUL_CUBE_MATH=1 (aclnnMm cubeMathType; ... 1=ALLOW_FP32_DOWN_PRECISION ...)`.
+
+Decode: `ominix-diffusion-cli` with
+`OMINIX_QIE_DECODE_ONLY_LATENT=/tmp/qie_q45_step4_latent.f32.bin`
+→ `/tmp/qie_5515_cube_math.png`.
+
+#### Numerical gate (GREEN)
+
+```
+[smoke45s4] init_latent: mean=0.0031 std=0.9969 min/max=-3.9269/3.9313 nan=0 inf=0
+[smoke45s4] ref_latent:  mean=-0.0689 std=0.4674 min/max=-1.6444/1.6830
+[smoke45s4] denoise_full OK (29250.69 ms)
+out_latent: mean=-2.4559 std=4.8611 min/max=-13.3203/7.6250 NaN=0 inf=0
+VERDICT: GREEN
+```
+
+`out_latent` stats are **bit-for-bit identical** to §5.5.14
+(`mean=-2.4559 std=4.8611 min/max=-13.3203/7.6250`).
+
+Wall: `init=104.4s, denoise_full=29.25s, per-step
+min=1209ms median=1276ms max=2182ms`.  VAE decode 20.21 s; total
+decode-only CLI wall 32.70 s.
+
+#### Pixel diff vs §5.5.14 baseline (`/tmp/qie_native_e2e_rerun.png`)
+
+```
+mean_abs_diff = 0.0064
+max_abs_diff  = 1
+fraction_identical_pixels = 0.981049
+```
+
+98.1% of pixels are byte-identical; remaining 1.9% differ by exactly
+1/255 — sub-quantization noise from the BF16/F16 cube-path swap that
+does not propagate into visible structure.
+
+#### Pixel diff vs CUDA reference (`/tmp/phase1_baseline_1024_20step.png`, resized 256×256 LANCZOS)
+
+```
+5515 vs CUDA: mean_abs_diff = 75.29  max = 255  identical = 0.0%
+5514 vs CUDA: mean_abs_diff = 75.29  max = 255  identical = 0.0%
+```
+
+Both native runs are equally far from the CUDA reference.  Cube_math
+moved nothing toward the target.
+
+#### Eye-check verdict — RED
+
+`/tmp/qie_5515_cube_math.png` is the same blue tile / cushion pattern
+as §5.5.14, no cat, no edit.  Visually indistinguishable.
+
+#### Decision — RED, escalate to §5.5.16
+
+`QIE_MATMUL_CUBE_MATH=0` (F16-accumulator KEEP_DTYPE) on aclnnMm cube
+path is **not** the bug.  Flipping it to `ALLOW_FP32_DOWN_PRECISION`
+is byte-stable through the entire 20-step denoise + VAE decode at
+the latent level (mean Δ=0 in F32) and effectively byte-stable at the
+PNG level (mean Δ=0.006 / max=1 / 98.1% identical).
+
+Candidate (a) from §5.5.14 is **ruled out**.  Remaining candidates,
+re-priority-ordered:
+
+  1. **§5.5.16** — direct Python attention oracle vs native
+     `11_attn_out` (substep cos=0.48).  Loads F32 dumps of
+     `09_*_Q_rmsn`, `09_*_K_rmsn`, `08_*_V` and computes
+     `softmax(Q @ K.T / sqrt(HD)) @ V` in pure F32 numpy/torch.
+     Compare to native dump.  This isolates whether the FIA fused
+     kernel (softmax / scale / V-matmul) drifts vs an F32 reference,
+     or whether the substep-08 inputs themselves are wrong.
+  2. §5.5.17 — text-cond provenance (`txt_cond` magnitudes
+     min=-151.25 max=104.41 are suspiciously large).
+  3. §5.5.18 — RoPE pe-table joint-attention layout check.
+
+Now-ruled-out:
+  - QKV projection (§5.5.13 oracle, cos=1.000).
+  - Gate-allocator harness aliasing (§5.5.13 fix).
+  - F16-accumulator on aclnnMm cube (this step).
+
+#### Artefacts (this step)
+
+- `/tmp/qie_q45_step4_5515.log` (denoise stdout, 50 lines).
+- `/tmp/qie_5515_decode.log` (decode-only stdout).
+- `/tmp/qie_q45_step4_latent.f32.bin` (16384 F32, regenerated; stats
+  bit-identical to §5.5.14).
+- `/tmp/qie_5515_cube_math.png` (112125 B, 256x256 RGB).
+- Mac copies of all four under matching paths.
+
+No code changes — single env-flag re-run.
