@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from diffusers import QwenImageEditPlusPipeline
+from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
 from diffusers.pipelines.qwenimage import pipeline_qwenimage_edit_plus as qie_edit_plus
 from diffusers.pipelines.qwenimage.pipeline_output import QwenImagePipelineOutput
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import (
@@ -56,6 +56,30 @@ def summarize(values):
         "max_s": max(values),
         "total_s": sum(values),
     }
+
+
+def parse_module_list(value):
+    if value is None:
+        return None
+    modules = [item.strip() for item in value.split(",") if item.strip()]
+    return modules or None
+
+
+def build_torchao_fp8_config(backend, modules_to_not_convert):
+    from diffusers import TorchAoConfig
+    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8WeightOnlyConfig
+
+    if backend == "torchao-float8wo":
+        quant_type = Float8WeightOnlyConfig(weight_dtype=torch.float8_e4m3fn)
+    elif backend == "torchao-float8dq":
+        quant_type = Float8DynamicActivationFloat8WeightConfig(
+            activation_dtype=torch.float8_e4m3fn,
+            weight_dtype=torch.float8_e4m3fn,
+        )
+    else:
+        raise ValueError(f"Unsupported TorchAO FP8 backend: {backend}")
+
+    return TorchAoConfig(quant_type, modules_to_not_convert=modules_to_not_convert)
 
 
 def combine_cfg_conditioning(
@@ -387,6 +411,17 @@ def main():
     parser.add_argument("--no-cuda-int-prod-patch", action="store_true")
     parser.add_argument("--cfg-batching", action="store_true")
     parser.add_argument("--cfg-batching-no-mask-padding", action="store_true")
+    parser.add_argument(
+        "--fp8-backend",
+        choices=["none", "torchao-float8wo", "torchao-float8dq"],
+        default="none",
+        help="Optional FP8 quantization backend for the QwenImage transformer.",
+    )
+    parser.add_argument(
+        "--fp8-modules-to-not-convert",
+        default=None,
+        help="Comma-separated module name substrings to leave unquantized for TorchAO FP8.",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser()
@@ -399,11 +434,37 @@ def main():
     if not args.no_cuda_int_prod_patch:
         patch_cuda_integer_prod()
 
+    fp8_modules_to_not_convert = parse_module_list(args.fp8_modules_to_not_convert)
+
+    quantized_transformer = None
+    transformer_load_wall = None
+    if args.fp8_backend.startswith("torchao-"):
+        quantization_config = build_torchao_fp8_config(args.fp8_backend, fp8_modules_to_not_convert)
+        transformer_t0 = time.perf_counter()
+        quantized_transformer = QwenImageTransformer2DModel.from_pretrained(
+            args.model,
+            subfolder="transformer",
+            quantization_config=quantization_config,
+            torch_dtype=torch.bfloat16,
+            local_files_only=args.local_files_only,
+        )
+        transformer_t1 = time.perf_counter()
+        transformer_load_wall = transformer_t1 - transformer_t0
+        print(
+            f"FP8_TRANSFORMER_LOADED backend={args.fp8_backend} wall_s={transformer_load_wall:.6f} "
+            f"modules_to_not_convert={fp8_modules_to_not_convert}",
+            flush=True,
+        )
+
     t0 = time.perf_counter()
+    pipe_kwargs = {}
+    if quantized_transformer is not None:
+        pipe_kwargs["transformer"] = quantized_transformer
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         local_files_only=args.local_files_only,
+        **pipe_kwargs,
     )
     t1 = time.perf_counter()
     pipe.to("cuda")
@@ -423,6 +484,9 @@ def main():
         "guidance_scale": args.guidance_scale,
         "cfg_mode": "batched" if args.cfg_batching else "sequential",
         "cfg_batched_no_mask_padding": args.cfg_batching_no_mask_padding,
+        "fp8_backend": args.fp8_backend,
+        "fp8_modules_to_not_convert": fp8_modules_to_not_convert,
+        "fp8_transformer_load_wall_s": transformer_load_wall,
         "seed": args.seed,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,

@@ -267,3 +267,77 @@ Interpretation:
 Next:
 
 - Proceed to FP8 quantization and/or `torch.compile`; CFG batching alone is not enough to reverse the MLX M4 Max comparison.
+
+### Step 2 - FP8 Quantization
+
+Date: 2026-04-25 PDT
+
+Harness changes:
+
+- Added opt-in transformer FP8 loading to `tools/qwen_image_edit/cuda/bench_qie_diffusers.py` / remote `~/qie_cuda/src/bench_qie_diffusers.py`.
+- Flag: `--fp8-backend {none,torchao-float8wo,torchao-float8dq}`. Default remains BF16/no quantization.
+- `torchao-float8dq` loads only the QwenImage transformer through Diffusers `TorchAoConfig(Float8DynamicActivationFloat8WeightConfig(... e4m3fn ...))`.
+- `torchao-float8wo` loads only the QwenImage transformer through Diffusers `TorchAoConfig(Float8WeightOnlyConfig(weight_dtype=torch.float8_e4m3fn))`.
+- Optional flag: `--fp8-modules-to-not-convert` for future selective quantization sweeps.
+
+Environment/package findings:
+
+| Option | Result |
+|---|---|
+| TransformerEngine | BLOCKED. `transformer-engine[pytorch]` had no prebuilt wheel for `torch==2.13.0.dev20260424+cu130` on aarch64. Source build first failed under isolated build, then on missing cuDNN/NCCL include paths. After explicit venv NVIDIA include/lib paths, build succeeded only by force-reinstalling `torch==2.11.0`, which invalidated the Phase 1 comparison and still failed import after restoring nightly Torch due `libtransformer_engine.so: undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`. TE was uninstalled from the remote venv after receipts. |
+| bitsandbytes `0.49.2` | Installed/imports, but Diffusers `BitsAndBytesConfig` only exposes int8 plus FP4/NF4 4-bit paths; FP8 kwargs are ignored. Not a Step 2 FP8 candidate on this stack. |
+| Diffusers + TorchAO `0.17.0` | Works mechanically with `QwenImageTransformer2DModel.from_pretrained(..., quantization_config=TorchAoConfig(...))` and keeps Phase 1 Torch nightly intact. |
+
+Install/check receipts:
+
+- TE isolated install log: `~/qie_cuda/logs/phase2_fp8_te_install.log`
+- TE no-isolation install log: `~/qie_cuda/logs/phase2_fp8_te_install_noiso.log`
+- TE explicit cuDNN path install log: `~/qie_cuda/logs/phase2_fp8_te_install_cudnnpath.log`
+- TE explicit NVIDIA paths install log: `~/qie_cuda/logs/phase2_fp8_te_install_nvidia_paths.log`
+- Torch nightly restore log: `~/qie_cuda/logs/phase2_restore_torch_nightly.log`
+- bitsandbytes install log: `~/qie_cuda/logs/phase2_fp8_bnb_install.log`
+- TorchAO install log: `~/qie_cuda/logs/phase2_fp8_torchao_install.log`
+- Post-clean venv: `torch==2.13.0.dev20260424+cu130`, `torchvision==0.27.0.dev20260424+cu130`, `torchao==0.17.0`, `bitsandbytes==0.49.2`; TransformerEngine removed.
+
+256x256 / 2-step smokes:
+
+| Variant | Inference wall | Transformer calls | Transformer call mean | Grouped step mean | Peak allocated | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| Phase 0 BF16 smoke | 9.378 s | 4 | 1.808 s | 3.616 s | 55.859 GiB | Baseline smoke |
+| TorchAO FP8 dynamic act+weight | 10.835 s | 4 | 2.255 s | 4.509 s | 36.834 GiB | PASS mechanical, FAIL perf |
+| TorchAO FP8 weight-only | 15.507 s | 4 | 3.425 s | 6.849 s | 36.854 GiB | PASS mechanical, FAIL perf; canonical skipped |
+
+Canonical 1024x1024 / 20-step results:
+
+| Variant | True CFG? | Calls | Inference wall | Step / grouped mean | Transformer call mean | Peak allocated | Eye check | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Phase 1 BF16 baseline | Yes | 40 | 141.438 s | 6.926 s | 3.463 s | 57.970 GiB | PASS | Baseline |
+| TorchAO FP8 dynamic act+weight | Yes | 40 | 178.516 s | 8.809 s | 4.404 s | 38.943 GiB | PASS | FAIL perf, +26.2% slower |
+
+Receipts:
+
+- Dynamic FP8 smoke log: `~/qie_cuda/logs/phase2_fp8dq_smoke_256_2step.log`
+- Dynamic FP8 smoke metrics: `~/qie_cuda/logs/phase2_fp8dq_smoke_256_2step_metrics.json`
+- Dynamic FP8 smoke output: `~/qie_cuda/outputs/phase2_fp8dq_smoke_256_2step.png`
+- Dynamic FP8 canonical log: `~/qie_cuda/logs/phase2_fp8dq_1024_20step.log`
+- Dynamic FP8 canonical metrics: `~/qie_cuda/logs/phase2_fp8dq_1024_20step_metrics.json`
+- Dynamic FP8 canonical output: `~/qie_cuda/outputs/phase2_fp8dq_1024_20step.png`
+- Weight-only FP8 smoke log: `~/qie_cuda/logs/phase2_fp8wo_smoke_256_2step.log`
+- Weight-only FP8 smoke metrics: `~/qie_cuda/logs/phase2_fp8wo_smoke_256_2step_metrics.json`
+- Weight-only FP8 smoke output: `~/qie_cuda/outputs/phase2_fp8wo_smoke_256_2step.png`
+
+Visual gate:
+
+- TorchAO FP8 dynamic canonical output is a recognizable black-and-white cat and passes the eye check.
+- Pixel diff versus Phase 1: mean abs diff `[1.8057, 1.7782, 1.8004]`, RMSE `[2.1684, 2.1320, 2.1523]`.
+
+Interpretation:
+
+- TorchAO FP8 materially reduces PyTorch peak allocation by about 19.0 GiB (`57.970 -> 38.943 GiB`) and shortens cold `.to("cuda")` (`429.288 -> 94.373 s`) because the transformer weights are quantized before the device transfer.
+- The actual denoise loop is slower: transformer call mean regressed from `3.463 s` to `4.404 s`. Dynamic quant/dequant overhead dominates any Blackwell FP8 matmul win in this eager Diffusers path.
+- Weight-only FP8 is worse in the 256x256 smoke and should not be used for canonical latency. It is only useful as a memory reduction diagnostic.
+- Step 2 does not deliver the expected 30-50% wall reduction on this stack. Do not include FP8 in the performance stack unless a later `torch.compile` run flips the TorchAO dynamic path from slower to faster.
+
+Next:
+
+- Proceed to `torch.compile` with BF16 first. If BF16 compile is green, optionally retest `torchao-float8dq + torch.compile` as an interaction check, but FP8 alone is red.
