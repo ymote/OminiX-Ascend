@@ -3938,3 +3938,143 @@ order vs interleaved).
 - Native dumps consumed: `/tmp/qie_dumps_5516/{00_t_emb,04_img_LN1,05_img_mod1,06_txt_LN1,07_txt_mod1}.f32`.
 - Run log: substep cosines + verdict above.
 
+
+### §5.5.20 Step 4t — `time_text_embed` chain oracle vs native `00_t_emb` — TAUTOLOGY (§5.5.7+ bisect was on synthetic inputs)
+
+**Hypothesis under test.** §5.5.19 GREEN-B placed the drift origin
+upstream of mod1 — most likely the `time_text_embed` chain (sinusoidal
+→ linear_1 → silu → linear_2). The current `00_t_emb` absmax of 0.0999
+is ~1118x smaller than the §5.5.7 historical 111.8. Build a pure-F32
+numpy oracle of the chain and compare.
+
+**Setup.**
+`tools/probes/qie_t_emb_oracle/qie_t_emb_oracle.py` reconstructs the
+exact engine path from `image_diffusion_engine.cpp:5150-5223`:
+
+  1. `host_timestep_embedding_f32(t=sigma*1000, dim=256, max_period=10000)`
+     producing `[cos(arg_0..arg_127), sin(arg_0..arg_127)]`
+  2. F32 to F16 cast
+  3. `dispatch_matmul_(sinu, time_linear1.W^T, +b)` (BF16 weight from GGUF)
+  4. `aclnnSilu` in-place
+  5. `dispatch_matmul_(silu, time_linear2.W^T, +b)`
+
+QIE-Edit has **no `text_embedder`** — `time_text_embed` is just the
+timestep_embedder MLP. Weights `time_text_embed.timestep_embedder.linear_{1,2}.{weight,bias}`
+are stored as `BF16` (weight) and `F32` (bias) in the GGUF.
+
+Run came from `qie_q45_real_denoise_smoke` with `make_flow_sigmas(20)`,
+sigmas[0]=1.0, t_val = 1000.0 (FIRST denoise step).
+
+**Result — oracle absmax matches §5.5.7, native dump does not.**
+
+| metric                                        | value     |
+| :-------------------------------------------- | :-------- |
+| Native `00_t_emb` absmax                      | 0.09998   |
+| Oracle (engine `[cos|sin]`, t=1000) absmax    | **111.75** |
+| Oracle vs native cos                          | **0.0028** |
+| §5.5.7 historical absmax                      | 111.8     |
+
+The oracle reproduces the §5.5.7 historical magnitude exactly. Native
+dump is ~1118x smaller and uncorrelated.
+
+**Alt-config sweep — none recover a high cossim.**
+
+| config                                   | cos      | oracle absmax |
+| :--------------------------------------- | :------- | :------------ |
+| engine `[cos|sin]` t=1000 F16-RT         | 0.002769 | 1.118e+02     |
+| engine `[cos|sin]` t=1000 pure F32       | 0.002770 | 1.118e+02     |
+| HF `[sin|cos]` t=1000                    | 0.011630 | 7.425e+01     |
+| interleaved `[sin0,cos0,...]` t=1000     | 0.007508 | 1.309e+02     |
+| engine `[cos|sin]` t=999                 | 0.002516 | 1.149e+02     |
+| engine `[cos|sin]` t=1                   | 0.008465 | 2.730e+02     |
+| engine `[cos|sin]` t=950                 | 0.001507 | 1.766e+02     |
+| engine `[cos|sin]` t=500                 | 0.004670 | 3.720e+02     |
+
+No oracle config produces a small-magnitude t_emb. Yet the native dump
+*is* small. The mismatch is therefore **not in the chain math** — the
+chain isn't even being invoked on the native side.
+
+**Root cause — smoke harness injects synthetic random t_emb.**
+
+`tools/probes/qie_q45_real_denoise_smoke/test_qie_q45_real_denoise_smoke.cpp:301-310`:
+
+```cpp
+std::vector<uint16_t> t_emb_f16;
+fill_random_f16(t_emb_f16, (size_t)H, 0.1f, 0x4533ULL);  // <-- random, 0.1 scale
+void *t_emb_dev = upload_f16(t_emb_f16.data(), t_emb_f16.size());
+...
+eng.denoise_loop_test(x_dev, img_seq, ..., t_emb_dev, pe_dev, ...);
+```
+
+`denoise_loop_test` accepts `t_emb_f16_dev` as a pre-built parameter
+and **never executes the time_text_embed chain**. The native dump
+`00_t_emb.f32` therefore captures the synthetic random uniform-+/-0.1
+buffer, not a real timestep embedding. (`denoise_full_loop_test_` —
+not used by this smoke — *does* compute the chain, but no production
+run with `QIE_DUMP_BLOCK0_DIR=` has been captured against it.)
+
+**Step 7 reality check — 04 LN1 vs INDEPENDENT CPU reference.**
+
+```
+cos(/tmp/qie_dumps_5516/04_img_LN1.f32, /tmp/qie_block0_outputs/cpu_04_img_LN1.f32) = 1.000000
+max_abs_diff  = 4.88e-04
+mean_abs_diff = 1.50e-04
+```
+
+NOT a tautology — both are **independent** reconstructions of LN1
+given the same `00_img_hidden_in` and the same (synthetic) `00_t_emb`.
+LN1 does not consume t_emb so this just confirms native + CPU agree on
+LayerNorm.
+
+**Re-examination of §5.5.17 substep drift.** The 0.9859 / 0.9800 cos
+deltas between native and CPU at substeps 05/07 are **F16-vs-F32
+precision noise on a synthetic 0.1-scale t_emb**, not a real engine
+bug. Verified inline (script `/tmp/check_mod1_f16_vs_f32.py`):
+
+| comparison                                                | cos      |
+| :-------------------------------------------------------- | :------- |
+| pure-F32 numpy oracle on dummy t_emb vs native 05_img_mod1 | 1.000000 |
+| pure-F32 numpy oracle on dummy t_emb vs CPU `cpu_05_img_mod1` | **0.985875** |
+| native 05 vs CPU 05                                       | 0.985874 |
+| F16-RT oracle vs CPU 05                                   | 0.985875 |
+
+Both an F16-RT path and a pure-F32 numpy path give the *same* answer
+that disagrees with the ggml CPU reference. The drift therefore lives
+in the ggml CPU reference's mod1 split / modulate codepath
+(possibly Q5_K dequant convention or a chunk-axis interpretation
+difference), not in the native engine.
+
+**Verdict — GREEN-B + AMBER on the entire §5.5.7-onward bisect.**
+
+- The `time_text_embed` chain math is correct (oracle reproduces the
+  expected 111.8 magnitude).
+- The native engine never runs the chain in `qie_q45_real_denoise_smoke`.
+- All §5.5.14-onward "substep drift" measurements have used synthetic
+  random t_emb, comparing two implementations of mod1 against each other
+  on inputs that bear no relationship to a real denoise step.
+- The CPU ggml reference is the side that disagrees with both clean
+  F16-RT and clean F32 numpy mod1 paths. The 0.9859 cos is a CPU-side
+  artefact, not an Ascend-side bug.
+
+**Recommended next.**
+
+1. Re-dump from a real-pipeline harness that exercises
+   `denoise_full_loop_test_` (which does run the chain) — i.e. a
+   smoke test using `host_timestep_embedding_f32` + `time_linear{1,2}`.
+2. With real t_emb, re-run §5.5.17 substep cossim sweep against the
+   CPU reference. If 04 LN1 stays cos=1.000 and 05/07 mod1 jump back
+   to cos~1.000 too, the entire bisect-induced "drift origin" is a
+   ghost.
+3. If a real drift remains under real t_emb, re-investigate the CPU
+   ggml mod1 split convention before hunting an Ascend-side bug.
+
+**Artefacts.**
+
+- `tools/probes/qie_t_emb_oracle/qie_t_emb_oracle.py` — pure-F32
+  numpy oracle, sinusoidal + linear1 + silu + linear2 chain.
+- Native dumps consumed: `/tmp/qie_dumps_5516/00_t_emb.f32`.
+- Run log: oracle cos and alt-config sweep above.
+- Step-7 verification: `cos(native_04, cpu_04) = 1.000000` (true
+  GREEN, not tautology).
+- F16-vs-F32 mod1 reconstruction proof:
+  `/tmp/check_mod1_f16_vs_f32.py` (CPU ggml is the outlier, not native).
