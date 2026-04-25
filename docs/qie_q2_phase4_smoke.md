@@ -3494,3 +3494,130 @@ Now-ruled-out:
 - Mac copies of all four under matching paths.
 
 No code changes — single env-flag re-run.
+
+---
+
+### §5.5.16 Step 4o — Python F32 attention oracle vs native `11_attn_out` — GREEN-B (FIA kernel CORRECT)
+
+**Hypothesis under test.**  §5.5.14 substep bisect showed
+`11_attn_out_img cos=0.48`, `11_attn_out_txt cos=0.61` while substep-08
+QKV-projections cos≈1.000 and §5.5.15 ruled out the F16-cube
+accumulator.  The remaining suspects were: (A) FIA fused
+(`aclnnFusedInferAttentionScoreV2`) softmax / scale / V-matmul drift,
+or (B) one of substep-08 V / substep-09 RmsNorm / substep-10 RoPE
+producing wrong inputs to FIA.  Goal: build a pure-F32 numpy oracle
+that replays attention from the native engine's *own* Q/K/V dumps and
+cosine-compares to its own FIA output.  If `oracle ≈ native_fia` then
+FIA is innocent and the bug is upstream of FIA.
+
+**Setup.**  Re-ran `qie_q45_real_denoise_smoke` with
+`QIE_DUMP_BLOCK0_DIR=/tmp/qie_dumps_5516` and a 4-line patch to
+`image_diffusion_engine.cpp` adding F32 disk dumps for
+`10_{img,txt}_{Q,K}_rope.f32` (existed only as in-memory `intra_probe`s
+before this step).  All other dump call sites unchanged.  Block-0
+dumps captured: `08_*_V` (V-proj), `10_*_{Q,K}_rope`
+(RmsNorm+RoPE-applied Q/K, the actual FIA inputs), `11_attn_out_*`
+(raw FIA output, BEFORE `to_out_0` / `to_add_out`).
+
+Native attention path under test: default
+`QIE_ATTN_SOFTMAX_F32=0` — raw FIA scale=`1/sqrt(HD)`, no kv-scale
+trick, no post-mul.  This is the path the engine ships in §5.5.15.
+
+**Oracle.**
+`tools/probes/qie_attn_oracle/qie_attn_oracle.py`.
+
+  - Joint sequence layout: `[txt(32), img(64)]` concat on seq → S=96.
+  - Per-stream dumps reshape `[seq, NH=24, HD=128]` row-major (matches
+    BSND layout used in the FIA call).
+  - Compute in F64:
+    `scores = Q @ K.T * (1/sqrt(HD))` → softmax along last dim →
+    `out = scores @ V`.
+  - Cast back to F32 and cosine-compare element-wise to
+    `concat(11_attn_out_txt, 11_attn_out_img)`.
+
+**Result — GREEN-B.**
+
+| metric                                | value         |
+| :------------------------------------ | :------------ |
+| **global cos (oracle vs native FIA)** | **1.000000**  |
+| mean abs diff                         | 0.000121      |
+| max abs diff                          | 0.003809      |
+| oracle stats (mean abs / max abs)     | 1.0164 / 12.28 |
+| native stats (mean abs / max abs)     | 1.0164 / 12.28 |
+| per-stream cos (txt / img)            | 1.000 / 1.000 |
+| per-head cos (all 24 heads)           | 1.0000 (uniform) |
+| worst-3 heads                         | h15, h9, h1 — all 1.0000 |
+| best-3 heads                          | h14, h10, h3 — all 1.0000 |
+
+The FIA fused kernel reproduces, to F16-rounding precision (max abs
+diff ≈ 3.8e-3 on values up to 12.28, ratio ≈ 3e-4), the result of a
+pure-F32 numpy `softmax(Q·K^T/√HD)·V` over its own inputs.  Per-head
+cossim is uniform 1.0000 across all 24 heads — there is **no head
+that drifts**, no scale bug, no softmax dtype bug.
+
+**Decision matrix.**
+
+- **GREEN-A** (cos < 0.95): FIA kernel drift — RULED OUT by 1.000.
+- **AMBER**  (0.95 ≤ cos < 0.99): mixed — RULED OUT by 1.000.
+- **GREEN-B** (cos ≥ 0.99): **CONFIRMED.**  FIA is mathematically
+  correct given its inputs.  The §5.5.14 RED at substep 11 is
+  inherited from upstream — Q/K/V into FIA are themselves wrong.
+
+**Where the bug lives.**
+
+The substep-bisect already showed (§5.5.14 raw data):
+  - 04 LN1, 05 mod1, 06 txt_LN1, 07 txt_mod1: cos=1.000 ✓
+  - 08 Q/K/V: cos≈1.000 (§5.5.13 oracle) ✓
+  - 09 RmsNorm Q/K: not directly oracled
+  - 10 RoPE Q/K: not directly oracled
+  - 11 attn_out: cos=0.48 / 0.61 RED
+
+§5.5.16 collapses the 11 RED into its predecessors.  Remaining
+unchecked surfaces are:
+
+  - 09 RmsNorm — head-dim normalisation of Q and K.
+  - 10 RoPE — `pe`-table application to RmsNorm-Q/RmsNorm-K.
+  - V dumps may also drift between RmsNorm/RoPE since they pass
+    untouched through 09–10, but §5.5.13 oracle covered V at
+    substep 08 against an X·W^T+b reference; if 08 V was correct
+    and V is not modified between 08 and FIA, V is innocent.
+
+That leaves **RmsNorm** and **RoPE** on Q/K as the two prime
+suspects.
+
+**Recommended next step.**  Run **§5.5.18 — RoPE Q/K oracle**
+**before** §5.5.17 V-projection oracle, because:
+  - V is byte-identical from substep 08 to FIA input (no mutation).
+  - §5.5.13 oracle already validated 08_*_V projection cos≈1.000.
+  - Therefore V is exonerated; the divergence has to come from Q/K.
+  - RoPE is the more recent surface (§5.5.x had no RoPE oracle yet);
+    RmsNorm is simpler and can be oracled in the same probe.
+
+§5.5.18 plan: read `09_*_Q_rmsnorm.f32` and `10_*_Q_rope.f32`,
+recompute RoPE in numpy from a known `pe`-table (rebuilt from the
+QIE-Edit RoPE config — img stream `pe_off = max_txt_seq`, txt stream
+`pe_off = 0`), cosine-compare numpy RoPE-Q vs native `10_Q_rope`.
+Symmetric for K.  If cos < 0.99 → RoPE is the bug.  Likely
+suspects: pe-offset wrong, axes split wrong, half-rotation sign
+flip, or per-axis-dim allocation mismatch.
+
+**Artefacts (this step).**
+
+- `/tmp/qie_dumps_5516/` — full block-0 dump set incl. new
+  `10_{img,txt}_{Q,K}_rope.f32` (4 × 0.38–0.75 MiB).
+- `tools/probes/qie_attn_oracle/qie_attn_oracle.py` — oracle script.
+- 4-line patch to `image_diffusion_engine.cpp` adding `dump_tensor_f32`
+  calls for `10_*_rope`.  Patch is gated by the same
+  `QIE_DUMP_BLOCK0_DIR` env-var that gates all other block-0 dumps —
+  zero perf impact when disabled.
+
+**Now-ruled-out.**
+
+  - FIA fused kernel softmax / scale / V-matmul (this step).
+  - F16-cube accumulator on aclnnMm (§5.5.15).
+  - QKV projection (§5.5.13).
+  - Gate-allocator harness aliasing (§5.5.13).
+
+**Net direction.**  Substep-bisect search has narrowed from 24
+intermediate substeps down to 2: **09 RmsNorm** + **10 RoPE** on
+Q/K.  Next probe (§5.5.18) closes one of those two.

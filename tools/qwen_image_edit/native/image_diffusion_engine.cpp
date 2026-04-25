@@ -3509,6 +3509,18 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 img_seq * H, true);
     intra_probe("10_txt_Q_rope", scratch_q_dev_, txt_seq * H, true);
     intra_probe("10_txt_K_rope", scratch_k_dev_, txt_seq * H, true);
+    // Q2.4.5.5.16: F32 disk dumps of RoPE-applied Q/K so the
+    // numpy attention oracle can use the actual FIA inputs.
+    dump_tensor_f32("10_img_Q_rope.f32",
+                     offset_rows(scratch_q_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("10_img_K_rope.f32",
+                     offset_rows(scratch_k_dev_, txt_seq),
+                     img_seq * H, /*is_f16*/ true);
+    dump_tensor_f32("10_txt_Q_rope.f32", scratch_q_dev_, txt_seq * H,
+                     /*is_f16*/ true);
+    dump_tensor_f32("10_txt_K_rope.f32", scratch_k_dev_, txt_seq * H,
+                     /*is_f16*/ true);
 
     // ------------------------------------------------------------------
     // 6. Joint attention via aclnnFusedInferAttentionScoreV2.
