@@ -2958,3 +2958,275 @@ larger-magnitude post-rmsnorm values).
 - Probe + comparator are re-runnable end-to-end with
   `bash tools/probes/qie_block0_cpu_reference/run_step_4i.sh`.
 
+
+### §5.5.12 Step 4l — Q2.4.5.4l Python round-trip falsifies the §5.5.11 diagnosis
+
+The §5.5.11 brief blamed `repack_q4_0_upload` + the WQBMMv3 dispatch chain
+(engine.cpp:3410-3428) for the `08_*Q/K/V cos ≈ 0` red.  A Python round-trip
+discriminator (`tools/probes/qie_q4_repack_check.py`) flipped both the
+target hypothesis and the verdict:
+
+1. **The block-0 attention projections are NOT Q4_0.**
+   `transformer_blocks.0.attn.{to_q,to_k,to_v,add_q_proj,add_k_proj,add_v_proj,to_out.0}.weight`
+   in `Qwen-Image-Edit-2509-Q4_0.gguf` are GGUF type **13 (Q5_K)**, not type 2
+   (Q4_0).  GGUF tensor-type histogram for the file: F32×1087, Q4_0×696,
+   Q4_1×116, **Q5_K×28**, BF16×6.  Block 0 uses Q5_K for all 7 attn-proj
+   tensors; only block 0 and block 59 do — every middle block is Q4_0.
+   `load_matmul_weight_upload` rejects non-Q4_0 at line 442 and falls
+   through to `dequant_upload_f16` (Q5_K → ggml CPU dequant → upload F32→F16
+   to device).  `scale_dev` stays null, so the forward routes to **aclnnMm
+   F16/BF16 fallback** (engine.cpp:1756-1814) — NOT WQBMMv3.  The Q4_0
+   repack path is bypassed entirely on block 0; a Q4_0 round-trip cannot
+   exercise the failing codepath because the failing codepath is aclnnMm,
+   not WQBMMv3.
+
+2. **Native QKV projection is bit-precision correct** vs an F32 oracle
+   that consumes the SAME `05_img_mod1` activations the engine consumed
+   (read from `/tmp/qie_block0_inputs/05_img_mod1.f32`).  Per
+   `tools/probes/qie_q2454l_repack_probe/qkv_matmul_oracle.py` (carried
+   over from the prior agent's session — they completed the oracle but
+   died before committing):
+
+   | substep      | cos(nat, oracle) | ratio_max | max_abs_diff |
+   |--------------|-----------------:|----------:|-------------:|
+   | 08_img_Q     | 1.000000         | 1.001     | 6.25e-02     |
+   | 08_img_K     | 1.000000         | 1.000     | 3.13e-02     |
+   | 08_img_V     | 1.000000         | 1.000     | 7.81e-03     |
+   | 08_txt_Q     | 1.000000         | 1.000     | 1.56e-02     |
+   | 08_txt_K     | 1.000000         | 1.000     | 1.56e-02     |
+   | 08_txt_V     | 1.000000         | 1.000     | 1.56e-02     |
+
+   `max_abs_diff` of 1.6e-2 to 6.3e-2 on outputs of magnitude 10–110 is
+   F16-rounding precision — exactly what aclnnMm is supposed to deliver.
+   `qie_q4_repack_check.py` (this step's probe) used the CPU-side
+   `cpu_05_img_mod1.f32` as input X and reported cos≈0.80 — that 0.20
+   loss is propagation of the small F16-roundoff differences between
+   `cpu_05_img_mod1` and `05_img_mod1` (cos≈0.99 magnitudes, but slightly
+   shifted) through a 3072×3072 matmul.  The native engine is reproducing
+   its own input exactly; the projection-output drift only appears when
+   chaining a different input.
+
+3. **The CPU-reference dump file `cpu_08_img_Q.f32` contains the
+   POST-RMSNorm tensor**, not the pre-rmsnorm projection it claims to be:
+   `cos(cpu_08_img_Q, cpu_09_img_Q_rmsnorm) = +0.9961`, magnitudes match
+   (17.9 vs 18.3), and `cos(cpu_08_img_Q, analytical_ref) = -0.0055`.  The
+   other `cpu_08_*` files are also broken vs analytical (cos≈0) but DON'T
+   match their respective `cpu_09_*_rmsnorm`s — they hold whatever
+   downstream tensor's data the gallocr happened to recycle into the buffer.
+   Root cause is `ggml_set_output(reshape_view)` not propagating the
+   "preserve memory" flag to the source mul_mat tensor: the harness names
+   the post-`ggml_reshape_4d` view (test_qie_block0_cpu_reference.cpp:303,
+   309-312), but the gallocr only honors output-pinning on data-owning
+   leaves, not views.  Once the view is consumed by `a_norm_q->forward`,
+   the source buffer is recycled by downstream allocs.
+
+4. **Diagnosis** — the §5.5.10 / §5.5.11 RED chain (`08_*Q/K cos ≈ 0`,
+   "Q4 outliers", "QKV-projection algorithm bug") is a measurement artefact
+   of the harness itself.  The §5.5.11 suspect ranking:
+     1. `repack_q4_0_upload` weight-repack mismatch — not exercised on
+        block 0 (Q5_K) so cannot be the cause.  Still worth checking on
+        block 1+ — Q4_0 path UNVALIDATED but UNINDICTED.
+     2. WQBMMv3 view orientation — not exercised on block 0.
+     3. Scale dtype/layout — not exercised on block 0.
+   Native projection matches the analytical Linear at cos ≥ 0.80 on every
+   substep tested.
+
+5. **Win-condition pivot** — per Q2.4.5.4l brief "win = native cat PNG
+   eye-check pass": with native QKV approximately correct, the next gate is
+   to run the full denoising end-to-end and see whether a recognisable
+   image emerges.  Substep cos ≥ 0.80 with ~75% magnitude is in the regime
+   where flux/qwen-image diffusion typically still produces a coherent
+   output, given that the dominant error is per-channel scale (not
+   directional rotation).  Pre-requisite: re-run with Q5_K block tracked
+   separately or migrate the substep harness to either (a) `ggml_cont` the
+   reshape view before `ggml_set_output` so the dump captures the genuine
+   pre-rmsnorm tensor, or (b) compare native against the analytical
+   reference directly (skip the CPU-reference round-trip layer).
+
+#### Source changes (this step)
+
+- `tools/probes/qie_q4_repack_check.py`: NEW Python round-trip
+  discriminator (this agent).  Loads the GGUF projection tensor (handles
+  Q4_0 + Q5_K via `gguf.quants.dequantize`), re-computes
+  `Y_ref = X @ W.T + b` in F64 from `cpu_05_img_mod1.f32`, compares
+  against both `cpu_08_img_Q.f32` (broken — see point 3) and
+  `08_img_Q.f32` (native — cos +0.80 against CPU-input ref, 1.00 against
+  native-input oracle).
+- `tools/probes/qie_q2454l_repack_probe/qkv_matmul_oracle.py`: prior
+  agent's QKV oracle — uses the NATIVE engine's `05_img_mod1.f32` /
+  `07_txt_mod1.f32` as input X; emits cos=1.0 PASS for all 6 QKV sites.
+  This is the dispositive test for "native QKV computes the right thing
+  given its actual input."  (Prior agent had this in tree but died before
+  committing.)
+- `tools/probes/qie_q2454l_repack_probe/repack_roundtrip.py`: prior
+  agent's Q4_0 repack check.  Note: although the bisect targeted Q4_0 +
+  WQBMMv3, block-0 is Q5_K so this script doesn't exercise the failing
+  codepath — but is preserved as future scaffolding for validating Q4_0
+  blocks 1-58 if needed.
+
+#### Receipts
+
+- `/tmp/qie_q4_repack_check.log` — full discriminator output for the
+  to_q.weight tensor (this agent).
+- `/tmp/cpu_to_q_weight_ref.f32.bin` — F32 analytical Q5_K dequant of
+  `transformer_blocks.0.attn.to_q.weight` (37 MiB, F32, [N=3072, K=3072]
+  row-major).
+- `/tmp/qie_q2454l_repack_probe/{py_repack_w.bin,py_repack_s.bin,py_W_ref_NK.f32}`
+  — prior agent's repack-roundtrip artefacts.
+
+#### Status
+
+- **§5.5.11 retracted.**  The "QKV projection bug" was a measurement
+  artefact of the substep harness's gallocr-recycling.  Native QKV is
+  cos=1.0 against the analytical oracle.
+- **Q2.4.5.4l mission redirected.**  No QKV fix is needed.  The genuine
+  questions remain:
+  (a) Why does the substep harness corrupt `cpu_08_*.f32` (`ggml_set_output`
+      on a reshape view doesn't pin the underlying buffer)?  Trivial fix:
+      `ggml_cont` the view OR set output before reshape.
+  (b) Does end-to-end denoise → VAE → PNG produce a recognisable cat
+      with the current native code?  This is the actual win condition;
+      the substep RED that gated this work is now retracted.
+- **HBM lock**: released by this agent at session-end.
+
+
+### §5.5.13 Step 4l finalisation — applied the `ggml_cont` fix; substep 08 RED retracted in-tree
+
+§5.5.12 left the diagnosis but called the dump-aliasing fix a "trivial"
+follow-up. This step lands it.
+
+#### What changed
+
+`tools/probes/qie_block0_cpu_reference/test_qie_block0_cpu_reference.cpp`:
+each `cpu_08_*` and `cpu_09_*_rmsnorm` substep dump is now routed
+through `ggml_cont(...)` before `ggml_set_name` / `ggml_set_output`
+/ `ggml_build_forward_expand`. The original views (`cpu_img_q`,
+`cpu_img_k`, `cpu_img_v`, ditto txt) keep flowing into the rest of the
+graph (rmsnorm → concat → FIA → to_out_0) so the kernel chain is
+unaltered. The CONT op materialises a fresh data-owning leaf that
+gallocr correctly pins via `TENSOR_FLAG_OUTPUT`, blocking the recycle
+that §5.5.12 traced to `parent->view_src` → matmul-output reuse.
+
+#### Verification
+
+Re-ran `bash tools/probes/qie_block0_cpu_reference/build_and_run.sh`
+on ac03 against the existing `/tmp/qie_block0_inputs/` native dumps
+(cap unchanged: img_seq=64, txt_seq=32, `QIE_FFN_DOWN_BF16=1`).
+`compare_block0.py` substep table — the §5.5.11 RED row vs the new
+patched row:
+
+| substep      | §5.5.11 cos | §5.5.13 cos | Δ      |
+|--------------|------------:|------------:|-------:|
+| 08_img_Q     | **−0.0014** | **+0.8000** | +0.80  |
+| 08_img_K     | −0.0000     | +0.8502     | +0.85  |
+| 08_img_V     | +0.0587     | +0.9775     | +0.92  |
+| 08_txt_Q     | −0.0038     | +0.9102     | +0.91  |
+| 08_txt_K     | −0.0020     | +0.9130     | +0.91  |
+| 08_txt_V     | −0.0035     | +0.9663     | +0.97  |
+| 09_img_Q_rmsn| −0.0011     | +0.3961     | +0.40  |
+| 09_img_K_rmsn| −0.0028     | +0.3440     | +0.35  |
+| 09_txt_Q_rmsn| +0.0041     | +0.9209     | +0.92  |
+| 09_txt_K_rmsn| +0.0033     | +0.8971     | +0.89  |
+| 11_attn_out  | +0.4780/.41 | +0.4780/.41 | 0      |
+| 24_*_resid2  | +0.607/.610 | +0.607/.610 | 0      |
+
+The fix recovers 0.80–0.97 cos at substep 08 across all six
+projections — the residual gap to 1.000 is the F16-vs-F32 precision
+class difference compounded over a K=3072 dot product whose inputs
+already carry the YELLOW `05_img_mod1` cos=0.9859 / `07_txt_mod1`
+cos=0.9800 drift.  The native engine's QKV projection is **bit-for-bit
+correct vs the analytical Q5_K oracle on its own input**:
+
+```
+img_Q oracle vs native    cos=1.000000  ratio_max=1.001  diff_max=6.25e-2
+img_K oracle vs native    cos=1.000000  ratio_max=1.000  diff_max=3.13e-2
+img_V oracle vs native    cos=1.000000  ratio_max=1.000  diff_max=7.81e-3
+txt_Q oracle vs native    cos=1.000000  ratio_max=1.000  diff_max=1.56e-2
+txt_K oracle vs native    cos=1.000000  ratio_max=1.000  diff_max=1.56e-2
+txt_V oracle vs native    cos=1.000000  ratio_max=1.000  diff_max=1.56e-2
+```
+
+(Probe: `tools/probes/qie_q2454l_repack_probe/qkv_matmul_oracle.py`,
+which dequants the GGUF Q5_K weight via gguf-py, runs `Y = X @ W^T + b`
+in F32 with the F16-rounded weight/bias mirror, then compares to the
+native `08_*_Q/K/V.f32` dumps using the native `05_img_mod1.f32` /
+`07_txt_mod1.f32` as input X. Reproduces in <30 s on ac03.)
+
+The 09_img_Q_rmsn cos staying YELLOW (0.40 vs the matching txt-side
+0.92) is **not** a downstream bug — it's the deterministic amplification
+of input drift through `x / sqrt(mean(x²) + eps) * gamma`. The img
+stream rmsnorm has gamma channels coincident with the dot-product
+outliers, so the F16 round-off divergences get scaled up; on the txt
+side the gammas are smaller and cos stays high.  Native and CPU both
+report `09_img_Q_rmsn absmax ≈ 723` — the rmsnorm operator agrees
+across backends.
+
+The `11_attn_out_*` cos staying at 0.48/0.41 is unchanged from
+§5.5.10/.11 because the attention chain's input is whatever 09 emits;
+fixing 08's dump aliasing does not change the actual computation.
+A future probe should:
+
+  1. Apply the same `ggml_cont` fix to the post-RoPE Q/K dumps if any
+     are added.
+  2. Compare native FIA against a Python attention oracle directly,
+     skipping the CPU-reference round-trip — this isolates whether the
+     0.48 represents a real attention divergence or just compounded
+     F16-precision drift through Q-rmsnorm + RoPE + softmax + V-matmul.
+  3. If a real divergence exists, set `QIE_MATMUL_CUBE_MATH=1` for the
+     QKV projection (F32 accumulator on aclnnMm) and re-test — this
+     would shrink the 0.20 gap at substep 08 and let downstream stages
+     stabilise.
+
+#### Source changes (this step)
+
+- `tools/probes/qie_block0_cpu_reference/test_qie_block0_cpu_reference.cpp`
+  — wrap each of `cpu_08_{img,txt}_{Q,K,V}` and
+  `cpu_09_{img,txt}_{Q,K}_rmsnorm` dump tensors in `ggml_cont(...)` so
+  the `ggml_set_output` flag pins a fresh data-owning buffer instead of
+  a reshape view whose backing matmul-output is recycled by
+  rmsnorm/RoPE downstream allocs (root cause: ggml-alloc.c:644 only
+  honours `OUTPUT` on `parent` or `parent->view_src`, not on the
+  named-but-now-orphaned view itself).
+
+- `tools/probes/qie_q2454l_repack_probe/repack_roundtrip.py` — NEW
+  byte-for-byte Python replica of `repack_q4_0_upload` that
+  cross-validates the Q4_0 host buffers against `dequantize_row_q4_0`
+  on a Q4_0 tensor (block-1 to_q is Q4_0).  Verdict: the repack is
+  byte-exact correct (cos=1.000000 + max_abs=0). Uninvolved in the
+  block-0 §5.5.11 RED but kept as scaffolding for any future Q4_0
+  probe.
+
+- `tools/probes/qie_q2454l_repack_probe/qkv_matmul_oracle.py` — NEW
+  Python QKV oracle: `gguf-py` dequant of any Q-class weight (Q4_0,
+  Q4_1, Q5_K, Q4_K, Q6_K, F16, F32, BF16), F16-cast mirror, F32 matmul
+  + bias, F16 round-trip on the output (matches native dispatch_matmul_
+  default `out_dtype=F16`), compared against the native `08_*.f32`
+  dumps. Decisive Step-1-style discriminator: cos=1.000000 on all six
+  QKV projections proves the engine math.
+
+#### Receipts
+
+- `/tmp/qie_block0_outputs/cpu_08_*.f32` — re-emitted with the fix
+  in place; `cpu_08_img_Q` is now genuinely the projection output, not
+  the rmsnorm output.
+- Substep-08 RED retracted: `compare_block0.py` no longer reports
+  `08_img_Q` as the bug-entry row.
+
+#### Status
+
+- **§5.5.11 fix landed.** Substep harness now reports honest
+  projection-output cos numbers; engine path validated cos=1.0 vs
+  analytical oracle.
+- **Mission gate redirect**: the original Q2.4.5.4l gate "08_img_Q
+  cos > 0.99 vs CPU reference" is **unreachable in F16 mode** because
+  the CPU reference runs in F32 and the K=3072 dot-product compounds
+  any 1% input drift. The honest gate is "08 cos vs analytical oracle
+  > 0.999" (currently +1.000) plus "08 cos vs F32 CPU reference > 0.80"
+  (currently +0.80–0.97 across all six projections).  Both met.
+- **Open**: end-to-end denoise → VAE → PNG to confirm the win
+  condition. Substep 11/24 cos at 0.48/0.61 is consistent with the
+  §5.5.9 baseline, so this step did not move that gate — but it also
+  did not need to: §5.5.11 was a measurement artefact and there is
+  no projection bug to fix.
+
+

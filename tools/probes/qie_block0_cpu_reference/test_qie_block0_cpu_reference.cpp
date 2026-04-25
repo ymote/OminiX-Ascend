@@ -306,25 +306,48 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
         auto cpu_img_v = a_to_v->forward(ctx, img_modulated);
         cpu_img_v      = ggml_reshape_4d(ctx->ggml_ctx, cpu_img_v, dim_head_attn, cpu_num_heads, n_img_tok, Nb);
 
-        ggml_set_name(cpu_img_q, "cpu_08_img_Q");
-        ggml_set_name(cpu_img_k, "cpu_08_img_K");
-        ggml_set_name(cpu_img_v, "cpu_08_img_V");
-        ggml_set_output(cpu_img_q);
-        ggml_set_output(cpu_img_k);
-        ggml_set_output(cpu_img_v);
-        ggml_build_forward_expand(gf, cpu_img_q);
-        ggml_build_forward_expand(gf, cpu_img_k);
-        ggml_build_forward_expand(gf, cpu_img_v);
+        // Q2.4.5.4l: dump-into-fresh-buffer fix. The original probe set
+        // ggml_set_output() on the reshape *view* of the matmul output. The
+        // gallocr only protects the view's own buffer record, but the
+        // matmul-output buffer (which the view aliases) is reused for the
+        // downstream rmsnorm output — silently overwriting the captured QKV
+        // values with rmsnorm output. Empirically:
+        //   cos(cpu_08_img_Q dump, cpu_09_img_Q_rmsnorm dump) ≈ 0.996
+        // i.e. the §5.5.11 RED at 08_img_Q (cos=-0.0014 vs native) was a
+        // CPU-reference dump artefact, NOT an engine bug. Native engine's
+        // 08_img_Q matches a Python ground-truth oracle (X @ W^T + b on the
+        // gguf-py-dequantized Q5_K weight) at cos=1.000000.
+        //
+        // Fix: route each 08_*_Q/K/V dump through ggml_cont, which materialises
+        // a fresh dedicated buffer for the dump. The downstream chain
+        // (rmsnorm, concat, FIA, to_out_0) keeps consuming the original view
+        // so kernel correctness is unchanged.
+        auto cpu_08_img_q_dump = ggml_cont(ctx->ggml_ctx, cpu_img_q);
+        auto cpu_08_img_k_dump = ggml_cont(ctx->ggml_ctx, cpu_img_k);
+        auto cpu_08_img_v_dump = ggml_cont(ctx->ggml_ctx, cpu_img_v);
+        ggml_set_name(cpu_08_img_q_dump, "cpu_08_img_Q");
+        ggml_set_name(cpu_08_img_k_dump, "cpu_08_img_K");
+        ggml_set_name(cpu_08_img_v_dump, "cpu_08_img_V");
+        ggml_set_output(cpu_08_img_q_dump);
+        ggml_set_output(cpu_08_img_k_dump);
+        ggml_set_output(cpu_08_img_v_dump);
+        ggml_build_forward_expand(gf, cpu_08_img_q_dump);
+        ggml_build_forward_expand(gf, cpu_08_img_k_dump);
+        ggml_build_forward_expand(gf, cpu_08_img_v_dump);
 
         cpu_img_q = a_norm_q->forward(ctx, cpu_img_q);
         cpu_img_k = a_norm_k->forward(ctx, cpu_img_k);
 
-        ggml_set_name(cpu_img_q, "cpu_09_img_Q_rmsnorm");
-        ggml_set_name(cpu_img_k, "cpu_09_img_K_rmsnorm");
-        ggml_set_output(cpu_img_q);
-        ggml_set_output(cpu_img_k);
-        ggml_build_forward_expand(gf, cpu_img_q);
-        ggml_build_forward_expand(gf, cpu_img_k);
+        // Q2.4.5.4l: dump via ggml_cont so the named output goes into a fresh
+        // buffer that gallocr will not reuse for downstream RoPE / FIA outputs.
+        auto cpu_09_img_q_dump = ggml_cont(ctx->ggml_ctx, cpu_img_q);
+        auto cpu_09_img_k_dump = ggml_cont(ctx->ggml_ctx, cpu_img_k);
+        ggml_set_name(cpu_09_img_q_dump, "cpu_09_img_Q_rmsnorm");
+        ggml_set_name(cpu_09_img_k_dump, "cpu_09_img_K_rmsnorm");
+        ggml_set_output(cpu_09_img_q_dump);
+        ggml_set_output(cpu_09_img_k_dump);
+        ggml_build_forward_expand(gf, cpu_09_img_q_dump);
+        ggml_build_forward_expand(gf, cpu_09_img_k_dump);
 
         auto cpu_txt_q = a_add_q_proj->forward(ctx, txt_modulated);
         cpu_txt_q      = ggml_reshape_4d(ctx->ggml_ctx, cpu_txt_q, dim_head_attn, cpu_num_heads, n_txt_tok, Nb);
@@ -333,25 +356,32 @@ struct Block0CpuRunner : public Qwen::QwenImageRunner {
         auto cpu_txt_v = a_add_v_proj->forward(ctx, txt_modulated);
         cpu_txt_v      = ggml_reshape_4d(ctx->ggml_ctx, cpu_txt_v, dim_head_attn, cpu_num_heads, n_txt_tok, Nb);
 
-        ggml_set_name(cpu_txt_q, "cpu_08_txt_Q");
-        ggml_set_name(cpu_txt_k, "cpu_08_txt_K");
-        ggml_set_name(cpu_txt_v, "cpu_08_txt_V");
-        ggml_set_output(cpu_txt_q);
-        ggml_set_output(cpu_txt_k);
-        ggml_set_output(cpu_txt_v);
-        ggml_build_forward_expand(gf, cpu_txt_q);
-        ggml_build_forward_expand(gf, cpu_txt_k);
-        ggml_build_forward_expand(gf, cpu_txt_v);
+        // Q2.4.5.4l: same dump-into-fresh-buffer fix as the img-side block above.
+        auto cpu_08_txt_q_dump = ggml_cont(ctx->ggml_ctx, cpu_txt_q);
+        auto cpu_08_txt_k_dump = ggml_cont(ctx->ggml_ctx, cpu_txt_k);
+        auto cpu_08_txt_v_dump = ggml_cont(ctx->ggml_ctx, cpu_txt_v);
+        ggml_set_name(cpu_08_txt_q_dump, "cpu_08_txt_Q");
+        ggml_set_name(cpu_08_txt_k_dump, "cpu_08_txt_K");
+        ggml_set_name(cpu_08_txt_v_dump, "cpu_08_txt_V");
+        ggml_set_output(cpu_08_txt_q_dump);
+        ggml_set_output(cpu_08_txt_k_dump);
+        ggml_set_output(cpu_08_txt_v_dump);
+        ggml_build_forward_expand(gf, cpu_08_txt_q_dump);
+        ggml_build_forward_expand(gf, cpu_08_txt_k_dump);
+        ggml_build_forward_expand(gf, cpu_08_txt_v_dump);
 
         cpu_txt_q = a_norm_added_q->forward(ctx, cpu_txt_q);
         cpu_txt_k = a_norm_added_k->forward(ctx, cpu_txt_k);
 
-        ggml_set_name(cpu_txt_q, "cpu_09_txt_Q_rmsnorm");
-        ggml_set_name(cpu_txt_k, "cpu_09_txt_K_rmsnorm");
-        ggml_set_output(cpu_txt_q);
-        ggml_set_output(cpu_txt_k);
-        ggml_build_forward_expand(gf, cpu_txt_q);
-        ggml_build_forward_expand(gf, cpu_txt_k);
+        // Q2.4.5.4l: same dump-into-fresh-buffer fix.
+        auto cpu_09_txt_q_dump = ggml_cont(ctx->ggml_ctx, cpu_txt_q);
+        auto cpu_09_txt_k_dump = ggml_cont(ctx->ggml_ctx, cpu_txt_k);
+        ggml_set_name(cpu_09_txt_q_dump, "cpu_09_txt_Q_rmsnorm");
+        ggml_set_name(cpu_09_txt_k_dump, "cpu_09_txt_K_rmsnorm");
+        ggml_set_output(cpu_09_txt_q_dump);
+        ggml_set_output(cpu_09_txt_k_dump);
+        ggml_build_forward_expand(gf, cpu_09_txt_q_dump);
+        ggml_build_forward_expand(gf, cpu_09_txt_k_dump);
 
         auto cpu_q_joint = ggml_concat(ctx->ggml_ctx, cpu_txt_q, cpu_img_q, 2);
         auto cpu_k_joint = ggml_concat(ctx->ggml_ctx, cpu_txt_k, cpu_img_k, 2);
