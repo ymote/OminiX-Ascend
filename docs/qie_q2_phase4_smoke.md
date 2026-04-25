@@ -3621,3 +3621,87 @@ flip, or per-axis-dim allocation mismatch.
 **Net direction.**  Substep-bisect search has narrowed from 24
 intermediate substeps down to 2: **09 RmsNorm** + **10 RoPE** on
 Q/K.  Next probe (§5.5.18) closes one of those two.
+
+## §5.5.18 — RoPE Q/K oracle vs native `10_*_rope` — **GREEN-B (RoPE FINE)**
+
+**Goal.**  Continue the §5.5.16 bisect.  §5.5.16 cleared FIA (kernel
+cos = 1.000000 vs F32 numpy oracle on the actual native Q/K/V FIA
+inputs).  §5.5.13 cleared V (cos ≈ 1.000 from substep 08).  Two
+suspects remain on the Q/K path: 09 RmsNorm and 10 RoPE.  This
+substep closes RoPE.
+
+**Method.**  Pure-F32 numpy oracle reading native `09_*_rmsnorm.f32`
+as inputs and re-applying the engine's 3D-axial RoPE.  Compared
+against native `10_*_rope.f32` dumps in `/tmp/qie_dumps_5516/`.
+
+**Engine RoPE contract** (verified in
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp` lines
+461-720 + 2593-2725):
+
+- 3D-axial: `head_dim=128` split into `axes_t=16, axes_h=56, axes_w=56`
+  contiguous pair groups (8 + 28 + 28 = 64 pairs = HD/2). ✓ contract.
+- `theta = 10000` (`cfg.rope_theta` default — NOT 1e6).
+- Pair convention is **interleaved** (NOT NEOX-half-rotation).  pe-table
+  layout `[pos, d_pair, 2, 2]` with rows `[cos, -sin]` / `[sin, cos]`.
+  Application:
+    `y[..., 2dp]   = x_even * cos + x_odd  * sin`
+    `y[..., 2dp+1] = x_odd  * cos - x_even * sin`
+- Per-axis omega: `linspace(0, (d-2)/d, d/2)`; `omega[i] = 1/theta^scale`.
+- Position IDs:
+  - txt diagonal: `t = h = w = TXT_START + i` where
+    `TXT_START = max(h_len, w_len) = 64` (per `gen_qwen_image_ids`).
+  - img: `t=0`, `h_id = -h_len/2 + r`, `w_id = -w_len/2 + c`,
+    row-major over `(r, c) ∈ [0,h_len)×[0,w_len)`.
+  - pe-table built once with `h_len = w_len = sqrt(max_img_seq) = 64`,
+    so `H_START = W_START = -32`.  Engine indexes only the first
+    `img_seq` pe rows for img.
+
+**Result (interleaved, primary config — table below).**
+
+| stream | Q cos      | K cos      |
+|--------|------------|------------|
+| txt    | 1.000000   | 1.000000   |
+| img    | 1.000000   | 1.000000   |
+| joint  | **1.000000** | **1.000000** |
+
+Per-head `img_Q` cos uniform 1.000000 across all 24 heads.
+Per-pos `img_Q` worst-3 = 1.000000 (no outlier positions).
+txt_Q identical: per-head min = max = 1.000000.
+
+The numpy oracle reproduces the native `10_*_rope` dumps to F32
+machine precision when fed the native `09_*_rmsnorm` dumps and
+the engine's documented RoPE contract.
+
+**Verdict.**  **GREEN-B — RoPE is BIT-ACCURATE.**  Bug is **upstream
+in 09 RmsNorm on Q/K**, OR earlier (08 V was already cleared by
+§5.5.13).  Since V passes from 08 but Q/K fail by 11, and RoPE is now
+cleared, the only remaining suspect on the Q/K path is the 09 Q-RmsNorm
+and 09 K-RmsNorm on the post-projection tensors.
+
+**Now-ruled-out (cumulative).**
+
+  - 3D-axial RoPE pe-table construction (this step).
+  - Interleave pair-rotation kernel (this step).
+  - Pe-offset alignment for txt vs img streams (this step).
+  - FIA fused kernel softmax / scale / V-matmul (§5.5.16).
+  - F16-cube accumulator on aclnnMm (§5.5.15).
+  - QKV projection — V matched at 08 (§5.5.13).
+
+**Net direction.**  Bisect search has narrowed from 24 intermediate
+substeps down to **1**: **09 RmsNorm** on Q/K.  Next probe (§5.5.17)
+closes it — read `08_*_Q.f32` / `08_*_K.f32` (post-projection) +
+the per-block `norm_q_w` / `norm_k_w` / `norm_added_q_w` /
+`norm_added_k_w` gammas, recompute RmsNorm in numpy F32, compare
+against `09_*_rmsnorm.f32`.  If cos < 0.99 → RmsNorm kernel is the
+bug.  Likely suspects: F16 reduction overflow (rmsnorm rsqrt happens
+in low precision), gamma indexing (img-side norm_q vs txt-side
+norm_added_q swap), or epsilon mismatch.
+
+**Artefacts (this step).**
+
+- `tools/probes/qie_rope_oracle/qie_rope_oracle.py` — pure-F32 numpy
+  oracle (no NPU, runs in seconds on CPU).  Includes alt-config sweep
+  (NEOX, sign-flips, axis-order, txt_start, img-coord variants) for
+  diagnostic completeness; not exercised since primary config is
+  cos = 1.000000.
+
