@@ -3837,3 +3837,104 @@ bug, or the timestep embedding upstream).
   YELLOW vs CPU; the bisect-narrowing premise that "08 cos=1.000"
   was an artefact of native-vs-native replay, not native-vs-CPU.
 
+
+
+## §5.5.19 — mod1 oracle vs native 05_img_mod1 / 07_txt_mod1 (GREEN-B)
+
+**Verdict: GREEN-B.** The mod1 dispatch (silu(t_emb) @ img_mod_w +
+img_mod_b → split → modulate(LN1, scale1, shift1)) is **bit-accurate
+against the native dump**. Drift entering at substep 05/07 is NOT in
+the mod1 dispatch; it must already be in `00_t_emb` itself, or upstream
+of substep 04 LN1.
+
+**Probe.** `tools/probes/qie_mod1_oracle/qie_mod1_oracle.py`. Loads
+`00_t_emb.f32`, `04_img_LN1.f32`, `06_txt_LN1.f32` from
+`/tmp/qie_dumps_5516`; loads `transformer_blocks.0.{img_mod,txt_mod}.1.{weight,bias}`
+from `Qwen-Image-Edit-2509-Q4_0.gguf` (both Q5_K — qt=13).
+Reconstructs the engine path with F16 round-trip at silu / matmul /
+modulate boundaries.
+
+**Result.**
+
+| Step | Native cos vs oracle |
+|---|---|
+| silu(t_emb) | exact (input only) |
+| img_mod_params = silu(t_emb) @ img_mod_w^T + img_mod_b | (intermediate, not dumped) |
+| split[scale1, shift1, gate1, scale2, shift2, gate2] | confirmed via implied LSQ |
+| **modulate(img_LN1, scale1, shift1) = 05_img_mod1** | **cos = 1.000000** |
+| **modulate(txt_LN1, scale1, shift1) = 07_txt_mod1** | **cos = 1.000000** |
+| max_abs_diff (img / txt) | 1.95e-3 / 1.95e-3 (F16 round-trip floor) |
+
+**Diagnostic 4 (implied scale/shift via per-column least squares
+on native LN1 → native mod1) confirms the legacy chunk ordering:**
+
+- img: implied scale1 cos vs chunk[0]=**1.000000**, chunk[1]=0.035, chunk[2]=-0.016
+- img: implied shift1 cos vs chunk[1]=**1.000000**, chunk[0]=0.035, chunk[2]=0.010
+- txt: same picture (chunk[0]=scale1, chunk[1]=shift1, chunk[2]=gate1).
+
+The native engine is using the legacy `[scale1, shift1, gate1, ...]`
+ordering at code site `image_diffusion_engine.cpp:3326-3342`. The HF
+spec ordering `[shift1, scale1, ...]` gives cos≈0.986 / 0.980 (matches
+the §5.5.17 cossim sweep numbers) — but the native engine *does* use
+the legacy ordering, so no swap-bug to fix here.
+
+**Alt-config experiments (img stream).**
+
+| Alt | cos vs native |
+|---|---|
+| no-silu (skip silu before matmul) | 0.995 |
+| silu = x \* sigmoid(x) explicit | 1.000000 (= primary) |
+| W reshaped [H, 6H] (no transpose) | 0.988 |
+| no-bias (skip + b) | 0.999 |
+
+The primary path (silu → @ W^T → +bias → split → modulate) is the
+bit-accurate one. None of the alt configs improve, confirming the
+dispatch is correctly modelled.
+
+**Diagnostic 0 — t_emb stats (the smoking gun).**
+
+| Field | absmax | std |
+|---|---|---|
+| `00_t_emb.f32` (this run, F16-dumped→F32) | **0.0999** | 0.0574 |
+| Engine probe `00_t_emb_in` per §5.5.7 historical | **111.8** | — |
+
+The current `00_t_emb` dump magnitude is ~3 orders of magnitude
+*smaller* than the historical `00_t_emb_in` probe. Either (a) the
+t_emb path was clamped/normalised since §5.5.7 (changing what the
+engine actually feeds into mod1), or (b) the dump is being captured
+post-some-rescale that the original probe did not see. Either way,
+the mod1 dispatch at HEAD `2e30379` operates correctly on **whatever
+t_emb is in 00_t_emb.f32**.
+
+**Bug class implied.** The §5.5.17 cossim sweep found 0.986 / 0.980
+between native 05/07 and the CPU F32 reference. With mod1 dispatch
+now proven exact at cos=1.0 vs the native dump, the drift origin
+must be:
+
+1. **t_emb itself** — `time_text_embed` chain
+   (sinusoidal → time_linear1 → silu → time_linear2) produces a
+   different F16 t_emb than the diffusers reference. Since
+   img_mod.1 acts as `silu(t_emb) @ W`, even small t_emb drift
+   propagates linearly into all 6 chunks → into modulate output.
+2. **04 LN1 itself** — possible but already cos=1.000 in the
+   §5.5.17 sweep (vs CPU F32 reference), so unlikely.
+3. **GGUF weight quant for img_mod / txt_mod** — Q5_K dequant
+   noise, but the per-column LSQ recovers identical chunks, so
+   the weight load is consistent on both sides of this oracle.
+
+**1-line fix path.** Build §5.5.20 t_emb oracle: replicate the
+diffusers `time_text_embed` chain in pure F32 (sinusoidal +
+time_linear1 + silu + time_linear2) and compare to native
+`00_t_emb.f32`. If cos < 0.99, the bug is in the engine's
+`host_timestep_embedding_f32` + `time_linear1/2` matmul (most
+likely Q4 dequant of `time_text_embed.timestep_embedder.linear_*`
+weights, or the sinusoidal half-pair (`cos[0..half), sin[0..half)`
+order vs interleaved).
+
+**Artefacts.**
+
+- `tools/probes/qie_mod1_oracle/qie_mod1_oracle.py` — pure-F32
+  numpy oracle, silu / matmul / split-ordering / modulate diagnostics.
+- Native dumps consumed: `/tmp/qie_dumps_5516/{00_t_emb,04_img_LN1,05_img_mod1,06_txt_LN1,07_txt_mod1}.f32`.
+- Run log: substep cosines + verdict above.
+
