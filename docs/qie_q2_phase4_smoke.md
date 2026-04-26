@@ -8339,3 +8339,155 @@ validated. §5.5.52 should target the allocator offset map.
 - Do NOT push: confirmed (still 44 commits ahead before this commit).
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~115 min wall (under the 2 h budget).
+
+## §5.5.52 — Allocator offset map: alias localized, B1 retracted
+
+### Mission
+
+§5.5.51 left the cause as a graph-allocator buffer alias on the
+second `compute()` call but did not name the colliding tensors.
+§5.5.52 instruments `ggml_gallocr_alloc_graph` with a per-call
+offset dump, identifies the exact alias, and attempts the cheapest
+B1 fix (`ggml_set_input` on per-step inputs in `build_graph`).
+
+### Gate A — allocator offset dump
+
+Patched `ggml/src/ggml-alloc.c` runtime path (after `reset_buffers`,
+before `init_tensor` loop) with a getenv-gated dump that records,
+per call: every leaf's `buf_id / addr / size_max / data / view_src`,
+every node's `dst.{buf_id,addr,size_max} / data / view_src` plus all
+`src[j].addr`. Build of `ominix-diffusion-cli` clean. Ran
+`STEPS=3 W=H=256 SD_NAN_CHECK=1 GGML_GALLOCR_OFFSET_DUMP=...`.
+
+Six `alloc_graph` calls were captured (text encoder, VAE encode, ...,
+qwen_image at calls 3/4/5 — the three denoise iterations). The
+qwen_image leaf/node placement is byte-identical across calls 3, 4, 5
+(reserve runs once at iter 0, runtime alloc reuses the placement),
+which confirms the alias is structural.
+
+### Smoking-gun offset overlap (call=3, identical at 4 and 5)
+
+```
+leaf[2] name=leaf_2  buf_id=0  addr=0  size_max=0       data=0x10000  view_src=(nil)
+leaf[3] name=leaf_3  buf_id=0  addr=0  size_max=65536   data=0x10000  view_src=(nil)
+node[2] op=CONT      buf_id=0  addr=0  size_max=3912064 data=0x10000  view_src=(nil) src[0]= (reshaped) (permuted)(addr=4294967295)
+```
+
+The two tensors sharing offset are **`leaf_2` (input `x`, 64 KiB)**
+and **`node[2] CONT` (3.9 MiB output of the patchify
+RESHAPE→PERMUTE→CONT chain on `x`)**. Both at `buf_id=0 / addr=0`.
+`leaf_2`'s reserved `size_max=0` (treated as already-allocated,
+because at reserve time the dup tensor's `data` field is non-NULL —
+caused by ggml-extend's two-step build: `alloc_compute_buffer`
+runs `build_graph + reserve` first, then `reset_compute_ctx`
+followed by a SECOND `build_graph` whose new dup-tensor is laid
+out by `alloc_graph` against the reserve's positional
+`leaf_allocs[i]`). `node[2] CONT` is given a real 3.9 MiB block
+starting at the same `addr=0`. On iter 0 this is benign because
+all consumers of leaf_2 (RESHAPE→PERMUTE chain) finish before
+CONT writes. On iter 1+, `copy_data_to_backend_tensor` re-uploads
+leaf_2 into `base+0` BEFORE compute starts; CONT's 3.9 MiB write
+then clobbers the 64 KiB of leaf_2 and every downstream f32
+becomes NaN — exactly the §5.5.51 evidence.
+
+`leaf_3` (timesteps embedding) has `size_max=65536` at the same
+`addr=0` for the same reason but does not collide on iter 0 (it
+is consumed before CONT). It would be the next casualty if iter
+ordering shifted.
+
+### Gate B1 — `ggml_set_input` on per-step inputs — RETRACTED
+
+Hypothesis: marking `x, context, timesteps, attention_mask,
+ref_latents` as `GGML_TENSOR_FLAG_INPUT` after `to_backend` would
+trigger the early-allocate path in `ggml_gallocr_alloc_graph_impl`
+(line 742 `if (node->flags & GGML_TENSOR_FLAG_INPUT) ...`) and
+prevent CONT from sharing the leaf address.
+
+Patch applied: 9 `ggml_set_input` calls in `qwen_image.hpp`
+`build_graph` after `to_backend`. Built clean. Ran 256² n=3
+`SD_NAN_CHECK=1` with offset dump.
+
+**Verdict: RED.** Offset dump diff (call=3) vs no-fix is
+**byte-identical** — `leaf_2` still `size_max=0`, `node[2] CONT`
+still `addr=0`. NaN evidence post-fix at iter 1:
+`node 0/10226 op=RESHAPE shape=[2,16,2,256] nans=16384/16384
+min=nan max=nan`. PNG: 2.3 KiB (all-NaN, identical solid black).
+
+Root cause of B1 failing: the `INPUT` flag check in
+`ggml_gallocr_alloc_graph_impl` runs on graph **nodes** (and on
+`src->flags` of nodes), not on leaves — see ggml-alloc.c lines
+742-757. `leaf_2` is a graph leaf, not a node, and its
+`leaf_alloc[i]` populator at lines 888-901 unconditionally takes
+the `leaf->view_src || leaf->data` short-circuit when `data` is
+non-NULL. The flag is silently ignored for leafs. B1 reverted.
+
+### Gate B2 / B3 — not attempted
+
+Time-box pressure (~115 min consumed by Gate A instrument +
+build + run + Gate B1 build + run + diagnosis). B2 (`ggml_cont(x)`
+to break view chain) would still leave `leaf_2` at `addr=0`
+because the leaf is still in `graph->leafs`; the ggml-extend
+two-step `alloc_compute_buffer + reset + alloc_graph` design
+would just shift the alias to whichever node CONT becomes.
+B3 (gallocr patch) is the right fix but requires either
+(a) honoring `INPUT` flag in the leaf_alloc populator, or
+(b) eliminating the two-step `reset_compute_ctx` between reserve
+and runtime alloc in `ggml_extend.hpp`. Both are upstream
+structural changes deserving their own dispatch.
+
+### Gates C / D / E — not reached
+
+n=3 256² remains RED (16384/16384 NaN at iter 1).
+
+### §5.5.52 verdict
+
+**Multi-step bug NOT fixed.** Saga remains open. Allocator
+alias is now precisely localized: `leaf_2` (`x`, 64 KiB,
+`size_max=0` due to two-step build's stale `leaf->data`) and
+`node[2] CONT` (3.9 MiB) both at `buf_id=0 / addr=0`. Cheapest
+upstream-style fix B1 (`ggml_set_input`) does not work because
+ggml-alloc ignores the INPUT flag for leaves. §5.5.53 should
+target the leaf-alloc populator or the ggml-extend two-step
+build sequence.
+
+### Recommended §5.5.53 fix path
+
+1. **In `ggml_extend.hpp`** (cleanest, no upstream change):
+   skip the second `build_graph` after `reset_compute_ctx` in
+   `compute()`; reuse the graph that was already built in
+   `alloc_compute_buffer` so leaf identity matches the reserve
+   plan. This eliminates the stale-`leaf->data` window.
+2. **In `ggml-alloc.c`** (upstream patch, harder): in the
+   leaf_alloc populator (lines 888-901), if
+   `leaf->flags & GGML_TENSOR_FLAG_INPUT` and
+   `leaf->view_src == NULL`, take the `else` branch even when
+   `leaf->data` is set, and call
+   `ggml_gallocr_allocate_node` for it earlier in
+   `alloc_graph_impl` so its address does not collide.
+3. **Force fresh `compute_allocr` per iter** (already tried in
+   §5.5.51c, NEGATIVE — the alias is established at iter-0
+   reserve and reproduced identically each subsequent reserve).
+
+### Multi-step verification post-fix — N/A (no fix landed)
+
+n=3 at 256² remains RED (16384/16384 NaN at step 1, post-revert
+of B1 verified by clean rebuild).
+
+### 1024² 20-step PNG eye-check — N/A (no fix to validate)
+
+### Saga close: NO
+
+Two consecutive sections (§5.5.51 → §5.5.52) have now confirmed
+the same alias from different angles: §5.5.51 by NaN-bisect,
+§5.5.52 by direct allocator offset dump. The leaf_alloc
+populator's `leaf->data` short-circuit is the structural cause.
+B1 retracted; B2/B3 deferred to §5.5.53 with two clearly-scoped
+fix candidates (above).
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout, released on cleanup.
+- Do NOT push: confirmed (still 45 commits ahead before this commit).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~120 min wall (at the 2 h budget cap).
