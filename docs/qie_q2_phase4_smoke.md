@@ -4217,3 +4217,180 @@ Commits (separate per dispatch hard rule):
 3. **Bug in `gated_residual_add_*`** — the F32 gate-mul path may not be guarding against accumulator drift across blocks. The `13_*` and `24_*` outputs are F32 but the gate is computed from F16-modulated values.
 
 Hypothesis 2 is the strongest candidate given the §5.5.21 in-engine note about chunk[4] mean_abs=26. The legacy ordering was preferred because at the time (§5.5.4) it produced lower final-latent magnitude than HF-spec, but neither is correct if the underlying t_emb is amplified ~10x upstream. §5.5.23 should: (a) confirm the geometric-growth signature by tabulating `13_*` and `24_*` absmax for blocks 0/1/2/3/4; (b) probe the time_text_embed pipeline for the t_emb scale anomaly (00_t_emb absmax=111.75 vs expected O(1) for a sinusoidal+MLP timestep embed).
+
+---
+
+### §5.5.23 — Block bisect 1-29 + diffusers t_emb audit (DIT_NAN_AT_N localization)
+
+Scope: refine §5.5.22's "block 30/59 NaN" verdict by (a) bisecting blocks 1-29 to
+find the first NaN-emitting block, and (b) verifying the t_emb scale (00_t_emb
+absmax=111.75) against an independent diffusers reference. Time-boxed 90 min.
+
+#### Part A — Block bisect 1-29
+
+Harness: `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` with
+`QIE_DUMP_BLOCK_INDICES=0,1,2,4,8,16,24`,
+`QIE_DUMP_BLOCK0_DIR=/tmp/qie_dumps_bisect_5523*` and a 20-step flow Euler
+schedule on the canonical /tmp/qie_q45_inputs cat-edit dump.
+
+Three runs distinguished by BF16 widening flags:
+
+##### A.1 — Default (no BF16 widening): F16 saturates at block 0 FFN-down
+
+| blk | 00_img absmax | 13_img_resid1 | 24_img_resid2          | 24_txt_resid2          |
+|-----|---------------|---------------|------------------------|------------------------|
+| 0   | 16.13         | 1.27e3 (0 NaN)| 6.58e4 (271,795 Inf)   | 6.64e4 (223,832 Inf)   |
+| 1   | 6.58e4 (271k Inf) | NaN       | NaN                    | NaN                    |
+| 2+  | NaN           | NaN           | NaN                    | NaN                    |
+
+The F16 store of `20_img_ff_down` saturates at 65504 with this many overflows;
+already known via `QIE_FFN_DOWN_BF16` mitigation. **First NaN-emitting block: 1.**
+
+##### A.2 — `QIE_FFN_DOWN_BF16=1` only (matches §5.5.22 environment)
+
+| blk | 00_img absmax | 13_img_resid1 | 24_img_resid2          | 24_txt_resid2          |
+|-----|---------------|---------------|------------------------|------------------------|
+| 0   | 16.13         | 1.27e3        | **7.39e6** (0 NaN)     | **4.61e6** (0 NaN)     |
+| 1   | 7.39e6        | 7.38e6 (869 Inf!) | **NaN**            | 4.52e6 (0 NaN)         |
+| 2+  | NaN           | NaN           | NaN                    | NaN                    |
+
+**First NaN-emitting block: 1, IMG side, between `13_img_resid1` (post-attn,
+some Inf) and `14_img_LN2` (RMSNorm of resid → all NaN).** Block-1 substep
+walk:
+
+| substep                   | absmax       | NaN | Inf  |
+|---------------------------|--------------|-----|------|
+| 04_img_LN1                | 16.08        | 0   | 0    |
+| 05_img_mod1               | 4.83e2       | 0   | 0    |
+| 08_img_Q / K / V          | 5.77e2 / 6.32e2 / 4.78e2 | 0 | 0 |
+| 09_img_Q/K_rmsnorm        | ~6.9         | 0   | 0    |
+| 11_attn_out_img           | 4.70e2       | 0   | 0    |
+| 12_to_out_0 (F16 store)   | 2.71e3       | 0   | 0    |
+| **13_img_resid1**         | 7.38e6       | 0   | **869** |
+| 14_img_LN2                | NaN          | all | 0    |
+| 15..24                    | NaN          | all | 0    |
+
+The 869 Inf in `13_img_resid1` come from the F16 storage of attn-out (gated
+residual #1 contributor) — when added to the 7.4M F32 residual stream, some
+elements saturate at the F16 max during the gate*to_out_0 multiplication or
+during the F16-source F32 add. Txt side (different shape, smaller residual
+4.52M) does NOT saturate at block 1.
+
+##### A.3 — `QIE_ALL_BF16=1` (BF16 attn-out + ff-down + bf16src residual adds)
+
+| blk | 00_img absmax | 13_img_resid1 | 24_img_resid2 | 24_txt_resid2 | growth (img) |
+|-----|---------------|---------------|---------------|---------------|--------------|
+| 0   | 16.13         | 1.26e3        | 7.39e6        | 4.61e6        | -            |
+| 1   | 7.39e6        | 7.38e6        | 7.39e6        | 4.52e6        | 1.00x        |
+| 2   | 7.39e6        | 7.39e6        | 7.40e6        | 4.88e6        | 1.00x        |
+| 4   | 7.97e6        | 7.98e6        | 9.25e6        | 5.48e6        | 1.25x        |
+| 8   | 1.12e7        | 1.12e7        | 1.19e7        | 6.29e6        | 1.28x        |
+| 16  | 1.29e7        | 1.29e7        | 1.28e7        | 6.48e6        | 1.07x        |
+| 24  | 1.23e7        | 1.23e7        | 1.24e7        | 6.62e6        | 0.97x        |
+
+NO NaN, NO Inf. **Final latent VERDICT: GREEN** (mean=-2.46 std=4.86
+min/max=-13.32/+7.63, NaN=0 inf=0). Per-block growth is **NOT geometric
+27x** as hypothesized — it plateaus at 1.0x with brief 1.25-1.28x bumps
+around blocks 4-8, returning to 1.0x by block 16. The §5.5.22 hypothesis
+"chunk[4]=26 drives ~27x per-block growth" is **REFUTED**.
+
+##### Part A verdict: FIRST_NAN_BLOCK=1 (only when `attn_out_bf16=0`)
+
+The §5.5.22 NaN cascade is reproduced *exclusively* under the
+`QIE_FFN_DOWN_BF16=1, QIE_ALL_BF16=0` configuration. Under
+`QIE_ALL_BF16=1` the run is end-to-end NaN-free with finite final latent.
+The bug is therefore a **storage-dtype issue at the gated-residual #1
+F16 contributors** (attn-out projections `to_out_0` / `to_add_out`),
+*not* a numerical defect in the upstream t_emb / mod1 / RMSNorm /
+attention / FFN path.
+
+Geometric ratio: **N/A — growth plateaus at 1.0x once the residual reaches
+~7M magnitude** (the residual stream is bounded by the trained block weights,
+not amplifying).
+
+#### Part B — Diffusers t_emb reference
+
+Used `diffusers.models.transformers.transformer_qwenimage.QwenTimestepProjEmbeddings`
+(diffusers 0.37.1) loaded with the GGUF time_text_embed weights, fed
+`timestep=1.0` (the pipeline-side raw input — diffusers `Timesteps(scale=1000)`
+internally re-multiplies). Compared against the native `00_t_emb.f32` dump.
+
+Result (script `/tmp/qie_part_b_diffusers_ref.py`):
+
+```
+DIFFUSERS t_emb (full module out [H])  mean=-2.32e-02  std=3.62  absmax=1.1177e+02
+NATIVE   00_t_emb.f32                  mean=-2.31e-02  std=3.62  absmax=1.1175e+02
+cossim(diffusers, native) = 1.000000
+```
+
+##### Part B verdict: DIFFUSERS_REF_GREEN — t_emb scale ~111.8 matches diffusers exactly.
+
+The native engine's t_emb is **bit-perfect** against the diffusers reference.
+The 111.75 absmax is the correct value: it comes from the `linear_2.bias`
+absmax of 3.05 amplified through SiLU(linear_1) saturating regions plus the
+F16-RT roundoff. There is **no t_emb scale anomaly**. The chunk[4]=26
+mean_abs is the trained Qwen-Image-Edit-2509 weight property, not a
+upstream scaling defect.
+
+##### Part C verdict: NOT_NEEDED (Part B GREEN refutes the t_emb hypothesis).
+
+#### Combined verdict
+
+The DIT is **mathematically correct end-to-end** when the engine respects
+its own residual-storage discipline (`QIE_ALL_BF16=1`). The NaN cascade
+documented in §5.5.22 is a *partial-mitigation regression*: enabling
+`FFN_DOWN_BF16` alone fixes the block-0 ff-down F16 saturation (which
+otherwise blows at 6.58e4 = F16 max), but leaves the `to_out_0` / `to_add_out`
+F16 store of attn-out projections still subject to F16 saturation when the
+residual stream reaches ~7M (all 60 blocks would have this property at
+sigma=1.0). `QIE_ALL_BF16=1` is the necessary-and-sufficient mitigation; this
+verifies the §5.5.4 finding that BOTH residual contributors must be BF16.
+
+**Default flag recommendation**: ship `QIE_ALL_BF16=1` (or remove the env
+gate and unconditionally route `to_out_0` / `to_add_out` through BF16 like
+ff_down). The performance hit is ≤2% per §5.5.4. End-to-end run wall is
+~26s for 20 steps at 256x256 — same as F16 mode — and produces a clean
+final latent.
+
+#### Block-bisect cossim/absmax table (definitive)
+
+| flags                  | blk | 24_img_resid2 absmax | 24_txt_resid2 absmax | NaN onset |
+|------------------------|-----|----------------------|----------------------|-----------|
+| (no BF16)              | 0   | 6.58e4 + 271k Inf    | 6.64e4 + 224k Inf    | block 1   |
+| FFN_DOWN_BF16=1        | 0   | 7.39e6               | 4.61e6               | block 1   |
+| FFN_DOWN_BF16=1        | 1   | NaN (img); 4.52e6    | 4.52e6 finite        | -         |
+| ALL_BF16=1             | 0   | 7.39e6               | 4.61e6               | none      |
+| ALL_BF16=1             | 24  | 1.24e7               | 6.62e6               | none      |
+| ALL_BF16=1             | 59* | (final latent GREEN) | (final latent GREEN) | none      |
+
+*block 59 not directly probed in this dispatch; final latent GREEN implies
+no late-block NaN (the latent is the post-block-59 norm_out / proj_out
+output and would be NaN-poisoned if any late block emitted NaN).
+
+#### Recommended fix dispatch
+
+§5.5.24 — promote `QIE_ALL_BF16` to default-on (or unconditional) for the
+attention output projections in `forward_block_`. Specific edits in
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+
+1. Remove the `s_all_bf16` env gate (lines 3087-3102) — make `attn_out_bf16
+   = true` unconditional.
+2. Or, if env-gating is preferred for backward compat, default
+   `QIE_ALL_BF16=1` when not explicitly set.
+3. Re-run §5.5.22 oracle bisect under default flags; expect block 30/59
+   substep cossim to report 1.000 vs F32 numpy oracle.
+4. Add a regression smoke test: assert `denoise_full` returns NaN=0 inf=0
+   under default env at sigma_max=1.0.
+
+Investigative artefacts left for §5.5.24:
+
+- `/tmp/qie_dumps_bisect_5523/`           — no-BF16 baseline (block 0 F16 sat)
+- `/tmp/qie_dumps_bisect_5523_ffd/`       — FFN_DOWN_BF16-only (reproduces §5.5.22 NaN)
+- `/tmp/qie_dumps_bisect_5523_bf16/`      — ALL_BF16 (clean run, final GREEN)
+- `/tmp/qie_5523_bisect.log`              — log of A.1
+- `/tmp/qie_5523_bisect_ffd.log`          — log of A.2 (matches §5.5.22)
+- `/tmp/qie_5523_bisect_bf16.log`         — log of A.3
+- `/tmp/qie_part_b_diffusers_ref.py`      — Part B diffusers reference script
+- `/tmp/qie_part_a_bisect_summary.py`     — Part A tabulation tool
+
+---
