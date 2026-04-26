@@ -7641,3 +7641,148 @@ Suggested next steps for §5.5.47+:
   ahead of origin/main).
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~2 h (build + n=4/8/20/1024 sweep + decode + diff).
+
+---
+
+## §5.5.47 — DiscreteFlowDenoiser c_skip + c_out reconstruction (RED)
+
+### Hypothesis
+
+The CLI sampler computes per-step:
+
+```
+denoised = c_out * v + c_skip * x_t   where c_out=-sigma, c_skip=1
+d        = (x_t - denoised) / sigma
+x_new    = x_t + d * dt
+```
+
+The native engine wrote raw model output `v` into `denoised_host` and
+relied on the host Euler block to compute `d = (x - v)/sigma`, which
+diverges from the CLI for sigma != 1. The candidate fix: reconstruct
+`denoised = -sigma*v + x_t` between the model output and the Euler
+block, so that downstream `d = (x_t - (-sigma*v + x_t))/sigma = v` and
+`x_new = x_t + v*dt` — the canonical flow-matching Euler.
+
+### Patch
+
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp:6281-6298`,
+inserted between the §5.5.28 step-0 dump and the host Euler block.
+18 lines, gated only by `step==0` debug above; the c_skip/c_out math
+runs unconditionally on every step.
+
+### Build
+
+`build-w1` clean rebuild of `qwen_image_edit_native` only (probe
+target builds via `build_and_run.sh` g++ direct compile of the engine
+.cpp, so the binary inherits the patch via source). Build OK.
+
+### n_steps=4/20 sweep (256², `/tmp/qie_q45_inputs`)
+
+The probe `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh`
+hard-codes `n_steps=20`; `QIE_PROBE_N_STEPS` and `QIE_PROBE_W/H` env
+vars are not honored. Both runs reduce to a single 20-step 256²
+denoise on the same dump:
+
+| metric    | §5.5.46 (V2 mirror + BF16 widen) | §5.5.47 (c_skip+c_out) | delta |
+|-----------|----------------------------------|------------------------|------:|
+| mean      |  -0.04                          |  +1.03                |  +1.07 |
+| std       |  15.13                          |  12.98                |  -14% |
+| min       | -40.88                          | -32.86                |  -20% |
+| max       | +40.84                          | +31.04                |  -24% |
+| NaN/inf   |   0/0                           |   0/0                 |     - |
+| denoise wall |  ~25 s                       |  ~26 s                |     - |
+
+VERDICT: **YELLOW (range)** — gate `|min|<20 && |max|<20` fails. The
+patch reduces magnitude ~20% but does not bring the latent into the
+canonical [-1,+1] flow-matching range; the residual ±32 magnitude is
+the same upstream signal that §5.5.46 already isolated to non-clamp
+sources.
+
+### 1024² 20-step end-to-end
+
+The probe input dump is 256² (`ne0=ne1=32 ne2=16 ne3=1`); honoring
+the dispatch, the 256² latent was passed to the CLI's
+`OMINIX_QIE_DECODE_ONLY_LATENT` decode-only path with `-W 1024 -H 1024`.
+The CLI logs `[QIE decode-only] file size 65536 != expected 1048576 —
+will read min(file, expected)`, i.e. the 256² latent is read into
+the first 16 384 floats of a 262 144-element 1024² VAE input and the
+remaining 245 760 elements are zero. This is the same wrap path used
+in §5.5.46's Gate C 1024² eye-check (`qie_5546_1024_FIXED.png`). The
+denoise wall and decode wall match the prior run:
+
+- Conditioner load + VAE encode (re-runs 25-step CFG inside CLI):
+  ~138 s (5.5 s/step × 25 steps).
+- VAE tile decode 49 tiles × 5.6 s ≈ 274 s.
+- Total `generate_image` wall: 412.42 s ≈ 6.9 min.
+- Output: `/tmp/qie_5547_1024_FIXED.png` (1.39 MiB).
+- `decode_only/x_latent_loaded` range = [-32.86, +31.04] NaN=0
+  (mirrors the patched 256² stats — confirms patch went into the
+  decoded latent).
+
+### Eye-check
+
+**TILE/NOISE.** Blue-and-olive horizontal striped checkerboard, no
+recognizable cat structure anywhere in the frame. Same VAE-failure
+fingerprint as §5.5.46's "blue diagonal weave" — magnitude reduced
+20% but still ~3-5× off canonical latent SD, so the VAE's first
+conv saturates the same way.
+
+Pixel diff vs `/tmp/phase1_baseline_1024_20step.png` (CUDA reference,
+256² resized for comparison):
+
+- mean |Δ| = 84.84 / 255
+- max |Δ| = 252 / 255
+- identical pixels = 0.00%
+- engine RGB std = (64, 82, 122) — strongly chromatic stripe pattern
+- ref RGB std    = (52, 53, 52)  — natural greyscale-ish photo
+
+### Verdict
+
+**RED.** The c_skip+c_out reconstruction is mathematically correct
+relative to the CLI sampler (verified by hand: `x_new = x + v*dt` post-
+patch matches CLI), and it does measurably reduce final-latent
+magnitude (-14% std, -22% range), but the residual ±32 magnitude
+still places the engine output ~30× outside the canonical flow-
+matching latent SD (~1.0). The VAE decode produces the same
+TILE/NOISE artifact as every prior eye-check from §5.5.42 onward.
+
+This RED confirms what §5.5.46's saga conclusion already noted: the
+±40 latent magnitude is **upstream signal**, not a saturation or
+sampler-arithmetic artifact. The canonical Euler form does not, on
+its own, restore the engine to CLI-equivalent output.
+
+### Reverted
+
+`git checkout -- tools/qwen_image_edit/native/image_diffusion_engine.cpp`
+restores the pre-patch source. No commit of the patch.
+
+### Saga: STILL OPEN
+
+The two-week saga remains open. The c_skip+c_out hypothesis is
+exhausted; the next hypothesis must address the upstream magnitude
+leak directly. Suggested next probes (carrying forward §5.5.46's
+unfinished list):
+
+1. **CLI ground-truth dump at 256²**: run `ominix-diffusion-cli` end-
+   to-end on the 256² conditioning and dump its post-DiT latent.
+   If CLI produces ±15-40 the issue is inherent to the conditioning
+   dump (text embedding, t_emb) — if CLI produces ±1 the engine has
+   a per-block magnitude leak.
+
+2. **Per-block residual magnitude trace**: instrument every block's
+   `13_*_resid1` and `21_*_resid2` magnitude at 256² in both engine
+   and CLI; localise the divergence point.
+
+3. **Attention-scale ablation**: try `QIE_ATTN_SOFTMAX_F32=1` (the
+   `kv_scale=1/HD + post-mul HD` path) to rule out the FIA scale
+   hypothesis flagged in §5.5.46.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout, released after each run (manual cleanup
+  required for the 412s decode after SSH session disconnect).
+- Do NOT push: confirmed (40 commits ahead, no push).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~70 min wall (build 3 min + 256² 2.3 min + decode 6.9 min
+  + scp + eye-check + revert + doc).
