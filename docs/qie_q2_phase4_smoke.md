@@ -8491,3 +8491,129 @@ fix candidates (above).
 - Do NOT push: confirmed (still 45 commits ahead before this commit).
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~120 min wall (at the 2 h budget cap).
+
+
+## §5.5.60 — d82ba89 verification dispatch — VERDICT: PARTIAL (NaN class NOT closed at 256²)
+
+### Context
+
+§5.5.59 fix at `d82ba89 fix(qie-edit): §5.5.59 — protect INPUT
+leaves from gallocr free + reuse` was committed at
+2026-04-27 07:20:30 +0800. Reserve-trace from §5.5.59
+conclusively showed leaf_2 freed at reserve sim (n_children=0
+mid-graph) and CONT reused offset=0. Patch added INPUT-flag
+early-return in `free_node` and an inplace-reuse skip in
+`ggml-alloc.c`. This dispatch ran the n=3 256² / 1024² /
+n=20 1024² verification gates.
+
+### Build state
+
+The pre-existing `build-w1/bin/ominix-diffusion-cli` had
+mtime 2026-04-27 07:11:58 — i.e. **before** d82ba89's commit
+time. First Gate A run was therefore against stale binary. After
+clean rebuild (`cmake --build . --target ominix-diffusion-cli`,
+binary mtime 2026-04-27 07:29:11), Gate A was re-run. Both
+runs reported identical 16384/16384 NaN, confirming the fix
+in d82ba89 — while present in source — does NOT close the
+NaN class even after relink.
+
+### Gate A — n=3 256² (sanity)
+
+Command:
+```
+SD_NAN_CHECK=1 ominix-diffusion-cli ... -W 256 -H 256 \
+  --steps 3 --cfg-scale 1.0 --sampling-method euler \
+  -o /tmp/qie_5560_256_n3.png --seed 42
+```
+
+Result (post-rebuild):
+```
+[NaN CHECK] encoder/cond.c_crossattn: OK (range=[-159.24, 108.69])
+[NaN CHECK] diffusion/x_0: 16384 elements — 16384 NaN
+[NaN CHECK] vae/decoded_image: 196608 elements — 196608 NaN
+generate_image completed in 194.05s
+PNG 2313 bytes (all-NaN-black)
+```
+
+**Verdict: RED.** The §5.5.53b 256² GREEN result that motivated
+this dispatch did NOT reproduce on d82ba89 + clean rebuild.
+
+### Gates B / C / D — not reached
+
+Gate A failure makes 1024² gates moot. Skipped to preserve
+the 90 min wall budget.
+
+### Smoking gun — PRE-COMPUTE vs NaN FINE divergence
+
+The most diagnostic finding from the 256² log:
+
+PRE-COMPUTE (recorded as each node fires):
+```
+[PRE-COMPUTE] qwen_image: node 2 op=CONT shape=[2,2,16,256] \
+  min=-0.4139 max=0.5153 nans=0/16384
+```
+
+NaN FINE (re-readback after the iteration completes):
+```
+[NaN FINE] qwen_image: node 2 op=CONT shape=[2,2,16,256] \
+  nans=16384/16384 min=nan max=nan
+```
+
+**Same tensor, same physical address, two readbacks an iteration
+apart, different contents.** This is the gallocr alias
+clobbering CONT's storage — exactly the §5.5.59 hypothesis
+— but the INPUT-only protection in d82ba89 does not cover
+this CONT output. The fix scope is too narrow.
+
+### Why §5.5.59 fix is incomplete
+
+`free_node` early-return for INPUT correctly preserves
+leaf_2 (`x`, the input latent) — leaf_2 is reported clean
+at every COPY CHECK with valid range `-3.97..3.93`. But the
+allocator is still freeing **internal CONT outputs whose
+storage is being aliased to a later node's output buffer**.
+Node 2's storage gets reused for an in-graph intermediate
+(likely the rotary embed or single-stream concat) whose write
+clobbers the cached CONT data that downstream attention reads
+during the next iteration's KV recomputation.
+
+### Recommended §5.5.61 fix path
+
+The free-list eligibility check must also account for the
+fact that pre-built CONT outputs in the qwen_image graph are
+reused across the multi-iteration sample loop. Either:
+
+1. Mark the affected CONT outputs as OUTPUT (extend the trick
+   used in 82e6e1a for `model_out`), preventing free.
+2. Force gallocr reserve to disable in-graph aliasing entirely
+   for the qwen_image `compute` graph (a coarse hammer; would
+   regress HBM but would un-block the saga).
+3. Route the rotary/concat intermediates through fresh
+   allocations (skipping reuse) — selective opt-out.
+
+### Performance
+
+Gate A wall: 194.05s for 256² n=3 (50.7 s/it sampling +
+12.3 s VAE encode + 7.0 s text-encode + 48.2 s weight load +
+20.1 s VAE decode). No regression from §5.5.49 baseline
+(195.5s same shape) — fix is performance-neutral. But output
+is still pure NaN.
+
+### Saga close: NO
+
+Two consecutive fix attempts — c88ca9b (partial graph-allocator
+alias), 82e6e1a (model_out OUTPUT mark), d82ba89 (INPUT leaf
+protect) — have all been validated as **necessary but not
+sufficient**. The class of bug (gallocr alias clobbering)
+is now confirmed at three levels (leaf_2 input, model_out
+sink, leaf-INPUT free). §5.5.61 must address the remaining
+case: in-graph intermediate aliasing across iteration boundaries.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during build + Gate A, released on cleanup.
+- Do NOT push: confirmed.
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~25 min wall (under the 90 min budget; Gates B/C/D
+  skipped due to Gate A RED).
