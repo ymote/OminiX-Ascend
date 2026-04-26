@@ -6088,3 +6088,161 @@ bisect.
 HBM lock auto-released after probe finished. No bytes pushed. Probe binary
 rebuilt on ac03 with §5.5.34 t_emb-from-file additions only (zero
 forward-path code modification).
+
+## Q2.4.5.5.35 — production driver per-block trace — NO_PRODUCTION_DRIVER_EXISTS
+
+**Verdict:** STRUCTURAL HALT. The mission's premise — run the production
+
+## Q2.4.5.5.35 — production driver per-block trace — NO_PRODUCTION_DRIVER_EXISTS
+
+**Verdict:** STRUCTURAL HALT. The mission's premise — "run the production
+driver `qwen_image_edit_native` with `--diffusion-model --llm
+--llm_vision --vae -r cat.jpg -p '...'` and let it dump per-block residuals
+at REAL conditioning" — does not match the code on `main` HEAD
+`4f2abb4`. There is no native production driver in this repo that runs
+real text-encoder + image-encoder + VAE + 60-block forward end-to-end.
+
+### Step 1 — production driver inventory
+
+`tools/qwen_image_edit/native/main_native.cpp` (built as
+`build-w1/bin/qwen_image_edit_native`) is a Phase-1 scaffold. Its CLI
+help advertises ONLY:
+
+```
+  --gguf FILE          DiT weights GGUF
+  --device N           ACL device ID (default 0)
+  --steps N            Denoising steps (default 20)
+  --cfg SCALE          Classifier-free guidance scale (default 4.0)
+  --seq-img N          Max image token seq (default 4096)
+  --seq-txt N          Max text token seq (default 256)
+  --q4                 Enable Q4 weight quantization (Phase 2 late)
+  --hbm-lock / --wait-hbm-lock-s
+```
+
+It accepts no `--llm`, `--llm_vision`, `--vae`, `-r`, `-p`,
+`-W`, `-H`, `--seed`, `--cfg-scale`, `--sampling-method`, or
+`-o` flags. Its `main` constructs an `ImageDiffusionEngine`
+(line 133), calls `init_from_gguf` (iff the gguf path is provided),
+and **exits**. No text encoder, no image encoder, no VAE, no
+`forward_block_` invocation, no t_emb computation, no PNG.
+
+### Step 2 — every native call site of `forward_block_`
+
+`grep -rn 'ImageDiffusionEngine\b' --include='*.cpp'` enumerates every
+native consumer:
+
+```
+tools/probes/qie_q42_60block_smoke/test_qie_q42_60block_smoke.cpp        (init_for_smoke; synthetic)
+tools/probes/qie_q43_denoise_smoke/test_qie_q43_denoise_smoke.cpp        (init_for_smoke; synthetic)
+tools/probes/qie_q44_real_gguf_smoke/test_qie_q44_real_gguf_smoke.cpp    (real GGUF; single forward; synthetic in)
+tools/probes/qie_q45_real_denoise_smoke/test_qie_q45_real_denoise_smoke.cpp  (real GGUF; denoise_loop_test; synthetic img/txt; t_emb-from-file added §5.5.34)
+tools/probes/qie_q45_step4_full_denoise/test_qie_q45_step4_full_denoise.cpp  (same as above)
+tools/qwen_image_edit/native/main_native.cpp                              (Phase-1 scaffold; no forward)
+```
+
+The native engine's only end-to-end exerciser is the §5.5.34 probe family,
+which runs `denoise_loop_test` at probe shape (img=64 or 256 with
+`QIE_Q45_BIG`) with deterministic random img/txt and (since §5.5.34) real
+t_emb loaded from CLI dump. That probe path is exactly what §5.5.32 / 33 /
+34 already invalidated for shape and conditioning reasons.
+
+### Step 3 — CLI is the only end-to-end driver
+
+`tools/ominix_diffusion/cli/main.cpp` (`build-w1/bin/ominix-diffusion-cli`)
+IS the only binary on `main` that wires real text-encoder + image-encoder +
+VAE + DiT + scheduler. It dispatches DiT through
+`tools/ominix_diffusion/src/qwen_image.hpp`'s GGML reference path —
+NOT through `ImageDiffusionEngine`. The two paths share zero runtime
+code; they share only weights on disk. There is no `--native` /
+`--use-engine` switch in CLI that routes the DiT through
+`ImageDiffusionEngine::forward_block_`.
+
+### Step 4 — `QIE_DUMP_BLOCK_INDICES` gating site
+
+`grep -n 'QIE_DUMP_BLOCK_INDICES'
+tools/qwen_image_edit/native/image_diffusion_engine.cpp` lands at
+`forward_block_` line 3193. Gating fires on the FIRST entry to
+`forward_block_` per process, then matches block_idx against the CSV.
+This means `QIE_DUMP_BLOCK_INDICES` is only consulted when something
+calls `forward_block_` — i.e., one of the five probe paths above. CLI
+never calls `forward_block_`, so the env var has no effect on a CLI run.
+
+### Step 5 — implication for the mission
+
+The mission requires bisecting "from the production driver only" with
+real conditioning. Such a driver does not exist. Three paths forward,
+all OUTSIDE this 90-min time-box and at least one of them violates the
+"do NOT modify forward code" rule depending on interpretation:
+
+**Path 5.5.36-A (recommended long-term)** — wire `ImageDiffusionEngine`
+into `ominix-diffusion-cli` behind a `--native-dit` switch. The CLI
+already has the text-encoder + image-encoder + VAE + scheduler wiring;
+add an alternate DiT-forward dispatch that calls
+`ImageDiffusionEngine::forward(img, img_seq, txt, txt_seq, t_emb)`
+instead of the GGML reference DiT. Run with
+`QIE_DUMP_BLOCK_INDICES` to get real-conditioning per-block dumps.
+Side effect: this turns CLI into the bona-fide production driver
+this mission expected. Estimated: ~2 person-days.
+
+**Path 5.5.36-B (cheaper, recommended next step)** — extend
+`main_native.cpp` (or, less invasive, a new
+`tools/probes/qie_q45_real_inputs_engine/`) to load REAL
+img / txt / t_emb from on-disk dumps generated by a CLI hot-edit
+side-channel (CLI dumps `x_init`, `txt_emb_cond`, `txt_emb_uncond`,
+`t_emb_step0` at 1024² shape; native then reads them). This is what
+§5.5.34 did for t_emb only, generalised to img and txt. NOT a forward
+modification — only adds host-side load helpers in main / probe. Estimated:
+~3 hours; produces real eng-vs-CLI per-block trace immediately.
+
+**Path 5.5.36-C** — fix the §5.5.33 retracted CLI `02_img_mod_out`
+dump-point (post-matmul, not bias view) and re-bisect from there. This
+addresses one specific divergence already half-localized to
+`img_mod_1` Linear in §5.5.30, but cannot tell us about FIA / FFN
+divergences that surface at later substeps.
+
+### Step 6 — bit-compare table
+
+**Not produced.** Cannot bisect a production-driver-vs-CLI per-block
+trace when the production driver does not invoke `forward_block_`.
+`/tmp/qie_5535_eng_prod/` is NOT generated.
+
+### Step 7 — first true divergent block + substep
+
+**Inherited from §5.5.30 (real-conditioning end-to-end via SMALL probe):**
+the only valid eng-vs-CLI comparison at REAL inputs to date is §5.5.30,
+which localized first divergence to **block 1, post-LN2 modulation
+(`15_img_mod2`)** — engine 5.8× lower than CLI. That signal stands;
+§5.5.34 added that the t_emb chain itself (Linear chain through silu)
+is bit-accurate at all 60 blocks, so the divergence is downstream of
+silu(t_emb) but at-or-before `(1+scale)*ln + shift`. This narrows the
+bug surface to the `img_mod_1` Linear matmul or its
+chunk_split-and-bind, applied at block-N for N≥1.
+
+### Step 8 — recommended §5.5.36
+
+**Pick Path 5.5.36-B** unless the team intends to ship a native-DiT
+production driver this quarter (in which case Path A is the right
+investment). Path B unblocks the per-block bisect within hours, at the
+cost of disposable host-side glue in main_native.cpp and a 5-line CLI
+patch to dump x_init / txt_emb_cond / txt_emb_uncond at step 0. Once the
+real img/txt/t_emb tuple lands on disk, the same `QIE_DUMP_BLOCK_INDICES`
+infra on the engine side produces a bit-exact per-block trace at
+production conditioning.
+
+### Hard rules check
+
+- ac03 ONLY: yes — no off-host commands ran.
+- HBM lock: no run executed; lock file untouched.
+- Do NOT push: confirmed; commit local only.
+- Do NOT modify forward code: confirmed; this section adds zero source
+  lines.
+- Time-box: structural halt at <30 min wall; remaining 60 min unused
+  per "report what you have at the time-box."
+
+### Artefacts
+
+- `tools/qwen_image_edit/native/main_native.cpp` (Phase-1 scaffold; no real conditioning)
+- `tools/ominix_diffusion/cli/main.cpp` (real CLI; GGML DiT only)
+- `tools/probes/qie_q45_real_denoise_smoke/test_qie_q45_real_denoise_smoke.cpp` (engine probe; synthetic img/txt + real t_emb)
+- `/tmp/qie_5529_cli_blocks/blockNN/qie_cli_blk*_13/24_*.f32.bin` (CLI residuals — preserved, ready for §5.5.36-B reuse)
+- No `/tmp/qie_5535_eng_prod` artefact (not generated; would require Path A or Path B first)
