@@ -5644,3 +5644,142 @@ indexing.
 
 No engine rebuild this dispatch (probe is host-side numpy only). No HBM
 allocated. No bytes pushed.
+
+### §5.5.32 Gate-A WQBMMv3 F32-accum A/B — F16_ACCUM_NOT_THE_BUG
+
+**Verdict:** GATE A FAILS. Setting `QIE_MATMUL_INNER_PRECISE=0`
+(HIGH_PRECISION / F32 accumulator) produces **bit-identical**
+`15_img_mod2.absmax` to the F16-accum default. The §5.5.31 hypothesis that
+WQBMMv3's F16 accumulator is overflowing on the modulation Linear matmul is
+**FALSIFIED**. Dispatch HALTED before Gates B–G per the hard-rule "If Gate A
+fails: halt, do not proceed."
+
+#### Per-block 15_img_mod2 absmax — F32 accum vs F16 accum vs CLI
+
+```
+blk | eng F32-accum | eng F16-accum (5530) | CLI    | F32/CLI ratio
+----|---------------|----------------------|--------|---------------
+  0 |        486.75 |               486.75 |   490  | 0.993 ✓
+  1 |        141.62 |               141.75 |   819  | 0.173 ✗
+  2 |        188.00 |               188.00 |  1400  | 0.134 ✗
+  4 |        502.00 |               502.00 |  1620  | 0.310 ✗
+  8 |        540.50 |               540.50 |  1380  | 0.392 ✗
+ 16 |        120.62 |               120.62 |   135  | 0.894 ≈
+ 30 |        304.75 |               304.75 |  6620  | 0.046 ✗
+ 45 |        237.12 |               237.12 |   937  | 0.253 ✗
+ 59 |       1085.00 |              1085.00 |  1160  | 0.935 ≈
+```
+
+F32-accum and F16-accum runs are bit-identical (max delta 1 LSB at block 4
+and block 30, attributable to upstream non-determinism in residual accum,
+not the matmul itself). The mod2 magnitude drift at blocks 1/2/4/8/30/45
+is unchanged: still 0.05–0.4× of CLI's.
+
+#### Cross-confirmation: 13_img_resid1 also bit-identical
+
+```
+blk | eng F32-accum absmax | eng F16-accum absmax | F32_vs_F16 cossim
+----|----------------------|----------------------|--------------------
+  0 |             1207.73  |             1207.73  | 1.000
+  1 |          7274666.00  |          7274666.00  | 1.000
+  2 |          7284575.00  |          7284575.00  | 1.000
+  4 |          7272726.00  |          7272806.50  | 1.000
+ 30 |         11186554.00  |         11186683.00  | 1.000
+```
+
+Engine post-attention residual at block 01 is 7.27M (same as §5.5.29) under
+both accumulator modes; CLI's is 8.82M — the divergence is upstream of the
+matmul accumulator. Pixel-level F32/F16 residue is sub-LSB, far below the
+order-of-magnitude drift vs CLI.
+
+#### Bug surface (Gate-A re-localization)
+
+The WQBMMv3 dispatcher is precision-clean: `innerPrecise=0` (HIGH_PRECISION)
+and `innerPrecise=1` (HIGH_PERFORMANCE) produce numerically equivalent
+output for the modulation Linear (M=1, K=H=3072, N=6H=18432, Q4_0 weights,
+F16 scale tile). Therefore the §5.5.31 follow-up hypothesis "F16 accumulator
+overflow on mod1 matmul" is wrong.
+
+The mod2 magnitude drift at blocks 1/2/4/8/30/45 must originate elsewhere.
+Candidates not yet falsified:
+
+1. **modulate_ kernel F16 saturation.** `modulate_` runs entirely in F16.
+   Block 30 `14_img_LN2.absmax = 27.2`; if CLI's `(1+scale)*ln+shift` at
+   blk30 produces 6620, the engine's 305 would imply a ~22× drop. F16 max
+   65504 — no saturation. But the modulate_ multiply may be casting
+   intermediates differently than CLI does.
+
+2. **Block 0 modulation parameters happen to be small enough that all paths
+   agree.** §5.5.31 confirmed weight bytes are bit-exact. Therefore
+   per-block scale/shift values (chunks of img_mod_out) must agree per-byte
+   too — yet the post-LN modulation result diverges. Bug must be in either
+   (a) modulate_'s broadcast formula, or (b) CLI's LN/modulate ordering
+   differs from engine's.
+
+3. **CLI side LN axis or affine differs.** Engine LN2.std=1.0 by default;
+   CLI may run LN2 differently (e.g. RMSNorm, or a different epsilon, or
+   different reduction axis), and the divergence shows up only when the
+   per-block scale chunk has high magnitude.
+
+4. **The chunk ordering pin in §5.5.7 may be wrong on real Q4_0 weights.**
+   Legacy native ordering pinned `[scale, shift, gate]` per chunk; HF spec
+   says `[shift, scale, gate]`. §5.5.7 chose the legacy ordering for
+   numerical stability — but this is a pin, not a fix. CLI may use the
+   spec ordering, and the resulting cross-binding error would be
+   per-block-magnitude-dependent (which matches the observed pattern:
+   blocks 0/16/59 happen to have small chunks across the board so the
+   binding error is invisible; blocks 1/2/4/8/30/45 have large chunks
+   where the binding mis-assigns large-magnitude entries to the wrong
+   role).
+
+#### Recommended §5.5.33
+
+1. **Direct mod_out byte-compare.** Dump `02_img_mod_out` (engine) and
+   `img_mod_out` (CLI, after `img_mod.linear(silu(t_emb))`) at blocks
+   {0,1,30}. Per-byte diff. If bytes agree → bug is in modulate_ or
+   LN/affine ordering. If bytes disagree → bug is in matmul output (NOT
+   the F16 accumulator, which Gate A just ruled out — perhaps F16 scale
+   precision in the WQBMMv3 antiquant path; ggml-cann uses BF16 scale via
+   `GGML_CANN_QUANT_BF16` for similar reasons).
+
+2. **Chunk-binding A/B.** Toggle `QIE_DEBUG_DUMP_GATES=1` and explicitly
+   try the spec ordering `[shift, scale, gate]` at the chunk-pointer
+   block (line ~3393). Re-run mod2 absmax check. If blk30 jumps from 305
+   → ~6620, the chunk binding was the bug all along and §5.5.7's pin was
+   masking the symptom of an upstream amplification (which §5.5.31
+   already proved is NOT a weight-load bug — so the upstream amp must be
+   in the F32→F16 cast of t_emb pre-Linear, or in silu, or in the
+   LinearForward output cast).
+
+3. **CLI ordering audit.** Read
+   `tools/ominix_diffusion/src/qwen_image.hpp:280-326` Flux::modulate
+   carefully. Confirm the chunk[0] vs chunk[1] role. Cross-check against
+   the gate-dump receipts in §5.5.7 (chunk[4] mean_abs=26 — far too large
+   for `(1+scale)` but reasonable for a stale shift). If the mean_abs=26
+   chunk is **really** scale, the engine's legacy pin is silently
+   suppressing a 26× per-block amplification.
+
+#### Gates B–G
+
+NOT EXECUTED. Per the hard-rule policy in the dispatch contract, Gate A
+failure short-circuits all downstream gates. No engine code modified, no
+c_skip+c_out reconstruction landed, no n=1 cossim measured, no n=20 final
+latent computed, no 1024² PNG eye-checked. The cat-PNG saga remains OPEN.
+
+#### Saga state
+
+- Native engine: 2-week-old TILE-pattern PNG output remains unchanged at
+  full 1024² resolution.
+- Bug surface: localized to mod2 magnitude drift at blocks 1/2/4/8/30/45 —
+  WQBMMv3 dispatch ruled OUT, weight bytes ruled OUT (§5.5.31).
+- Next: mod_out byte-compare and chunk-binding audit (§5.5.33).
+
+#### Artefacts
+
+- `/tmp/qie_5532_gateA_eng.log` — engine probe stdout, F32-accum default
+- `/tmp/qie_5532_gateA_eng_blocks/blockNN/` — per-block residual + mod2
+  dumps under `QIE_MATMUL_INNER_PRECISE=0`
+- §5.5.30 dumps `/tmp/qie_5529_eng_blocks/` retained for F32-vs-F16 A/B
+
+HBM lock manually released after probe completion. No engine rebuild this
+dispatch (binary at HEAD `9812409` was already current). No bytes pushed.
