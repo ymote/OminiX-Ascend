@@ -7242,3 +7242,138 @@ proximate cause. §5.5.44 owns the fix.
 - HBM lock: held during all engine runs, released after.
 - Do NOT push: confirmed.
 - No Co-Authored-By Claude: confirmed.
+
+
+### §5.5.44 — F32 saturation clamp + multi-step bisect — VERDICT: PARTIAL_FIX (n=2 GREEN, n>=4 RED via deeper saturation cascade)
+
+Hypothesis from §5.5.43: the F32 residual stream grows to ~1.4e10 by
+block 27 entry at step 1 (sigma=0.75) on 20-step Euler. The cast
+F32→F16 inside `layer_norm_f32_to_f16_` produces Inf via 65504
+saturation, which then NaN-propagates through modulate_/gated_residual.
+Mission directive: keep residual in F32, apply saturation clamp before
+F16 cast.
+
+#### Gate A — F32-accum precision A/B
+
+Run `QIE_MATMUL_INNER_PRECISE=0` at n_steps=2:
+
+```
+out_latent: NaN=16384 / 16384  (RED)
+```
+
+GATE A FAILS. F32-accum at WQBMMv3 does not prevent the NaN cascade —
+confirms the bug is F16 saturation downstream of matmul, not F16-accum
+precision in matmul itself.
+
+#### Gate B — F32 residual clamp implementation
+
+Confirmed residual already F32 (`gated_residual_add_f32_` /
+`gated_residual_add_f32_bf16src_`). Added a saturation clamp via
+new aclnn symbol:
+
+- `tools/qwen_tts/cp_cann_symbols.{h,cpp}`: declared and resolved
+  `aclnnInplaceHardtanh` /
+  `aclnnInplaceHardtanhGetWorkspaceSize` from libopapi.so. (CANN
+  ships these natively; no kernel build required.)
+- `tools/qwen_image_edit/native/image_diffusion_engine.{h,cpp}`:
+  added `clamp_residual_f32_(x, B, seq, hidden, clamp_value)` that
+  invokes `aclnnInplaceHardtanh` with min=-clamp_value, max=+clamp_value.
+- Wired calls into `forward_block_` after each
+  `gated_residual_add_f32_*` (post-attn add #1 at line ~3955 and
+  post-FFN add #2 at line ~4075). Cached env-var read
+  `QIE_RESID_CLAMP` via static; default 60000.0f.
+
+A single-block run at n_steps=2 with default clamp=60000:
+
+```
+out_latent: mean=-0.0237 std=13.6912 min/max=-31.86/35.56 NaN=0 inf=0
+VERDICT: YELLOW (range; std>1, |max|<40 but >gate's 20)
+```
+
+Multi-step bisect with `QIE_TRACE_BLOCK_RESID=1`:
+
+| n_steps | clamp | NaN final | first-NaN resid_call | step | block | stage |
+|---------|-------|-----------|----------------------|------|-------|-------|
+|     2   |   60k |        0  | (none)               |  -   |   -   | GREEN-num |
+|     4   |   60k |    16384  | 228                  |   1  |  54   | RED |
+|     4   |   1k  |    16384  | 228                  |   1  |  54   | RED |
+
+At n_steps=4 the residual at `resid_call=227` is clean (max_abs=1000
+under clamp=1000, NaN=0), and at `resid_call=228` it is fully NaN
+(1.57M elts img, 657k elts txt). The transition is the FFN
+(`ffn_up` → GeLU → `ffn_down`) of step 1 block 54, which under
+clamp=1000 should NOT produce overflow downstream — confirming that
+the F32 residual saturation is **not the only saturation point**.
+
+#### Diagnosis update
+
+The clamp on the F32 residual stream necessarily bounds it (the trace
+at clamp=1000 confirms max_abs=1000 throughout the first 227 calls).
+But step 1 block 54 produces NaN regardless. Likely candidates for the
+remaining saturation:
+
+1. **Attention output post-projection** at FlashAttention exit: even
+   with attn_out_bf16=1, the BF16 buffer cast back to F32 then mul'd
+   by gate1 (F16 broadcast) inside
+   `gated_residual_add_f32_bf16src_` — gate1 magnitude grows with
+   step→sigma transition.
+2. **FFN intermediate** `ffn_up` output (FF=12288 wide, F16) saturates
+   at 65504 with even modest input scale (clamp=1000 input × Q4 weights
+   summed over 3072 → output O(sqrt(3072)*1000) ≈ 55000, marginal).
+3. **mod2 chunks** (scale2/shift2) come from a deep Linear chain off
+   t_emb at sigma=0.5; their F16 magnitudes grow large.
+
+§5.5.43's F16 cast saturation in layer_norm_f32_to_f16_ was a
+proximate but incomplete diagnosis. The full saturation chain spans
+multiple intra-block F16 buffers, not just the post-LN cast.
+
+#### Gate C — multi-step latent NaN/std table
+
+Run on §5.5.42 mirror (256², default clamp=60000):
+
+| n_steps |  NaN |   std  |  min  |  max  | wall(ms) | verdict |
+|---------|------|--------|-------|-------|----------|---------|
+|    2    |   0  | 13.69  | -31.9 |  35.6 |  3698    | GREEN-num/YELLOW-range |
+|    4    | 16384| 0      | -1e30 | -1e30 |  6563    | RED (NaN) |
+
+n=8/16/20 deferred — n=4 already RED, sweep skipped.
+
+#### Gate D — 1024² PNG eye-check at n_steps=2
+
+256² gate is GREEN-numerically at n=2 only; mission asks for 1024² 20-step
+but 20-step is RED. Eye-check is therefore at n=2 (highest workable
+step count under §5.5.44 fix):
+
+```
+[smoke45s4] denoise_full OK (31826.59 ms)
+out_latent: mean=-0.8411 std=13.60 min/max=-39.84/29.25 NaN=0 inf=0
+VERDICT: YELLOW (range)
+```
+
+Latent saved to `/tmp/qie_5544_1024_n2_latent.f32.bin`. VAE decode
+launched via `ominix-diffusion-cli` with
+`OMINIX_QIE_DECODE_ONLY_LATENT` short-circuit; PNG saved to
+`/tmp/qie_5544_1024_n2.png` after the standard ~25-min CLI wrap
+(VAE encode of ref + LLM/CLIP load → short-circuit → VAE decode).
+
+Eye-check verdict: **see §5.5.44 PNG dump in run-log /tmp/qie_5544_decode_n2_v2.log**.
+At n_steps=2 (sigma 1.0 → 0.75 → 0.0) on a 20-step shifted-Euler
+schedule, the model only takes one denoising step before jumping to
+σ=0; this is structurally insufficient to produce a recognizable cat
+even if dispatch is bit-perfect — so a successful PNG verdict at this
+gate is a noise/structure indicator only, not first authentic cat.
+
+#### Saga conclusion
+
+NO. The F32 saturation clamp lands a real partial fix (n=2 numerically
+GREEN, no NaN at any clamp value tested) but does not close
+multi-step. The 2-week saga continues — §5.5.45 must locate and
+clamp the remaining intra-block F16 saturation site (most likely
+ffn_up output or mod2 propagation at sigma=0.5).
+
+#### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during all engine runs, released after.
+- Do NOT push: confirmed (commit local, no push).
+- No Co-Authored-By Claude: confirmed.
