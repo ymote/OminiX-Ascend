@@ -2,6 +2,7 @@
 #define __QWEN_IMAGE_HPP__
 
 #include <cstdlib>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -258,7 +259,8 @@ namespace Qwen {
                                                               struct ggml_tensor* t_emb,
                                                               struct ggml_tensor* pe,
                                                               struct ggml_tensor* modulate_index = nullptr,
-                                                              struct ggml_tensor* attention_mask = nullptr) {
+                                                              struct ggml_tensor* attention_mask = nullptr,
+                                                              int block_idx = -1) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -316,6 +318,23 @@ namespace Qwen {
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
+            // [QIE Q2.4.5.5.29] Tag post-attention residuals for CLI diagnostic dump.
+            // Gated by QIE_CLI_DUMP_RESID env var in ggml_extend.hpp::compute().
+            // Selective subset matches engine §5.5.22 QIE_DUMP_BLOCK_INDICES default
+            // (0,1,2,4,8,16,30,45,59). Marking all 60 would balloon HBM by ~12 GB.
+            auto is_dump_block = [&](int b) {
+                return b == 0 || b == 1 || b == 2 || b == 4 || b == 8 ||
+                       b == 16 || b == 30 || b == 45 || b == 59;
+            };
+            if (block_idx >= 0 && is_dump_block(block_idx) && std::getenv("QIE_CLI_DUMP_RESID")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_13_img_resid1", block_idx);
+                ggml_set_name(img, nm);
+                ggml_set_output(img);
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_13_txt_resid1", block_idx);
+                ggml_set_name(txt, nm);
+                ggml_set_output(txt);
+            }
 
             auto img_normed2    = img_norm2->forward(ctx, img);
             auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2, img_mod_param_vec[4], img_mod_param_vec[3], modulate_index != nullptr);  // Q2.4.5.5.22: swap to engine convention
@@ -337,6 +356,20 @@ namespace Qwen {
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp_out, img_gate2));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_gate2));
+            // [QIE Q2.4.5.5.29] Tag post-FFN residuals for CLI diagnostic dump.
+            auto is_dump_block2 = [&](int b) {
+                return b == 0 || b == 1 || b == 2 || b == 4 || b == 8 ||
+                       b == 16 || b == 30 || b == 45 || b == 59;
+            };
+            if (block_idx >= 0 && is_dump_block2(block_idx) && std::getenv("QIE_CLI_DUMP_RESID")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_24_img_resid2", block_idx);
+                ggml_set_name(img, nm);
+                ggml_set_output(img);
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_24_txt_resid2", block_idx);
+                ggml_set_name(txt, nm);
+                ggml_set_output(txt);
+            }
 
             return {img, txt};
         }
@@ -443,7 +476,7 @@ namespace Qwen {
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<QwenImageTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
 
-                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index, attention_mask);
+                auto result = block->forward(ctx, img, txt, t_emb, pe, modulate_index, attention_mask, /*block_idx*/ i);
                 img         = result.first;
                 txt         = result.second;
             }

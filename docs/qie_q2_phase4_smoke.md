@@ -5189,3 +5189,115 @@ active:
 
 CLI was killed gracefully after the dump landed; HBM lock manually
 released. No bytes pushed to remote.
+
+### §5.5.29 Per-block residual abs-max trace eng vs CLI — FFN_GATE2_DROP_AT_BLK01_NONZERO
+
+**Verdict:** Engine residual stream stops growing after block 0. CLI's residual
+stream grows ~3 orders of magnitude through 60 blocks (7e6 → 1e10). Engine
+stays roughly flat at 7-60M absmax. **First divergent block: 1 (post-FFN).**
+
+#### Infrastructure
+
+CLI side: `qwen_image.hpp` `QwenImageTransformerBlock::forward` now takes an
+optional `int block_idx = -1`. When `QIE_CLI_DUMP_RESID=1` and block_idx is in
+{0,1,2,4,8,16,30,45,59}, `ggml_set_name` + `ggml_set_output` tag the four
+residual additions per block (img/txt × resid1/resid2). Post-compute scan in
+`ggml_extend.hpp::compute()` reads each tagged tensor's data and prints absmax,
+mean, std as a `[QIE_CLI_RESID]` LOG_INFO line. Optional F32 dumps to
+`/tmp/qie_5529_cli_blocks/blockNN/` when `QIE_CLI_DUMP_BLOCKS_F32=1`. Selective
+block subset prevents HBM blowup (~12GB if all 60 marked as outputs).
+
+Engine side: REUSED §5.5.22 infrastructure unchanged. `QIE_DUMP_BLOCK_INDICES`
+plus `QIE_DUMP_BLOCK0_DIR` produce per-block `13_img_resid1.f32`,
+`13_txt_resid1.f32`, `24_img_resid2.f32`, `24_txt_resid2.f32` plus all the
+intra-block intermediates (LN, mod, attn, FFN, gates).
+
+#### Per-block abs-max comparison (selected sites)
+
+```
+blk | site             |   eng absmax |   cli absmax |   ratio e/c
+----|------------------|--------------|--------------|------------
+  0 | 13_img_resid1    |     1.21e+03 |     1.24e+03 |     0.976  match
+  0 | 24_img_resid2    |     7.28e+06 |     7.07e+06 |     1.030  match
+  1 | 13_img_resid1    |     7.27e+06 |     8.82e+06 |     0.825
+  1 | 24_img_resid2    |     7.29e+06 |     1.41e+08 |     0.052  FIRST DIVERGE
+  2 | 24_img_resid2    |     7.29e+06 |     2.22e+08 |     0.033
+  4 | 24_img_resid2    |     7.27e+06 |     3.18e+08 |     0.023
+  8 | 24_img_resid2    |     9.27e+06 |     4.82e+08 |     0.019
+ 16 | 24_img_resid2    |     1.01e+07 |     1.14e+09 |     0.009
+ 30 | 24_img_resid2    |     1.11e+07 |     3.32e+09 |     0.003
+ 45 | 24_img_resid2    |     1.18e+07 |     7.33e+09 |     0.002
+ 59 | 24_img_resid2    |     5.78e+07 |     1.00e+10 |     0.006
+```
+
+(txt-side residuals show same divergence, smaller magnitudes.)
+
+**Block 0 (post-attention AND post-FFN): eng matches CLI within 3%.**
+
+**Block 1 post-FFN: eng = 7.29M, CLI = 141M, ratio = 0.052 (engine 19x too LOW).**
+
+After block 1, the CLI residual stream grows ~150x per chunk of blocks while
+the engine stream remains roughly flat. By block 59 the engine residual is
+175x smaller than CLI's.
+
+#### Substep localization at block 1
+
+Engine intra-block intermediates (block 1):
+- `13_img_resid1` absmax = 7.27M (input to FFN block, OK — eng/cli within 17%)
+- `14_img_LN2` absmax = 15.7, std = 1.000 (LayerNorm — by definition)
+- `15_img_mod2` absmax = 141 (post `(1+scale)*ln + shift`)
+- `20_img_ff_down` absmax = 62K (FFN down-projection output)
+- delta r2 - r1 = 1.87M (gated FFN contribution to residual)
+
+For block 0 the same trace yields delta = 7.28M (FFN contribution). Engine
+**block 1 FFN-gated contribution is 4x smaller than block 0's**, while CLI's
+FFN-gated contribution at block 1 is **~70x larger than engine's** (132M vs
+1.87M).
+
+Engine `15_img_mod2.absmax` drops from 487 (blk00) -> 141 (blk01) -> similar
+through later blocks. The post-LN modulation `(1+scale_mod) * ln + shift_mod`
+becomes consistently smaller in engine than CLI starting at block 1. Since
+LN2.std=1.0 by definition, the difference must be in the modulation
+parameters: `(1 + img_scale2)` and `img_shift2` produced by `img_mod_1`
+linear layer applied to silu(t_emb).
+
+**Bug surface (working hypothesis):**
+- Engine's per-block `img_mod_1` (and/or `txt_mod_1`) Linear output for
+  block 1+ is producing scales/shifts of much smaller magnitude than CLI's
+  — yet block 0's modulation gates produce matching residual magnitudes.
+- Candidate: t_emb is fine, mod_1 weights load correctly, but the
+  `chunk[3..5]` slicing convention OR the per-block selection from the
+  GGUF tensor map may pick the wrong block's gate after block 0.
+- Alternate candidate: there is a per-block weight-loading offset error
+  (`block_idx` to `transformer_blocks.NN.txt_mod_1` lookup); only block 0
+  loads correctly; block N>=1 loads block-N's mod1 weights but applies them
+  to a stale t_emb-derived modulation? — UNLIKELY since t_emb is reused.
+- Most likely: BF16/F16 precision loss in the gate2-multiplied FFN output
+  before the residual add. F16 max is 65504; engine `20_img_ff_down` is in
+  the 60K range — close to F16 saturation. If the `gated_residual_add` runs
+  partial F16 path it could clamp to ~7M which IS the observed plateau.
+
+#### Recommended §5.5.30
+
+Three-step bisect to pinpoint:
+1. Add gate2 (`MOD_chunk5_gate2`) absmax dump to engine block-1 (engine
+   already has it — just check log levels). Compare to CLI block-1 mod2
+   chunk[5] gate. If mismatched: bug is in `img_mod_1` Linear application.
+2. Add CLI-side `15_img_mod2`-equivalent dump (post-modulation pre-FFN).
+   Direct head-to-head magnitude check.
+3. If both modulation paths agree but gated FFN-residual diverges, suspect
+   F16 saturation in `gated_residual_add_f32_bf16src_` — replace BF16 src
+   FFN-down path with F32-only path for first 3 blocks and re-run.
+
+The c_skip/c_out reconstruction proposed in §5.5.28 is ORTHOGONAL to this
+bug — that's a separate post-DiT scaling. Both must land for §5.5.30 GREEN.
+
+#### Artefacts
+
+- `/tmp/qie_5529_cli_blocks/blockNN/qie_cli_blkNN_*.f32.bin` (CLI per-block residuals)
+- `/tmp/qie_5529_eng_blocks/blockNN/*.f32` (engine per-block residuals + intermediates)
+- `/tmp/qie_5529_cli.log` (CLI dump trace, `[QIE_CLI_RESID]` lines)
+- `/tmp/qie_5529_eng.log` (engine probe stdout)
+
+CLI was killed mid-VAE-decode (eye-check not needed); HBM lock manually
+released. No bytes pushed.

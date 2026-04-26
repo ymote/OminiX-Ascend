@@ -2197,6 +2197,59 @@ public:
                 }
             }
         }
+        // [QIE Q2.4.5.5.29] Per-block residual abs-max / std dump for CLI vs engine
+        // comparison. Gated by QIE_CLI_DUMP_RESID. Tags set by qwen_image.hpp at
+        // the 4 residual addition sites with names like
+        // "qie_cli_blkNN_13_img_resid1", "qie_cli_blkNN_24_img_resid2", etc.
+        if (std::getenv("QIE_CLI_DUMP_RESID") && !ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_synchronize(runtime_backend);
+            const bool dump_f32 = (std::getenv("QIE_CLI_DUMP_BLOCKS_F32") != nullptr);
+            const char* outdir  = "/tmp/qie_5529_cli_blocks";
+            if (dump_f32) {
+                std::string mk = std::string("mkdir -p ") + outdir;
+                (void)system(mk.c_str());
+            }
+            int n_nodes = ggml_graph_n_nodes(gf);
+            std::vector<float> buf;
+            for (int i = 0; i < n_nodes; i++) {
+                struct ggml_tensor* node = ggml_graph_node(gf, i);
+                const char* name = ggml_get_name(node);
+                if (!name || strncmp(name, "qie_cli_blk", 11) != 0) continue;
+                if (node->type != GGML_TYPE_F32) continue;
+                int64_t n = ggml_nelements(node);
+                buf.resize(n);
+                ggml_backend_tensor_get(node, buf.data(), 0, n * sizeof(float));
+                double sum = 0.0, sumsq = 0.0, absmax = 0.0;
+                int nans = 0;
+                for (int64_t j = 0; j < n; j++) {
+                    float v = buf[j];
+                    if (std::isnan(v) || std::isinf(v)) { nans++; continue; }
+                    double a = std::fabs((double)v);
+                    if (a > absmax) absmax = a;
+                    sum += v; sumsq += (double)v * (double)v;
+                }
+                double mean = sum / (double)std::max<int64_t>(1, n);
+                double var  = sumsq / (double)std::max<int64_t>(1, n) - mean * mean;
+                double stdv = var > 0 ? std::sqrt(var) : 0.0;
+                LOG_INFO("[QIE_CLI_RESID] %s shape=[%ld,%ld,%ld,%ld] absmax=%.4e mean=%+.4e std=%.4e nans=%d/%ld",
+                         name, (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
+                         absmax, mean, stdv, nans, (long)n);
+                if (dump_f32) {
+                    int bn = -1;
+                    if (sscanf(name, "qie_cli_blk%d_", &bn) == 1 &&
+                        (bn == 0 || bn == 1 || bn == 2 || bn == 30 || bn == 59)) {
+                        char path[256];
+                        snprintf(path, sizeof(path), "%s/block%02d", outdir, bn);
+                        std::string mk = std::string("mkdir -p ") + path;
+                        (void)system(mk.c_str());
+                        char fpath[512];
+                        snprintf(fpath, sizeof(fpath), "%s/%s.f32.bin", path, name);
+                        FILE* f = std::fopen(fpath, "wb");
+                        if (f) { std::fwrite(buf.data(), sizeof(float), (size_t)n, f); std::fclose(f); }
+                    }
+                }
+            }
+        }
         copy_cache_tensors_to_cache_buffer();
         if (output != nullptr) {
             auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
