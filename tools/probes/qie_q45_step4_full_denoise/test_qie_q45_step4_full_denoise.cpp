@@ -141,8 +141,13 @@ int main(int /*argc*/, char ** /*argv*/) {
     cfg.head_dim      = 128;
     cfg.hidden_size   = 3072;
     cfg.ff_mult       = 4;
-    cfg.max_img_seq   = 4096;
+    // Q2.4.5.5.24: bumped from 4096 → 8192 to accommodate 1024² (img+ref =
+    // 4096+4096=8192). RoPE pe-table is sized off max(max_img_seq, max_txt_seq)
+    // so this scales scratch + rope buffers; does not change engine math.
+    cfg.max_img_seq   = 8192;
     cfg.max_txt_seq   = 256;
+    if (const char *e = std::getenv("QIE_Q45_MAX_IMG_SEQ"))
+        cfg.max_img_seq = std::atoi(e);
     cfg.precompute_rope = true;
     cfg.joint_attention_dim = (int)joint_dim;
 

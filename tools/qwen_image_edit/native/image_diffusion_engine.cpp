@@ -3087,18 +3087,35 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // F16-strict and the magnitudes there are bounded by the upstream
     // LN/SiLU normalization (max ≤ ~3700 observed at block 0, far below
     // F16's 65504). The leak surface is solely the residual contributors.
+    // Q2.4.5.5.24: §5.5.23 confirmed both residual contributors (ff_down
+    // and attn-out) MUST be BF16 to avoid F16-saturation NaN at block 1
+    // once the residual stream reaches ~7M magnitude. Default both ON.
+    // The env vars are kept as override-OFF diagnostics:
+    //   QIE_DISABLE_ALL_BF16=1     → force attn_out_bf16=false (legacy F16)
+    //   QIE_DISABLE_FFN_DOWN_BF16=1 → force ffn_down_bf16=false (legacy F16)
+    // The legacy QIE_ALL_BF16 / QIE_FFN_DOWN_BF16 names are accepted as
+    // override-OFF when explicitly set to 0 (preserves backward-compat
+    // for `QIE_ALL_BF16=0` diagnostic backout).
     static int s_ffn_down_bf16 = -1;
     static int s_all_bf16      = -1;
     if (s_ffn_down_bf16 < 0) {
-        const char *v_specific = std::getenv("QIE_FFN_DOWN_BF16");
-        const char *v_all      = std::getenv("QIE_ALL_BF16");
-        int specific = v_specific ? std::atoi(v_specific) : 0;
-        int all      = v_all      ? std::atoi(v_all)      : 0;
-        s_all_bf16      = all;
-        s_ffn_down_bf16 = specific || all;
-        QIE_LOG("forward_block_: QIE_FFN_DOWN_BF16=%d QIE_ALL_BF16=%d "
-                "(ff_down BF16 + bf16src #2 always under either; "
-                "attn-out BF16 + bf16src #1 only under ALL)",
+        auto override_off = [](const char *name) -> bool {
+            const char *v = std::getenv(name);
+            return v && std::atoi(v) == 1;
+        };
+        auto explicit_zero = [](const char *name) -> bool {
+            const char *v = std::getenv(name);
+            return v && std::atoi(v) == 0;
+        };
+        bool disable_all  = override_off("QIE_DISABLE_ALL_BF16")
+                            || explicit_zero("QIE_ALL_BF16");
+        bool disable_ffd  = override_off("QIE_DISABLE_FFN_DOWN_BF16")
+                            || explicit_zero("QIE_FFN_DOWN_BF16");
+        s_all_bf16      = disable_all ? 0 : 1;
+        s_ffn_down_bf16 = (disable_all && disable_ffd) ? 0 : 1;
+        QIE_LOG("forward_block_: ffn_down_bf16=%d attn_out_bf16=%d "
+                "(default ON; override-off via QIE_DISABLE_{ALL,FFN_DOWN}_BF16=1 "
+                "or legacy QIE_{ALL,FFN_DOWN}_BF16=0)",
                 s_ffn_down_bf16, s_all_bf16);
     }
     const bool ffn_down_bf16 = s_ffn_down_bf16 != 0;

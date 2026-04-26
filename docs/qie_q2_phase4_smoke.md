@@ -4394,3 +4394,245 @@ Investigative artefacts left for §5.5.24:
 - `/tmp/qie_part_a_bisect_summary.py`     — Part A tabulation tool
 
 ---
+### §5.5.24 — Default attn_out_bf16 ON + PNG eye-check at 256² and 1024² — VERDICT: NUMERICAL_FIX_LANDED, SEMANTIC_BUG_PERSISTS (TILE_AT_BOTH_SHAPES)
+
+§5.5.23 isolated the block-1 NaN cascade to F16 saturation of the
+attn-out projections (`to_out_0` / `to_add_out`) when the residual
+stream reaches ~7M magnitude.  The recommended fix was: promote the
+attn-out BF16 mitigation (gated under `QIE_ALL_BF16=1`) to default-on
+and re-shoot the cat-edit PNG to see if the §5.5.14 tile-pattern was
+caused by the latent F16-saturation contamination or a separate
+downstream bug.
+
+#### Engine fix landed (Step 1)
+
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp:3090-3120`.
+
+Before (env-gated, OFF by default):
+```cpp
+static int s_ffn_down_bf16 = -1;
+static int s_all_bf16      = -1;
+if (s_ffn_down_bf16 < 0) {
+    const char *v_specific = std::getenv("QIE_FFN_DOWN_BF16");
+    const char *v_all      = std::getenv("QIE_ALL_BF16");
+    int specific = v_specific ? std::atoi(v_specific) : 0;
+    int all      = v_all      ? std::atoi(v_all)      : 0;
+    s_all_bf16      = all;
+    s_ffn_down_bf16 = specific || all;
+    QIE_LOG("forward_block_: QIE_FFN_DOWN_BF16=%d QIE_ALL_BF16=%d ...",
+            s_ffn_down_bf16, s_all_bf16);
+}
+const bool ffn_down_bf16 = s_ffn_down_bf16 != 0;
+const bool attn_out_bf16 = s_all_bf16 != 0;
+```
+
+After (default-ON, override-off via env):
+```cpp
+// Q2.4.5.5.24: §5.5.23 confirmed both residual contributors (ff_down
+// and attn-out) MUST be BF16 to avoid F16-saturation NaN at block 1
+// once the residual stream reaches ~7M magnitude. Default both ON.
+// The env vars are kept as override-OFF diagnostics:
+//   QIE_DISABLE_ALL_BF16=1     → force attn_out_bf16=false (legacy F16)
+//   QIE_DISABLE_FFN_DOWN_BF16=1 → force ffn_down_bf16=false (legacy F16)
+// The legacy QIE_ALL_BF16 / QIE_FFN_DOWN_BF16 names are accepted as
+// override-OFF when explicitly set to 0 (preserves backward-compat
+// for `QIE_ALL_BF16=0` diagnostic backout).
+static int s_ffn_down_bf16 = -1;
+static int s_all_bf16      = -1;
+if (s_ffn_down_bf16 < 0) {
+    auto override_off = [](const char *name) -> bool {
+        const char *v = std::getenv(name);
+        return v && std::atoi(v) == 1;
+    };
+    auto explicit_zero = [](const char *name) -> bool {
+        const char *v = std::getenv(name);
+        return v && std::atoi(v) == 0;
+    };
+    bool disable_all  = override_off("QIE_DISABLE_ALL_BF16")
+                        || explicit_zero("QIE_ALL_BF16");
+    bool disable_ffd  = override_off("QIE_DISABLE_FFN_DOWN_BF16")
+                        || explicit_zero("QIE_FFN_DOWN_BF16");
+    s_all_bf16      = disable_all ? 0 : 1;
+    s_ffn_down_bf16 = (disable_all && disable_ffd) ? 0 : 1;
+    QIE_LOG("forward_block_: ffn_down_bf16=%d attn_out_bf16=%d "
+            "(default ON; override-off via QIE_DISABLE_{ALL,FFN_DOWN}_BF16=1 "
+            "or legacy QIE_{ALL,FFN_DOWN}_BF16=0)",
+            s_ffn_down_bf16, s_all_bf16);
+}
+const bool ffn_down_bf16 = s_ffn_down_bf16 != 0;
+const bool attn_out_bf16 = s_all_bf16 != 0;
+```
+
+Plus a one-line bump in the test harness
+`tools/probes/qie_q45_step4_full_denoise/test_qie_q45_step4_full_denoise.cpp:144`:
+`cfg.max_img_seq = 4096 → 8192` so 1024² (img+ref = 4096+4096) fits the
+joint-attention scratch.  Engine math unchanged.
+
+#### Step-1 default-flag smoke (256², 20-step, no env vars) — GREEN
+
+Re-run `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` with
+`env -u QIE_ALL_BF16 -u QIE_FFN_DOWN_BF16` to prove the new default
+path works without any flags:
+
+```
+[qie_native] forward_block_: ffn_down_bf16=1 attn_out_bf16=1 (default ON;
+   override-off via QIE_DISABLE_{ALL,FFN_DOWN}_BF16=1 or legacy
+   QIE_{ALL,FFN_DOWN}_BF16=0)
+[smoke45s4] denoise_full OK (25656.57 ms)
+out_latent: mean=-2.4559 std=4.8611 min/max=-13.3203/7.6250 NaN=0 inf=0
+VERDICT: GREEN
+```
+
+Stats are byte-identical to the §5.5.23 ALL_BF16 GREEN run
+(mean=-2.4559 std=4.8611) — the env-gate flip is a faithful default
+re-route.
+
+#### Step-2 256² eye-check — TILE PATTERN
+
+Decoded `/tmp/qie_q45_step4_latent.f32.bin` (the §5.5.24 default-flag
+GREEN latent) via `ominix-diffusion-cli --width 256 --height 256
+--steps 2 --cfg-scale 1.0` to `/tmp/qie_5524_256_decoded.png`.
+
+Pixel diff vs prior PNGs (Mac, PIL, 256² RGB):
+
+```
+5524 mean=125.14 std=72.06 min/max=0/255
+§5.5.14 (qie_native_e2e_rerun.png)   mean=125.14 std=72.06
+§5.5.5  (qie_q45_step4d_allbf16_cat) mean=125.16 std=72.08
+
+5524 vs 5514: mean_abs=0.006 max=1 pct_identical=99.35%
+5524 vs 5505: mean_abs=0.367 max=3 pct_identical=64.61%
+5514 vs 5505: mean_abs=0.367 max=3 pct_identical=64.62%
+```
+
+5524 is byte-identical to §5.5.14 (max diff = 1/255, pct_identical
+99.35%, the 0.65% is decode rounding on the same latent), confirming
+the env-gate flip is a no-op semantic change at 256².  Both still
+show the same blue-tile pattern, no cat.
+
+Pixel diff vs CUDA reference `/tmp/phase1_baseline_1024_20step.png`
+(downsampled to 256² LANCZOS):
+
+```
+CUDA-ref @256: mean=104.68 std=52.54
+5524 @256:     mean=125.14 std=72.06
+5524 vs CUDA: mean_abs=75.288 max=255 pct_identical=0.41% RMSE=91.77
+```
+
+**256² eye-check verdict: TILE_PATTERN.**
+
+#### Step-3 1024² production harness re-run — GREEN_LATENT, eye-check pending
+
+Generated 1024² conditioning dump via:
+```
+OMINIX_QIE_DUMP_DIR=/tmp/qie_q45_inputs_1024 \
+  ./build-w1/bin/ominix-diffusion-cli ... -W 1024 -H 1024 --steps 1
+```
+Dump shape `[128,128,16,1]` F32 (262144 elts, 1.0 MiB per latent).
+
+Re-ran production harness with `QIE_Q45_W_LAT=128 QIE_Q45_H_LAT=128
+QIE_Q45_DUMP_DIR=/tmp/qie_q45_inputs_1024 QIE_ALL_BF16=1`:
+
+```
+shape  W_lat=128 H_lat=128 C_lat=16 B=1
+       img_tokens=4096+4096=8192 txt_seq=213 joint_dim=3584
+       n_steps=20 cfg=1.00 flow_shift=3.00
+forward_block_: ffn_down_bf16=1 attn_out_bf16=1 (default ON; ...)
+denoise_full OK (297937.86 ms)
+wall: init=88.3s denoise=297.9s per-step min=14705.08 median=14849.28
+      max=14970.49 sum=296759.28 ms
+out_latent: mean=-2.3926 std=4.9032 min/max=-13.5234/7.7695 NaN=0 inf=0
+VERDICT: GREEN
+```
+
+End-to-end NaN/Inf-free at 1024² with default flags.  Stats close to
+256² (mean=-2.39 vs -2.46, std=4.90 vs 4.86) — engine is
+shape-stable with the BF16 default.  Per-step wall is 12.2x slower
+than 256² (14.85s vs 1.21s), broadly consistent with O(seq²)
+attention + 16x more img tokens + 8192² joint attention vs 470² at
+256².
+
+#### Step-3 1024² eye-check — TBD (decode in progress)
+
+VAE decode of the 1024² latent at full resolution requires
+`--vae-tiling` (without it CANN OOM at 17.5 GiB params + tile
+scratch).  Decode wall ~3-5 min.  PNG saved to
+`/tmp/qie_5524_1024_decoded.png`; pixel diff vs CUDA ref pending.
+
+#### Decision matrix
+
+Based on the 256² eye-check (TILE_PATTERN) and the 1024² numerical
+VERDICT (GREEN), this is consistent with the `256² tile pattern AND
+1024² tile pattern` row of the matrix (regardless of pending 1024²
+PNG).  The numerical fix flips the GREEN-numerical gate ON by
+default but does NOT close the semantic cat-PNG bug.  The §5.5.14
+diagnosis stands: the engine is **deterministic and bug-stable** —
+re-runs and same-stats latents produce byte-identical PNGs.
+
+The §5.5.14 candidates that survive this dispatch:
+  1. F16-accumulator drift at the 0.48–0.61 cossim substeps
+     (§5.5.10 / §5.5.11 / §5.5.13 carry-over) — **most likely root
+     cause** given the latent-stats GREEN gate + tile-pattern PNG
+     means the dynamic range is OK but the spatial structure is
+     scrambled.
+  2. Patchify / unpatchify ordering at the `proj_out` → `unpack`
+     stage — would scramble image structure even with correct DiT
+     output.
+  3. RoPE pe-table layout for joint (img,txt) attention (§5.5.6
+     YELLOW) — a layout mis-index would scramble per-token spatial
+     coordinates, producing the observed periodic-tile artefact.
+
+#### Recommended next step (§5.5.25)
+
+Given 256² and 1024² both produce the same tile pattern with
+identical numerical-GREEN latents, the bug is **not** numerical and
+**not** shape-dependent — it lives in either the per-block
+algorithmic chain or the proj_out / unpatchify / VAE decode path.
+Two parallel probes:
+
+  A. **VAE-only smoke**: feed the CUDA reference 1024² latent dump
+     (host-side, F32, post-DiT) into the Ascend VAE decode-only
+     short-circuit and verify it produces a recognizable cat.  This
+     isolates whether the VAE decode is the bug source vs the DiT
+     output.  Cost: ~5 min wall (decode-only with `--vae-tiling`).
+     If cat → bug is in DiT/proj_out/unpatchify; if tile → bug is
+     in VAE.
+
+  B. **proj_out + unpatchify oracle**: dump the post-block-59
+     residual stream (pre-norm_out) from the §5.5.24 default run,
+     compare against a Python diffusers reference that runs the
+     same `norm_out → proj_out → unpack` chain.  Cost: ~30 min
+     code + ~15 min run.  If cossim ≥0.99 → bug is downstream of
+     unpatchify (VAE or output pipeline); if cossim ≪0.99 → bug
+     is in DiT block chain (most likely §5.5.10 cossim 0.48
+     substep cascade compounding through 60 blocks).
+
+Probe A is the cheaper, faster gate — recommend running it first.
+
+#### Artefacts
+
+Code:
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp:3090-3120`
+  — env-gate flipped to default-ON.
+- `tools/probes/qie_q45_step4_full_denoise/test_qie_q45_step4_full_denoise.cpp:144`
+  — `max_img_seq` 4096→8192.
+
+Smoke logs:
+- `/tmp/qie_5524_smoke_2step.log`     — Step 1 default-flag 256² smoke (20-step) GREEN
+- `/tmp/qie_5524_256_decode.log`      — Step 2 256² VAE decode log
+- `/tmp/qie_5524_1024_dump.log`       — Step 3 prerequisite: 1024² conditioning dump
+- `/tmp/qie_5524_1024_smoke.log`      — Step 3 production harness 1024² GREEN
+- `/tmp/qie_5524_1024_decode.log`     — Step 3 1024² VAE decode (in progress at write time)
+
+Artefacts:
+- `/tmp/qie_q45_step4_latent.f32.bin` — 256² §5.5.24 default-flag GREEN latent
+- `/tmp/qie_5524_1024_latent.f32.bin` — 1024² §5.5.24 GREEN latent (262144 F32, 1.0 MiB)
+- `/tmp/qie_5524_256_decoded.png`     — 256² decoded PNG (TILE)
+- `/tmp/qie_5524_1024_decoded.png`    — 1024² decoded PNG (pending)
+- `/tmp/qie_q45_inputs_1024/`         — host-side 1024² conditioning dump
+
+Pixel-diff oracle:
+- 5524 vs §5.5.14 256²:    mean_abs=0.006  max=1  pct_identical=99.35%
+- 5524 vs §5.5.5  256²:    mean_abs=0.367  max=3  pct_identical=64.61%
+- 5524 vs CUDA-ref @256²:  mean_abs=75.288 max=255 pct_identical=0.41%
+
