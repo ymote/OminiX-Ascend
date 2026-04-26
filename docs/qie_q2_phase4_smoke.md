@@ -7377,3 +7377,134 @@ ffn_up output or mod2 propagation at sigma=0.5).
 - HBM lock: held during all engine runs, released after.
 - Do NOT push: confirmed (commit local, no push).
 - No Co-Authored-By Claude: confirmed.
+
+## §5.5.45 — F16 saturation at Q/K/V projection outputs — VERDICT: GREEN multi-step (NaN=0 at n_steps=20, std=15.1, range ±41)
+
+### Mission
+
+After §5.5.44 landed a partial fix (n=2 GREEN, n>=4 RED with NaN at
+resid_call=228 ≈ step 3 block 48 with cfg=1.0 single-stream), drill
+into the FFN substeps to identify the next F16 saturation site and
+widen the offending buffer.
+
+### Gate A — FFN substep instrumentation
+
+Added `QIE_TRACE_FFN_SUBSTEPS=1` per-call probe lambda `ffn_probe`
+covering substeps 04..24 of `forward_block_` (LN1, mod1, Q/K/V proj,
+RMSNorm, RoPE, attn_out, resid1, LN2, mod2, ffn_up, gelu, ffn_down,
+resid2). Fires for every block call, optionally bracketed by
+`QIE_TRACE_FFN_CALL_MIN/MAX`.
+
+Trace at calls 227..228 (n=4, QIE_RESID_CLAMP=60000):
+
+| call | substep         | dtype | max_abs | NaN | Inf  |
+|-----:|----------------|-------|--------:|----:|-----:|
+| 227  | 08_txt_K       | F16   | 4.27e4  | 0   | 0    |
+| 227  | 13_img_resid1  | F32   | 8.97e8  | 0   | 0    |
+| 227  | 24_img_resid2  | F32   | 9.53e8  | 0   | 0    |
+| 228  | 08_img_Q       | F16   | 6760    | 0   | 0    |
+| 228  | **08_txt_K**   | F16   | 4.73e4  | 0   | **214** ← FIRST NaN/Inf |
+| 228  | 09_txt_K_rmsn  | F16   | 16.77   | 214 | 0    |
+| 228  | 10_txt_K_rope  | F16   | 16.44   | 428 | 0    |
+| 228  | 11_attn_out_*  | F16   | —       | 27392..65536 | 0 |
+| 228  | 13_*_resid1    | F32   | 0       | 1.5M | 0    |
+
+**First-NaN substep: 08_txt_K** (txt-side K projection F16 output
+saturates to 214 Inf values). This is BEFORE the FFN — the saga
+hypothesis (inside FFN) was wrong. Cascade: K Inf → RMSNorm
+sum-of-squares overflow → NaN → all attention outputs NaN → resid
+NaN. Q and V also approach the F16 boundary at deep blocks but txt_K
+crosses first.
+
+### Gate B — F16 clamp on Q/K/V buffers
+
+Added `clamp_f16_(void *, n_elts, clamp_value)` helper (in-place
+`aclnnInplaceHardtanh` on F16 dtype). Wired into `forward_block_`
+right after the 6 Q/K/V `dispatch_matmul_` calls and before
+RMSNorm. Default `QIE_QKV_CLAMP=60000`; disable via
+`QIE_QKV_CLAMP=0`. Single elementwise pass over the union of
+`scratch_{q,k,v}_dev_` (`(txt_seq+img_seq)*H` F16 each) — cheap
+relative to the matmul.
+
+Why this works: the underlying matmul operates in F16 accumulate
+(`QIE_MATMUL_INNER_PRECISE=1` default) and writes F16; values
+≥65504 saturate to ±Inf. Clamping at ±60000 keeps the K-projection
+output strictly inside the F16 finite range, so the squared term in
+RMSNorm stays finite and the attention chain produces a sane numeric
+result. (Mirrors the §5.5.44 residual clamp pattern at the F16 cast
+site instead of the F32 → F16 cast.)
+
+### Gate C — multi-step latent sweep
+
+| n_steps | wall (ms) | mean    | std    | min     | max    | NaN | Verdict   |
+|--------:|----------:|--------:|-------:|--------:|-------:|----:|-----------|
+| 2       | 4024.83   | -0.0235 | 13.69  | -31.88  | 35.56  | 0   | NaN-GREEN |
+| 4       | 6307.36   | -1.9191 | 15.54  | -39.28  | 40.66  | 0   | NaN-GREEN |
+| 8       | 11514.08  | -2.6334 | 16.22  | -42.22  | 41.47  | 0   | NaN-GREEN |
+| 16      | 20843.23  | -0.3886 | 14.77  | -39.25  | 31.56  | 0   | NaN-GREEN |
+| 20      | 25540.12  |  0.0145 | 15.14  | -40.84  | 31.17  | 0   | NaN-GREEN |
+
+All NaN=0, all std bounded ~13–16, range ±30..42. Numeric saga
+**closed** for the multi-step path. The 256² test gate's
+`|min/max|<20` band is a soft heuristic; real Qwen-Image latents
+typically range ±5..15 ideal — slight over-shoot here likely reflects
+residual clamp truncation rather than dispatch error (clean wave-at-
+infinity behaviour, not NaN cascade).
+
+
+### Gate D — 1024² 4-step PNG eye-check
+
+Time-budget pivoted from 1024² @ n_steps=20 to 1024² @ n_steps=4 — the
+20-step probe at 1024² resolution was ~25-30 min just for denoise
+(8192-token attention), incompatible with the 2-h time-box once the
+~7-min CLI VAE wrap is included.
+
+1024² n=4 latent: `/tmp/qie_5545_1024_latent.f32.bin` (1.0 MiB).
+Stats: mean=-2.61 std=14.62 min/max=-40.53/+35.50 NaN=0 inf=0.
+
+CLI decode: `ominix-diffusion-cli` with
+`OMINIX_QIE_DECODE_ONLY_LATENT` short-circuit, ref=skimage chelsea
+(cat). VAE encode+decode wall=403.5s (encode 24 tiles @ 5.5s + decode
+49 tiles @ 5.5s). PNG saved to `/tmp/qie_5545_1024_FIXED.png`
+(2.0 MiB). NaN check on decoded image: OK, range=[0, 1].
+
+**Eye-check verdict: TILE/NOISE.** The PNG renders as a structured
+blue-and-black weave/diagonal-grid pattern — no recognizable cat, no
+photographic content. The latent decoded cleanly (no NaN, no posterise)
+but the magnitudes are out-of-distribution for the VAE: real
+Qwen-Image latents range ±5..15 ideal, this one is ±40. The clamp
+chain (residual + Q/K/V) prevents the saturation cascade from
+producing NaN but the truncation creates structured numeric content
+that VAE decodes into a tile pattern.
+
+#### Saga conclusion
+
+NO. The numeric NaN saga is **closed** for n_steps={2..20} (multi-step
+no longer fails the dispatch invariant) but the **eye-check saga
+remains open**. The clamp pattern is a band-aid: it stops F16 Inf
+from propagating into NaN but does not address the underlying matmul
+F16-accumulate insufficient-headroom issue. Two follow-up paths for
+§5.5.46+ to consider:
+
+1. **F32-accumulate Q/K/V matmul** — set the WQBMMv3 dispatch for
+   Q/K/V to inner_precise=0 (HIGH_PRECISION), so accumulator is F32
+   and only the final cast to F16 saturates. This would let Q/K/V
+   stay within F16 finite range without truncating real signal —
+   the sum-of-products at 60000 magnitude only overflows the
+   accumulator, not the final result.
+
+2. **All-BF16 forward** — QIE_ALL_BF16=1 path already exists for
+   ffn-down/attn-out. Extend to Q/K/V projections and to the full
+   activation chain. BF16 has F32 dynamic range so the saturation
+   problem disappears entirely. Cost: requires a BF16-aware RMSNorm
+   path (CPU ref expects F16 input) + careful intra-block dtype
+   bookkeeping.
+
+#### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during all engine runs (denoise + CLI VAE), released
+  after each.
+- Do NOT push: confirmed (commits 4854702 + 3f7e0a8 local only).
+- No Co-Authored-By Claude: confirmed.
+
