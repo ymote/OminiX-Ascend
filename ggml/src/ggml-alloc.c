@@ -888,7 +888,13 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
-        if (leaf->view_src || leaf->data) {
+        // §5.5.53b: honor GGML_TENSOR_FLAG_INPUT on leaves. The legacy short-
+        // circuit treats leaf->data!=NULL as "externally-owned, do not
+        // allocate", but for INPUT leaves the data is host-side staging and
+        // the leaf MUST receive a backend allocation slot (otherwise it
+        // aliases onto base+0 with another tensor and gets clobbered).
+        bool is_input = (leaf->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+        if (leaf->view_src || (leaf->data && !is_input)) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
             galloc->leaf_allocs[i].leaf.size_max = 0;
