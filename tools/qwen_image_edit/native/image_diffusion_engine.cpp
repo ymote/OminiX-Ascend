@@ -344,7 +344,12 @@ bool repack_q4_0_upload(ggml_tensor *t,
             // Scale: little-endian ggml_half, two bytes at the start of block.
             uint16_t d;
             std::memcpy(&d, blk, sizeof(uint16_t));
-            out_s[(size_t)b * N + n] = d;
+            // Q2.4.5.5.42: scale layout mirrors ggml-cann transform_q4_0:
+            // groups written sequentially per-row → memory is [N, BLK]
+            // row-major (BLK contig fast). V2 dispatch creates a CANN
+            // tensor with shape [K/32, N] and element strides (1, K/32) —
+            // matching this physical layout.
+            out_s[(size_t)n * BLK + b] = d;
 
             const uint8_t *qs = blk + 2;
             const size_t block_nib_base = n_base_nib + (size_t)b * QK4_0;
@@ -1725,8 +1730,13 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
             w_shape, 2, ACL_INT4, w_strides, 0, ACL_FORMAT_ND,
             &w_storage, 1, weight_dev);
 
+        // Q2.4.5.5.42: scale tensor mirrors ggml-cann mul_mat_quant V2 view:
+        // ne (post-reverse) shape = [K/32, N], element strides = [1, K/32].
+        // Underlying memory is [N, K/32] row-major (BLK contig), produced by
+        // the §5.5.42 repack change above. V3's old (N,1) stride view did not
+        // match the on-NPU layout that ggml-cann's working V2 path expects.
         int64_t s_shape[2]   = {K / 32, N};
-        int64_t s_strides[2] = {N, 1};
+        int64_t s_strides[2] = {1, K / 32};
         // Q2.4.5.4c: when output is BF16, WQBMMv3 requires the scale tensor
         // in matching dtype (precedent: ggml-cann backend's GGML_CANN_QUANT_BF16
         // path; see ggml/src/ggml-cann/aclnn_ops.cpp:2670-2686). Cast F16 →
@@ -1792,34 +1802,51 @@ bool ImageDiffusionEngine::dispatch_matmul_(void *x_f16_dev, void *weight_dev,
             t_x_eff = t_x_local_bf16;
         }
 
+        // Q2.4.5.5.42: V2 dispatch byte-for-byte mirror of ggml-cann
+        // ggml_cann_mul_mat_quant (ggml/src/ggml-cann/aclnn_ops.cpp:2820+).
+        // ggml-cann's V2 path is the proven working Q4_0 dispatch on
+        // 910B/A2 — V3 returned cos=0 RED in §5.5.40 due to subtle dtype/
+        // ordering mismatch. V2 differs from V3 only by the dropped
+        // innerPrecise argument; numerical path is otherwise identical.
+        // Tensor shapes (post-CANN-reverse):
+        //   x      : [M, K]   strides [K, 1]   (row-major, K contig)
+        //   weight : [K, N]   strides [1, K]   (transpose-weight view of
+        //                                       [N, K] row-major memory)
+        //   scale  : [K/32, N] strides [1, K/32] (transpose view of
+        //                                       [N, K/32] row-major memory)
+        //   y      : [M, N]   strides [N, 1]   (row-major, N contig)
+        //   antiquantOffset = nullptr (Q4_0 is symmetric)
+        //   antiquantGroupSize = 32
+        //   biasOptional = nullptr (we apply bias via aclnnInplaceAdd after)
         uint64_t ws_needed = 0;
         aclOpExecutor *exec = nullptr;
-        if (g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize &&
-            g_cann.aclnnWeightQuantBatchMatmulV3) {
-            s = g_cann.aclnnWeightQuantBatchMatmulV3GetWorkspaceSize(
+        if (g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize &&
+            g_cann.aclnnWeightQuantBatchMatmulV2) {
+            (void)s_inner_precise;  // unused under V2 (V3-only knob)
+            s = g_cann.aclnnWeightQuantBatchMatmulV2GetWorkspaceSize(
                 t_x_eff, t_w, t_scale,
                 /*antiquantOffsetOptional*/ nullptr,
                 /*quantScaleOptional*/      nullptr,
                 /*quantOffsetOptional*/     nullptr,
                 /*biasOptional*/            nullptr,  // apply bias after
                 /*antiquantGroupSize*/      32,
-                /*innerPrecise*/            s_inner_precise,
                 t_y, &ws_needed, &exec);
             if (s == 0) {
                 ensure_workspace_(ws_needed);
                 void *ws = ws_needed > 0 ? workspace_dev_ : nullptr;
-                s = g_cann.aclnnWeightQuantBatchMatmulV3(ws, ws_needed, exec,
+                s = g_cann.aclnnWeightQuantBatchMatmulV2(ws, ws_needed, exec,
                                                           compute_stream_);
                 if (s != 0) {
-                    QIE_LOG("dispatch_matmul_: WQBMMv3 launch status=%d",
+                    QIE_LOG("dispatch_matmul_: WQBMMv2 launch status=%d",
                             (int)s);
                 }
             } else {
-                QIE_LOG("dispatch_matmul_: WQBMMv3 workspace status=%d",
-                        (int)s);
+                QIE_LOG("dispatch_matmul_: WQBMMv2 workspace status=%d "
+                        "(M=%lld K=%lld N=%lld)",
+                        (int)s, (long long)M, (long long)K, (long long)N);
             }
         } else {
-            QIE_LOG("dispatch_matmul_: WQBMMv3 symbol missing");
+            QIE_LOG("dispatch_matmul_: WQBMMv2 symbol missing");
             s = -1;
         }
         g_cann.aclDestroyTensor(t_w);
