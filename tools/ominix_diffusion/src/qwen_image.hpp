@@ -338,6 +338,17 @@ namespace Qwen {
 
             auto img_normed2    = img_norm2->forward(ctx, img);
             auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2, img_mod_param_vec[4], img_mod_param_vec[3], modulate_index != nullptr);  // Q2.4.5.5.22: swap to engine convention
+            // [QIE Q2.4.5.5.30] Gate-A: tag img_modulated2 (engine 15_img_mod2 mirror) at selected blocks.
+            auto is_dump_mod2 = [&](int b) {
+                return b == 0 || b == 1 || b == 2 || b == 4 || b == 8 ||
+                       b == 16 || b == 30 || b == 45 || b == 59;
+            };
+            if (block_idx >= 0 && is_dump_mod2(block_idx) && std::getenv("QIE_CLI_DUMP_RESID")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_15_img_mod2", block_idx);
+                ggml_set_name(img_modulated2, nm);
+                ggml_set_output(img_modulated2);
+            }
             auto img_gate2      = img_mod_param_vec[5];
 
             auto txt_normed2    = txt_norm2->forward(ctx, txt);

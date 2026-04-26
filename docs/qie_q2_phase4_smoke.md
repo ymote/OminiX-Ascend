@@ -5301,3 +5301,145 @@ bug — that's a separate post-DiT scaling. Both must land for §5.5.30 GREEN.
 
 CLI was killed mid-VAE-decode (eye-check not needed); HBM lock manually
 released. No bytes pushed.
+
+### §5.5.30 Gate-A mod2 magnitude check eng vs CLI — MOD_SCALE_DROP_AT_BLK01_CONFIRMED
+
+**Verdict:** GATE A FAILS. Engine block 1 `15_img_mod2.absmax = 142` vs CLI
+`818.7` — engine is **5.8× LOWER** than CLI at the post-modulation pre-FFN
+site. Block 0 matches (487 vs 490). Modulation magnitudes diverge starting
+at block 1 in a non-uniform per-block pattern.
+
+Since Gate A failed, dispatch §5.5.30 STOPPED before Gates B-G per the
+do NOT proceed to Gate B rule. The hypothesis that F16 saturation in the
+gated_residual_add was the SOLE bug is FALSIFIED — the modulation scale path
+is also drifting. Both must be fixed before the cat-PNG saga can close.
+
+#### Infrastructure
+
+CLI side: `qwen_image.hpp` `QwenImageTransformerBlock::forward` extended
+with a per-block `15_img_mod2` ggml_set_name + ggml_set_output (selective
+subset {0,1,2,4,8,16,30,45,59}) immediately after `Flux::modulate` for
+`img_modulated2`. Runs on F32 buffers (CLI default residual stream
+precision). Picked up automatically by the existing `QIE_CLI_DUMP_RESID`
+post-compute scan in `ggml_extend.hpp::compute()`.
+
+Engine side: REUSED §5.5.29 dump infrastructure unchanged. The
+`15_img_mod2.f32` per-block dump was already present.
+
+#### Per-block 15_img_mod2 absmax comparison
+
+```
+blk | eng absmax | cli absmax | ratio e/c | eng std | cli std
+----|------------|------------|-----------|---------|--------
+  0 |   4.87e+02 |   4.90e+02 |  0.99 ✓   |   53.1  |   53.1
+  1 |   1.42e+02 |   8.19e+02 |  0.17 ✗   |   23.4  |   75.0   FIRST DIVERGE
+  2 |   1.88e+02 |   1.40e+03 |  0.13 ✗   |   23.9  |   66.9
+  4 |   5.02e+02 |   1.62e+03 |  0.31 ✗   |   24.6  |   51.4
+  8 |   5.40e+02 |   1.38e+03 |  0.39 ✗   |   22.1  |   39.8
+ 16 |   1.21e+02 |   1.35e+02 |  0.89 ≈   |   15.5  |   17.4
+ 30 |   3.05e+02 |   6.62e+03 |  0.05 ✗   |   13.6  |  120.5
+ 45 |   2.37e+02 |   9.37e+02 |  0.25 ✗   |   14.1  |   21.0
+ 59 |   1.08e+03 |   1.16e+03 |  0.94 ≈   |   42.1  |   36.6
+```
+
+**Block 1: eng=142, CLI=819 → ratio 0.17 (5.8× too LOW).**
+**Block 30: eng=305, CLI=6619 → ratio 0.046 (22× too LOW).**
+
+Pattern is non-uniform: blocks 0, 16, 59 match within 10%; blocks 1-8, 30, 45
+diverge by 3-22×. Both `absmax` and `std` diverge (not just outliers).
+
+#### Cossim cross-check at block 1 residuals
+
+CLI vs engine `13_img_resid1.f32` (post-attention residual, INPUT to LN2):
+```
+shape=[3072, 8192]
+eng absmax=7.27e6 std=3.52e5
+cli absmax=8.82e6 std=6.71e5     (ratio 0.83 by absmax, 0.52 by std)
+cossim = 0.586                   (~50% directional drift)
+```
+
+CLI vs engine `24_img_resid2.f32` (post-FFN residual, OUTPUT after Gate A):
+```
+eng absmax=7.29e6 std=3.52e5
+cli absmax=1.41e8 std=2.51e6     (ratio 0.052, 19× too LOW)
+cossim = 0.189
+```
+
+The post-attention residual stream at block 1 ALREADY has cossim 0.586 vs CLI
+— meaning Gate-A drift originates in BOTH the attention path AND the FFN
+path at block 1, not just FFN. The mod2 magnitude divergence (142 vs 819 →
+0.17) is one symptom; the resid1 cossim 0.586 is another.
+
+#### Bug surface (Gate-A finding)
+
+The engine's per-block modulation produces lower-magnitude scale/shift at
+blocks 1-8, 30, 45 vs CLI — even though block 0 matches. The modulation path
+is:
+```
+t_emb (shared) → silu → img_mod_1 Linear(d, 6*H) → chunk[3..5] = (shift2, scale2, gate2)
+LN2(resid1) * (1 + scale2) + shift2  →  15_img_mod2
+```
+
+Engine block 0 mod2 absmax matches CLI exactly (487 vs 490). Engine block 1
+mod2 absmax is 5.8× lower. Since:
+- t_emb is identical (shared host-side input)
+- LN2 normalizes std=1 always (engine LN2 absmax 15.7 ≈ CLI's expected ~15)
+- The Linear weights are loaded from the same GGUF tensor map
+
+The bug must be one of:
+1. **Per-block weight selection**: engine `img_mod_1` weight loader picks the
+   wrong block's tensor for blocks ≥1 (block 0 happens to be index 0 in the
+   GGUF map and may load correctly by coincidence). Block 16/59 also
+   matching is consistent with a non-monotonic indexing bug (e.g. wrong
+   offset arithmetic that aliases block N into block N′ where some N′
+   happen to share weights with the right block).
+2. **F16 saturation in modulate_**: `modulate_` runs entirely in F16.
+   `x*scale` could saturate when `scale` magnitudes are large per-block.
+   But this would only DROP magnitudes via clamp, not produce 5.8× drift in
+   either direction. Plus mod2 absmax 142 is FAR below F16 max 65504 — no
+   saturation evident.
+3. **Q4 weight scale drift in img_mod_1**: the WQBMMv3 dispatch uses
+   per-group scales loaded as F16. If a scale row is mis-aligned (e.g. for
+   block N's mod_w the scale tensor is read at offset N′·groups instead of
+   N·groups), output would scale-shift by an arbitrary factor.
+
+Engine attention residual (resid1 cossim 0.586) ALSO diverges — pointing to
+the same per-block weight-loading hypothesis applied across all per-block
+linear layers (Q/K/V/O projections, mod_1, ff_up, ff_down).
+
+#### Recommended next dispatch §5.5.31
+
+**Title:** §5.5.31 — Per-block weight-load alignment bisect against CLI
+
+1. Dump engine's loaded `img_mod_1.weight` (and scale) for blocks 0, 1, 2,
+   16, 30, 45, 59. Compare bit-for-bit against CLI's
+   `transformer_blocks.{N}.img_mod.linear.weight` from the GGUF tensor
+   map. Same for `txt_mod_1.weight`.
+2. If block 0 weights match CLI but block ≥1 weights do not, the
+   per-block weight-loading offset is the bug. Likely site:
+   `init_layer_weights_from_gguf` per-block index arithmetic.
+3. If engine weights match CLI exactly, the bug is downstream (mod-1 Linear
+   forward path or scale broadcast). Add per-block dumps for
+   `silu(t_emb) \* mod_w + mod_b` directly (3 chunks: shift2, scale2,
+   gate2) and compare absmax block-by-block.
+4. The c_skip+c_out reconstruction (Gate E) and F16 saturation fix (Gate C)
+   remain dependencies but cannot land cleanly until the mod-scale drift is
+   resolved. The 1024² PNG eye-check (Gate G) is gated on all three.
+
+This dispatch (§5.5.30) made NO mod-scale OR F16 fix landings — Gate A is a
+diagnostic gate and the failure short-circuits further work. The CLI-side
+`15_img_mod2` ggml_set_output diagnostic patch is RETAINED in
+`tools/ominix_diffusion/src/qwen_image.hpp` as it provides ongoing value
+for §5.5.31's bisect (no cost — only fires under `QIE_CLI_DUMP_RESID`).
+
+#### Artefacts
+
+- `/tmp/qie_5530_gateA_cli.log` — CLI 1-step log with mod2 absmax lines
+- `/tmp/qie_5529_eng_blocks/block01/15_img_mod2.f32` — engine reference (re-used)
+- (No `/tmp/qie_5530_eng_*` produced; engine probe NOT re-run for Gate A —
+  reused §5.5.29 engine dumps unchanged)
+- `tools/ominix_diffusion/src/qwen_image.hpp` — Q2.4.5.5.30 CLI mod2 tag patch (retained)
+
+CLI was killed gracefully after sampling completed (mid-VAE-decode);
+HBM lock manually released; NPU clean. No bytes pushed.
+
