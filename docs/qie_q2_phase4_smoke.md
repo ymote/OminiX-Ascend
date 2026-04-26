@@ -5783,3 +5783,155 @@ latent computed, no 1024² PNG eye-checked. The cat-PNG saga remains OPEN.
 
 HBM lock manually released after probe completion. No engine rebuild this
 dispatch (binary at HEAD `9812409` was already current). No bytes pushed.
+
+### §5.5.33 silu(t_emb) + 02_img_mod_out bit-bisect — PROBE_T_EMB_IS_SYNTHETIC
+
+**Verdict:** Decisive falsification of the *premise* of §5.5.30–§5.5.32. The
+engine probe `tools/probes/qie_q45_real_denoise_smoke` feeds the
+`forward_block_` chain a **random F16 noise t_emb** (`fill_random_f16`,
+std=0.1, line 305 of the probe), bypassing the
+`time_text_embed.timestep_embedder.{linear_1, silu, linear_2}` projection
+chain that production / CLI both apply. CLI's t_emb at sigma_max=1.0
+contains two large-magnitude outliers (idx 504 = 111.78, idx 1787 = 109.38)
+characteristic of the trained Linear projection's residual-stream
+amplification. The engine probe's t_emb has absmax 0.099 and std 0.057.
+
+Because the §5.5.30 and §5.5.32 mod2-magnitude comparisons against CLI
+implicitly assumed both runs share the same t_emb, the per-block
+"magnitude drift" reported there is not a bug signature — it is the
+expected ratio between random-noise-driven engine modulation and
+real-trained-Linear-driven CLI modulation. Block 0 happened to match CLI
+at absmax 487-vs-490 because, at the integration scale of `15_img_mod2`
+over 8192 tokens × 3072 dims, the ratio compresses; blocks 1–58 produce
+smaller engine output simply because their per-block bias and weights
+amplify CLI's *real* large-magnitude `silu(t_emb)` outliers more strongly
+than the engine's *uniform-noise* equivalent.
+
+**The cat-PNG bug remains OPEN, but the bug surface has shifted.** The
+chunk-binding suspicion in §5.5.32 is not actionable from probe data; we
+need a comparison with matched t_emb.
+
+#### Step 1 — silu(t_emb) eng vs CLI (engine probe's synthetic vs CLI's real)
+
+```
+blk | cossim   | max|diff|  | eng_absmax | cli_absmax
+----|----------|------------|------------|-------------
+  0 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+  1 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+  2 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+ 16 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+ 30 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+ 59 | -0.00451 |  1.118e+02 |     0.0525 |   111.7830
+```
+
+Engine self-consistency: `eng_blkNN == eng_blk00` byte-equal across all 6
+blocks (silu(t_emb) is invariant per step — sanity passes).
+
+CLI top-2 outlier indices: idx 504 = 111.78, idx 1787 = 109.38. These are
+the trained timestep-embedder's residual-stream amplifications. Engine
+values at the same indices: 0.022 and -0.035 — sub-noise.
+
+#### Step 2 — 02_img_mod_out eng vs CLI per block
+
+```
+blk |    cossim |   max|diff| | eng_absmax | cli_absmax | eng/cli
+----|-----------|-------------|------------|------------|----------
+  0 |  +0.01064 |   1.941e+01 |     1.3828 |    19.1982 |   0.0720
+  1 |  -0.01217 |   2.361e+00 |     2.2070 |     0.5090 |   4.3359
+  2 |  -0.01476 |   1.563e+00 |     1.4023 |     0.5090 |   2.7551
+ 16 |  +0.00110 |   2.386e+00 |     2.6523 |     0.5090 |   5.2108
+ 30 |  -0.00486 |   3.972e+00 |     4.2383 |     0.5090 |   8.3265
+ 59 |  +0.02286 |   7.626e+01 |     1.5410 |    75.8641 |   0.0203
+```
+
+Cossim is essentially zero everywhere — outputs are uncorrelated.
+Magnitudes differ by 50× to 80×. CLI's `02_img_mod_out` absmax is
+**identical at 0.5090 across blocks 1/2/16/30** — that is the bias-only
+output magnitude at non-Q5_K blocks. CLI's blocks 0 and 59 are Q5_K so
+they show different absmax because Q5_K dequant produces different
+per-block bias scales.
+
+This pattern is consistent with the engine probe's t_emb being
+*orthogonal noise* relative to the trained `img_mod_1.weight` — the
+matmul output is dominated by the bias term, modulated by zero-mean noise
+projection. Whereas CLI's t_emb activates specific weight columns
+producing the trained large-magnitude modulation.
+
+#### Step 1b — engine silu(t_emb) cross-block self-consistency
+
+```
+eng blk00 == eng blk00 ? True
+eng blk01 == eng blk00 ? True
+eng blk02 == eng blk00 ? True
+eng blk16 == eng blk00 ? True
+eng blk30 == eng blk00 ? True
+eng blk59 == eng blk00 ? True
+```
+
+Engine silu(t_emb) is invariant per step as expected — `s_dump_fired`
+captures the first call of each block, which all share the same
+`scratch_q_dev_[:H]` buffer state for one step. Sanity passes.
+
+#### Bug surface — re-localized
+
+The actual bug is NOT visible at the probe-vs-CLI mod_out comparison
+because the inputs differ. Candidate bug surfaces still standing:
+
+1. **Engine's production path (called via `denoise_full` from
+   `qwen_image_edit_native`, NOT the smoke probe)** — does it correctly
+   build t_emb via the time-embedder chain? Need a fresh probe that
+   loads CLI's `00_t_emb.f32.bin` from the dump dir as F16 device upload
+   instead of `fill_random_f16`. (`init_from_dump` already loads the four
+   other input tensors — extending it to load t_emb is one-line.)
+
+2. **Once t_emb matches**, re-run the bit-bisect at §5.5.33 plan above:
+   silu(t_emb) eng vs CLI should be byte-identical (CANN aclnnSilu vs
+   ggml_silu); 02_img_mod_out divergence then *would* prove WQBMMv3's
+   F16-input → BF16-cast precision loss (mantissa 10 → 7 bits) is the
+   bug. Block 0 (Q5_K → aclnnMm + dequant + cubeMath=ALLOW_FP32) escapes
+   because its path keeps F32 accumulation throughout.
+
+3. **`time_text_embed.timestep_embedder.{linear_1, linear_2}` Linear
+   weights** — these are loaded but never invoked in the smoke probe.
+   The full `qwen_image_edit_native` driver path may invoke them
+   correctly. Verify by checking whether
+   `qwen_image_edit_native::denoise_full` (or its caller in the
+   production binary) constructs t_emb via the Linear chain rather than
+   passing a raw sinusoid forward.
+
+#### Recommended §5.5.34
+
+1. **Patch the smoke probe** to optionally load `00_t_emb.f32.bin` from
+   `OMINIX_QIE_DUMP_DIR` (CLI dump) when a flag like
+   `QIE_PROBE_T_EMB_FROM_DUMP=1` is set. One-line change in
+   `test_qie_q45_real_denoise_smoke.cpp` — replace the
+   `fill_random_f16(t_emb_f16, …)` call with a `slurp_file` of
+   `${dump}/00_t_emb.f32.bin` (cast F32 → F16) when the flag is on.
+   Keep random fallback for back-compat.
+
+2. **Re-run engine + CLI** with the matched t_emb. Compare
+   `01_silu_t_emb` byte-for-byte. If still diverges → CANN
+   aclnnSilu vs CPU ggml_silu numerical mismatch (can audit op tables).
+
+3. **Compare `02_img_mod_out`** per block with matched t_emb. Expected:
+   block 0 (Q5_K → F16-fallback path) matches; blocks 1/2/16/30/59 (Q4_0
+   → WQBMMv3) diverge if WQBMMv3's BF16 input pre-cast is the bug. If
+   blocks all match → bug is downstream in modulate_ / chunk binding /
+   LN2 (then proceed with chunk-binding A/B from §5.5.32 plan).
+
+4. **Independent path**: instrument the *production*
+   `qwen_image_edit_native` driver (not the smoke probe) to dump
+   `02_img_mod_out` directly. Driver has the full t_emb chain so this
+   sidesteps the probe-input issue entirely. Cost: one Q4_0 init +
+   denoise wall (~150s init + ~10s/block × 60 = ~14 min total).
+
+#### Artefacts
+
+- `/tmp/qie_5533_eng/blockNN/{01_silu_t_emb.f32, 02_img_mod_out.f32}` — engine probe (synthetic t_emb)
+- `/tmp/qie_5533_cli/blockNN/{01_silu_t_emb.f32.bin, 02_img_mod_out.f32.bin}` — CLI (real t_emb)
+- `/tmp/cmp_5533.py` — comparison harness
+- `/tmp/qie_5533_eng.log`, `/tmp/qie_5533_cli.log` — runtime logs
+
+HBM lock manually released after both runs. No bytes pushed. Engine and
+CLI binaries rebuilt on ac03 with §5.5.33 dump-call additions only (no
+forward-path code modified).

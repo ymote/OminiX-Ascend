@@ -280,7 +280,25 @@ namespace Qwen {
             auto attn = std::dynamic_pointer_cast<QwenImageAttention>(blocks["attn"]);
 
             auto img_mod_params    = ggml_silu(ctx->ggml_ctx, t_emb);
+            // [QIE Q2.4.5.5.33] Tag silu(t_emb) and mod1 matmul out for engine
+            // bit-compare. silu(t_emb) is shared per-step but tagged per-block
+            // so the consumer can dump per-block via existing path.
+            auto is_dump_5533 = [&](int b) {
+                return b == 0 || b == 1 || b == 2 || b == 16 || b == 30 || b == 59;
+            };
+            if (block_idx >= 0 && is_dump_5533(block_idx) && std::getenv("QIE_CLI_DUMP_5533")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_01_silu_t_emb", block_idx);
+                ggml_set_name(img_mod_params, nm);
+                ggml_set_output(img_mod_params);
+            }
             img_mod_params         = img_mod_1->forward(ctx, img_mod_params);
+            if (block_idx >= 0 && is_dump_5533(block_idx) && std::getenv("QIE_CLI_DUMP_5533")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_02_img_mod_out", block_idx);
+                ggml_set_name(img_mod_params, nm);
+                ggml_set_output(img_mod_params);
+            }
             auto img_mod_param_vec = get_mod_params_vec(ctx->ggml_ctx, img_mod_params, modulate_index);
 
             if (zero_cond_t) {

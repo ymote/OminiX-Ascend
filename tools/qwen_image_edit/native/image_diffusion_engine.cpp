@@ -3329,12 +3329,17 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                        return false; }
     }
     intra_probe("01_silu_t_emb", scratch_q_dev_, H, true);
+    // Q2.4.5.5.33: silu(t_emb) is shared across all 60 blocks; dumped into
+    // per-block dir to verify identical input to mod1 matmul.
+    dump_tensor_f32("01_silu_t_emb.f32", scratch_q_dev_, H, /*is_f16*/ true);
 
     // img_mod_params = img_mod.1 Linear → scratch_mod_dev_[0 .. 6H)
     if (!dispatch_matmul_(scratch_q_dev_, lw.img_mod_w_q4, lw.img_mod_scale,
                           lw.img_mod_b, B, H, 6 * H, scratch_mod_dev_))
         return false;
     intra_probe("02_img_mod_out", scratch_mod_dev_, 6 * H, true);
+    // Q2.4.5.5.33: dump mod1 matmul output BEFORE chunk/modulate.
+    dump_tensor_f32("02_img_mod_out.f32", scratch_mod_dev_, 6 * H, /*is_f16*/ true);
     // txt_mod_params = txt_mod.1 Linear → scratch_mod_dev_[6H .. 12H)
     if (!dispatch_matmul_(scratch_q_dev_, lw.txt_mod_w_q4, lw.txt_mod_scale,
                           lw.txt_mod_b, B, H, 6 * H,
