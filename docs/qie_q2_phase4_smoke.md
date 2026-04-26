@@ -7786,3 +7786,140 @@ unfinished list):
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~70 min wall (build 3 min + 256² 2.3 min + decode 6.9 min
   + scp + eye-check + revert + doc).
+
+## §5.5.48 — CLI ground-truth latent at 256² 20-step (RED)
+
+### Setup
+
+Carrying forward §5.5.47's first follow-up: dispatch the CLI
+(`ominix-diffusion-cli`) end-to-end at 256² 20-step on the same
+`cat_input.png` conditioning the engine has been failing on, and
+diff the CLI's final post-DiT latent against the engine's. CLI is
+the upstream ggml-cann reference path, so its latent is the
+ground-truth target the engine must match.
+
+CLI invocation: 256² 20-step Q4_0 GGUF weights, seed 42, EDIT mode,
+sampler Euler. Single-step dumps at step 0 (init_latent,
+ref_latent_0, noised_init_latent, model_out_step0_cond) plus
+final `x0_sampled_0` post-sampler.
+
+### CLI completion verdict
+
+- Wall: ~17 min (1036.18 s sampling + 19.52 s VAE decode + ~50 s
+  load + ~12 s VAE encode + ~7 s text encode = ~1124 s total).
+- Step pace: 51.6 s/step at 256², matches §5.5.47 stage rate.
+- Exit: clean (PID 1203871 returned, PNG written, no crash).
+- PNG: `/tmp/qie_5548_cli_256_n20.png` (2314 B — solid black, all
+  pixels = 0).
+
+### CLI dump stats
+
+| Tensor                  | nan/inf | mean    | std    | min      | max     |
+|-------------------------|---------|---------|--------|----------|---------|
+| init_latent             | 0/0     | 0       | 0      | 0        | 0       |
+| ref_latent_0            | 0/0     | -0.0689 | 0.4674 | -1.6444  | +1.6831 |
+| noised_init_latent      | 0/0     | +0.0031 | 0.9969 | -3.9269  | +3.9313 |
+| model_out_step0_cond    | 0/0     | -0.0077 | 0.2365 | -0.4139  | +0.5153 |
+| **x0_sampled_0 (final)**| **16384/0** | **NaN** | **NaN** | **NaN**  | **NaN** |
+
+Step-0 model output is canonical (std=0.24, range ±0.5); final x0 is
+**100% NaN** (16384/16384 elements NaN, 0 Inf). The CLI explicitly
+flags it:
+
+```
+[ERROR] [NaN CHECK] diffusion/x_0 (sampled latent): 16384 elements
+        — 16384 NaN, 0 Inf
+[ERROR] [NaN CHECK] vae/decoded_image: 196608 elements — 196608 NaN
+```
+
+VAE faithfully propagates NaN → solid-black PNG.
+
+### Eye-check
+
+**OTHER (solid black).** Not a recognizable cat. The CLI itself
+fails at this conditioning at 256² 20-step. Ground-truth at 256² is
+not a cat — it is NaN-saturated denoising failure.
+
+Pixel diff vs CUDA reference: skipped — no CUDA reference PNG
+present on ac03. The engine has never had a 256² CUDA baseline
+dumped (only 1024²).
+
+### CLI vs engine comparison
+
+| Metric                       | CLI 256² 20-step  | Engine §5.5.46 256² 20-step | Engine §5.5.47 (c_skip+c_out) |
+|------------------------------|-------------------|------------------------------|-------------------------------|
+| final latent std             | NaN               | 15.13                        | 12.98                         |
+| final latent range           | NaN               | ±41                           | ±33                           |
+| final latent NaN count       | 16384/16384       | 0                             | 0                             |
+
+Engine produces finite-but-magnitude-wrong (±15-40 std) latent;
+CLI produces NaN-saturated latent. **Both are broken at 256²
+20-step**, in different ways.
+
+### Decision matrix outcome
+
+The matrix (§5.5.48 Step 5) listed three outcomes:
+
+- CLI cat + ~std=15 ±40: engine downstream bug.
+- CLI cat + ~std=5 ±15: engine residual leak.
+- CLI NOT cat: surprising — not the right ground truth.
+
+Outcome **(3) — CLI NOT cat (NaN, solid black PNG).**
+256² 20-step is not a viable ground-truth point for the engine
+because the upstream CLI itself NaNs at this resolution and step
+count. The two-week saga's working assumption — that the engine
+diverges from a CLI that succeeds at 256² — is **invalidated** for
+this configuration.
+
+### Implications
+
+1. The §5.5.42-§5.5.47 engine fails at 256² reframing is now
+   blunted: failing at 256² does not by itself prove the engine
+   is wrong, because the upstream CLI fails too.
+2. The earlier 1024² Gate C cat-PNG (§5.5.46) succeeded for the
+   CLI but not the engine, so the 1024² delta is still real.
+3. The right ground-truth resolution for engine-vs-CLI parity work
+   is **1024²**, not 256². The 256² probe path was a convenience
+   for fast iteration; it cannot be used as parity reference.
+
+### Verdict
+
+**RED on the experimental hypothesis** (CLI was supposed to be the
+known-good ground truth), **but informative**: the saga's
+engine produces ±40 vs CLI canonical ±1 framing was based on
+extrapolating from 1024² CLI behavior, not measuring 256² CLI
+directly. At 256², CLI itself is in a NaN-saturating regime —
+likely the same precision/saturation chain the engine debug has
+been chasing, just hit at a different point in the sampler.
+
+### Recommended §5.5.49
+
+**Pivot ground-truth back to 1024²:**
+
+1. Re-run `ominix-diffusion-cli` end-to-end at **1024² 20-step**
+   on `cat_input.png` with the same QIE_DUMP path enabled, capturing
+   final `x0_sampled` to `/tmp/qie_5549_cli_dump/`. Wall budget
+   ~25-35 min.
+2. If CLI 1024² latent is finite and roughly canonical (std ~1,
+   range ~±5), diff it directly against the engine's 1024² latent
+   (`qie_5547_1024_FIXED` decoded latent, std=12.98, range ±33).
+   That diff isolates the engine's residual magnitude leak in the
+   same regime where CLI succeeds.
+3. If CLI 1024² also NaNs, escalate to the precision review on the
+   CLI side (Q4_0 weights + EAGER mode + EDIT mode) — saga is
+   joint, not engine-only.
+
+The §5.5.46 unfinished list (per-block residual trace,
+QIE_ATTN_SOFTMAX_F32 ablation) remains; defer until after the
+1024² CLI ground-truth is captured.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout the 17-min CLI run; released after
+  CLI exit (`/tmp/ac03_hbm_lock` removed by the wait wrapper).
+- Do NOT push: confirmed (still 41 commits ahead of origin/main,
+  this commit makes 42).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~25 min wall (CLI was already at step 14/20 when
+  dispatch arrived; 6 steps × 52 s + analysis + commit).
