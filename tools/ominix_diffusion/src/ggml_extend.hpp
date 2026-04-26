@@ -2290,6 +2290,36 @@ public:
                          name, fpath, (long long)n);
             }
         }
+        // [QIE Q2.4.5.5.37] Block-1 full substep dump for engine bit-compare.
+        // Tags emitted by qwen_image.hpp under QIE_CLI_DUMP_BLOCK1_FULL.
+        // Output layout matches engine /tmp/qie_5536_eng_real/block01/<tail>.f32
+        // (we use .f32.bin extension; comparison script accounts for that).
+        if (std::getenv("QIE_CLI_DUMP_BLOCK1_FULL") && !ggml_backend_is_cpu(runtime_backend)) {
+            ggml_backend_synchronize(runtime_backend);
+            const char* outdir = "/tmp/qie_5537_cli_block1";
+            { std::string mk = std::string("mkdir -p ") + outdir; (void)system(mk.c_str()); }
+            int n_nodes = ggml_graph_n_nodes(gf);
+            std::vector<float> buf;
+            for (int i = 0; i < n_nodes; i++) {
+                struct ggml_tensor* node = ggml_graph_node(gf, i);
+                const char* name = ggml_get_name(node);
+                if (!name || strncmp(name, "qie_cli_blk01_", 14) != 0) continue;
+                if (node->type != GGML_TYPE_F32) continue;
+                const char* tail = name + 14;  // strip "qie_cli_blk01_"
+                int64_t n = ggml_nelements(node);
+                buf.resize(n);
+                ggml_backend_tensor_get(node, buf.data(), 0, n * sizeof(float));
+                char path[256];
+                snprintf(path, sizeof(path), "%s/block01", outdir);
+                { std::string mk = std::string("mkdir -p ") + path; (void)system(mk.c_str()); }
+                char fpath[512];
+                snprintf(fpath, sizeof(fpath), "%s/%s.f32.bin", path, tail);
+                FILE* f = std::fopen(fpath, "wb");
+                if (f) { std::fwrite(buf.data(), sizeof(float), (size_t)n, f); std::fclose(f); }
+                LOG_INFO("[QIE_CLI_BLOCK1_FULL] %s shape=[%ld,%ld,%ld,%ld] -> %s",
+                         name, (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3], fpath);
+            }
+        }
         copy_cache_tensors_to_cache_buffer();
         if (output != nullptr) {
             auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());

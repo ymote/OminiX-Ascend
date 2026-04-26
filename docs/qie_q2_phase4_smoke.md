@@ -6376,3 +6376,163 @@ already exists; the missing piece is purely the CLI substep-tap patch.
 - Do NOT push: confirmed; commit local only.
 - Do NOT modify forward code: confirmed; this section adds zero source lines.
 - No Co-Authored-By Claude: confirmed.
+
+## §5.5.37 — Block-1 substep drill: CLI dump infra landed but tag points DO NOT FIRE
+
+### Goal
+Drill the first divergent substep within block 1 by adding CLI-side
+substep dumps {02_img_mod_out, 02_txt_mod_out, 04_img_LN1, 05_img_mod1,
+06_txt_LN1, 07_txt_mod1, 08_img_Q/K/V, 08_txt_Q/K/V, 09_*_rmsnorm,
+11_attn_out_img/txt, 12_to_out_0/to_add_out} matching the engine
+filename convention, then bit-compare against
+`/tmp/qie_5536_eng_real/block01/`.
+
+### Patch (added but NOT effective)
+
+`tools/ominix_diffusion/src/qwen_image.hpp`:
+- Add optional `int block_idx = -1` to `QwenImageAttention::forward` signature.
+- Plumb `block_idx` from `QwenImageTransformerBlock::forward` (line ~386).
+- Tag 8 attention substeps (`08_img_Q/K/V`, `08_txt_Q/K/V`,
+  `09_img_Q_rmsnorm`, `09_img_K_rmsnorm`, `09_txt_Q_rmsnorm`,
+  `09_txt_K_rmsnorm`, `11_attn_out_img/txt`, `12_to_out_0/to_add_out`)
+  via `ggml_set_name` + `ggml_set_output` gated on
+  `(block_idx==1) && getenv("QIE_CLI_DUMP_BLOCK1_FULL")`.
+- Tag 6 outer substeps (`02_img_mod_out`, `02_txt_mod_out`,
+  `04_img_LN1`, `05_img_mod1`, `06_txt_LN1`, `07_txt_mod1`) in
+  `QwenImageTransformerBlock::forward` (~line 357).
+
+`tools/ominix_diffusion/src/ggml_extend.hpp`:
+- Add `QIE_CLI_DUMP_BLOCK1_FULL` emission scan at end of `compute()`,
+  pattern-matched on `qie_cli_blk01_*` graph node names. Writes
+  `.f32.bin` files to `/tmp/qie_5537_cli_block1/block01/<tail>.f32.bin`.
+
+Total: ~50 lines added, all env-gated, no forward-path change. Build
+PASSES on `cmake --build build-w1 --target ominix-diffusion-cli`.
+
+### CLI run
+```
+QIE_CLI_DUMP_BLOCK1_FULL=1 ./build-w1/bin/ominix-diffusion-cli \
+  --diffusion-model …Qwen-Image-Edit-2509-Q4_0.gguf … \
+  -W 1024 -H 1024 --steps 1 -o /tmp/qie_5537_cli.png --seed 42
+```
+
+Runs to completion. Sampler reaches step N/25 normally.
+
+### BLOCKER — tags never reach graph nodes
+
+A diagnostic `scan_summary` log was added to the BLOCK1_FULL emission
+block. Per-step output (every DiT compute() call) prints:
+
+```
+[QIE_CLI_BLOCK1_FULL] scan_summary: n_nodes=551 qie_blk_seen=0 block01_matches=0
+```
+
+- `n_nodes=551` — the entire DiT graph reachable from the final output.
+- `qie_blk_seen=0` — **zero** nodes whose name starts with
+  `qie_cli_blk` (any block index).
+- `block01_matches=0` — nothing for our block-1 emission.
+
+A second probe was added inside `QwenImageModel::forward_orig`'s
+60-block for-loop (`if (i==0||i==1) LOG_INFO(...)` with a
+function-static counter). That probe **also never fires** despite:
+
+- The probe string is present in the linked binary (verified via
+  `strings build-w1/bin/ominix-diffusion-cli`).
+- The probe condition only requires `getenv("QIE_CLI_DUMP_BLOCK1_FULL")`
+  and `i in {0,1}` — both are satisfied.
+- The startup log confirms `qwen_image_params.num_layers: 60`.
+- 25 sampler steps complete (so SOME forward path produces denoised
+  output).
+
+This means **`QwenImageModel::forward_orig` is NOT being called during
+DiT compute().** The 60-block transformer loop in `forward_orig`
+(line ~564) is dead code at runtime in this build configuration, OR the
+`QwenImageRunner::build_graph` -> `qwen_image.forward` ->
+`forward_orig` chain is bypassed by an alternate dispatch.
+
+### Likely root cause
+
+§5.5.36's `n_nodes=551` for what should be a 60-block DiT graph
+(expected ~1500-3000 ggml ops) is anomalously small. This is consistent
+with one of:
+
+1. A native-CANN engine that takes the entire DiT block stack as a
+   single fused graph operator and dispatches via `dlsym`'d aclnn
+   calls outside the ggml graph node accounting — the user-memory
+   note "CP CANN Engine — Native-CANN CP decode path via dlsym"
+   matches this pattern and would explain n_nodes=551 (only outer
+   embed/proj_out/norm_out + 60 fused-block opaque ops).
+2. A custom backend op (`GGML_OP_CUSTOM`) that wraps the entire DiT
+   forward, where the inner block forward executes inside the op
+   kernel rather than as graph nodes.
+
+Neither hypothesis was previously documented in the §5.5.x trail; both
+should be confirmed by `git grep` for native-engine dispatch hooks
+("cann_engine", "QwenImage Engine", "fused_dit", custom op
+registration in qwen_image.hpp). The §5.5.33 `QIE_CLI_DUMP_5533` dump
+infra worked at block 0 — that suggests block 0 may have a special
+non-fused fallback path (which would also explain why block 0 was
+bit-exact and block 1 diverges: block 1 enters the fused engine).
+
+### Verdict
+
+```
+BLOCK1_SUBSTEP_DRILL_BLOCKED_NATIVE_ENGINE_BYPASSES_FORWARD_ORIG
+```
+
+Per-substep bit-compare table cannot be produced in this section
+because the CLI emit path's graph-node tagging is never reached in DiT
+compute(). The added dump infrastructure is correct (verified via
+binary-string check + identical pattern to working §5.5.33 / §5.5.29
+gates) but the dispatch layer it sits in is not the live path for the
+DiT block stack.
+
+### Recommended §5.5.38
+
+**Locate the live DiT dispatch first, then re-add tags there.**
+
+1. `git grep -n` on the §5.5.36 fork for: `aclnn`, `cann_engine`,
+   `dlsym`, `fused_dit`, `qwen_image_engine`, `GGML_OP_CUSTOM`,
+   `register_op`, `compute_forward.*qwen_image`. Identify the actual
+   transformer-block dispatch path.
+2. If a native engine: the substep dumps must be added *inside* that
+   engine's per-block kernel (likely also a `QIE_*` env-gated
+   `dump_tensor_f32` call right after each substep computes its
+   output buffer). The engine already supports per-block dumps for
+   `00_img`, `02_img_mod_out`, `13_img_resid1`, etc. in
+   `/tmp/qie_5536_eng_real/block01/` so the infra exists — extend it
+   with the missing 8-12 substep dumps.
+3. If a fused custom-op kernel: dump the intermediate ACL aclTensors
+   inside the kernel, gated on the same env var.
+
+After adding the dumps in the correct dispatch layer, repeat
+the bit-compare. The first sub-step where eng vs CLI cossim drops
+below 0.99 is the bug site (priority candidates unchanged from §5.5.36
+recommendation: `05_img_mod1`, `02_img_mod_out`, `08_img_Q/K/V`,
+`11_attn_out_img`, `12_to_out_0`).
+
+Time-box estimate for §5.5.38: 60-90 min wall (30 min to locate the
+dispatch, 30 min to add dumps, 15 min to run CLI + compare, 15 min to
+diagnose first divergent substep + write fix patch).
+
+### Artefacts
+
+- `tools/ominix_diffusion/src/qwen_image.hpp` (block-1 tag patch,
+  preserved in commit; INERT at runtime — see BLOCKER above).
+- `tools/ominix_diffusion/src/ggml_extend.hpp` (BLOCK1_FULL emission
+  scan, preserved; emits `scan_summary` log per-step).
+- `/tmp/qie_5537_cli_block1/block01/` — empty, no files written.
+- `/tmp/qie_5537_cli.log` — log shows `n_nodes=551 qie_blk_seen=0
+  block01_matches=0` for every step.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: TAKEN at `touch /tmp/ac03_hbm_lock` before launch,
+  RELEASED after kill.
+- Do NOT push: confirmed.
+- Do NOT modify forward code beyond ADDING dump points: confirmed.
+  The `block_idx` parameter added to `QwenImageAttention::forward`
+  is a default-initialized optional that does not affect existing
+  call semantics; debug LOG_INFO probes were removed before commit.
+- No Co-Authored-By Claude: confirmed.

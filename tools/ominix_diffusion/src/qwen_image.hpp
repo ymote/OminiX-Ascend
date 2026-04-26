@@ -115,7 +115,8 @@ namespace Qwen {
                                                       struct ggml_tensor* img,
                                                       struct ggml_tensor* txt,
                                                       struct ggml_tensor* pe,
-                                                      struct ggml_tensor* mask = nullptr) {
+                                                      struct ggml_tensor* mask = nullptr,
+                                                      int block_idx           = -1) {
             // img: [N, n_img_token, hidden_size]
             // txt: [N, n_txt_token, hidden_size]
             // pe: [n_img_token + n_txt_token, d_head/2, 2, 2]
@@ -141,26 +142,47 @@ namespace Qwen {
             int64_t n_img_token = img->ne[1];
             int64_t n_txt_token = txt->ne[1];
 
+            // [QIE Q2.4.5.5.37] Block-1 substep dump gate. Uses pre-existing
+            // ggml_set_name + ggml_set_output emission machinery in ggml_extend.hpp.
+            const bool dump_blk1 = (block_idx == 1) && std::getenv("QIE_CLI_DUMP_BLOCK1_FULL");
+            auto tag_b1 = [&](struct ggml_tensor* t, const char* tail) {
+                if (!dump_blk1) return;
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_%s", block_idx, tail);
+                ggml_set_name(t, nm);
+                ggml_set_output(t);
+            };
+
             auto img_q        = to_q->forward(ctx, img);
+            tag_b1(img_q, "08_img_Q");
             int64_t num_heads = img_q->ne[0] / dim_head;
             img_q             = ggml_reshape_4d(ctx->ggml_ctx, img_q, dim_head, num_heads, n_img_token, N);  // [N, n_img_token, n_head, d_head]
             auto img_k        = to_k->forward(ctx, img);
+            tag_b1(img_k, "08_img_K");
             img_k             = ggml_reshape_4d(ctx->ggml_ctx, img_k, dim_head, num_heads, n_img_token, N);  // [N, n_img_token, n_head, d_head]
             auto img_v        = to_v->forward(ctx, img);
+            tag_b1(img_v, "08_img_V");
             img_v             = ggml_reshape_4d(ctx->ggml_ctx, img_v, dim_head, num_heads, n_img_token, N);  // [N, n_img_token, n_head, d_head]
 
             img_q = norm_q->forward(ctx, img_q);
+            tag_b1(img_q, "09_img_Q_rmsnorm");
             img_k = norm_k->forward(ctx, img_k);
+            tag_b1(img_k, "09_img_K_rmsnorm");
 
             auto txt_q = add_q_proj->forward(ctx, txt);
+            tag_b1(txt_q, "08_txt_Q");
             txt_q      = ggml_reshape_4d(ctx->ggml_ctx, txt_q, dim_head, num_heads, n_txt_token, N);  // [N, n_txt_token, n_head, d_head]
             auto txt_k = add_k_proj->forward(ctx, txt);
+            tag_b1(txt_k, "08_txt_K");
             txt_k      = ggml_reshape_4d(ctx->ggml_ctx, txt_k, dim_head, num_heads, n_txt_token, N);  // [N, n_txt_token, n_head, d_head]
             auto txt_v = add_v_proj->forward(ctx, txt);
+            tag_b1(txt_v, "08_txt_V");
             txt_v      = ggml_reshape_4d(ctx->ggml_ctx, txt_v, dim_head, num_heads, n_txt_token, N);  // [N, n_txt_token, n_head, d_head]
 
             txt_q = norm_added_q->forward(ctx, txt_q);
+            tag_b1(txt_q, "09_txt_Q_rmsnorm");
             txt_k = norm_added_k->forward(ctx, txt_k);
+            tag_b1(txt_k, "09_txt_K_rmsnorm");
 
             auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
             auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
@@ -185,9 +207,15 @@ namespace Qwen {
                                              txt->ne[1] * attn->nb[1]);  // [N, n_img_token, n_head*d_head]
             img_attn_out      = ggml_cont(ctx->ggml_ctx, img_attn_out);
             txt_attn_out      = ggml_cont(ctx->ggml_ctx, txt_attn_out);
+            // [QIE Q2.4.5.5.37] Tag post-FIA outputs (engine 11_attn_out_*).
+            tag_b1(img_attn_out, "11_attn_out_img");
+            tag_b1(txt_attn_out, "11_attn_out_txt");
 
             img_attn_out = to_out_0->forward(ctx, img_attn_out);
             txt_attn_out = to_add_out->forward(ctx, txt_attn_out);
+            // [QIE Q2.4.5.5.37] Tag output projections (engine 12_to_out_0 / 12_to_add_out).
+            tag_b1(img_attn_out, "12_to_out_0");
+            tag_b1(txt_attn_out, "12_to_add_out");
 
             return {img_attn_out, txt_attn_out};
         }
@@ -299,6 +327,13 @@ namespace Qwen {
                 ggml_set_name(img_mod_params, nm);
                 ggml_set_output(img_mod_params);
             }
+            // [QIE Q2.4.5.5.37] Also tag under block-1-full env (tag is idempotent).
+            if (block_idx == 1 && std::getenv("QIE_CLI_DUMP_BLOCK1_FULL")) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_02_img_mod_out", block_idx);
+                ggml_set_name(img_mod_params, nm);
+                ggml_set_output(img_mod_params);
+            }
             auto img_mod_param_vec = get_mod_params_vec(ctx->ggml_ctx, img_mod_params, modulate_index);
 
             if (zero_cond_t) {
@@ -309,12 +344,28 @@ namespace Qwen {
             txt_mod_params         = txt_mod_1->forward(ctx, txt_mod_params);
             auto txt_mod_param_vec = get_mod_params_vec(ctx->ggml_ctx, txt_mod_params);
 
+            // [QIE Q2.4.5.5.37] Block-1 substep tag helper for the outer block forward.
+            const bool dump_blk1_outer = (block_idx == 1) && std::getenv("QIE_CLI_DUMP_BLOCK1_FULL");
+            auto tag_b1_outer = [&](struct ggml_tensor* t, const char* tail) {
+                if (!dump_blk1_outer) return;
+                char nm[64];
+                snprintf(nm, sizeof(nm), "qie_cli_blk%02d_%s", block_idx, tail);
+                ggml_set_name(t, nm);
+                ggml_set_output(t);
+            };
+            // [QIE Q2.4.5.5.37] Tag 02_txt_mod_out (img is already tagged above at line ~298).
+            if (dump_blk1_outer) tag_b1_outer(txt_mod_params, "02_txt_mod_out");
+
             auto img_normed    = img_norm1->forward(ctx, img);
+            tag_b1_outer(img_normed, "04_img_LN1");
             auto img_modulated = Flux::modulate(ctx->ggml_ctx, img_normed, img_mod_param_vec[1], img_mod_param_vec[0], modulate_index != nullptr);  // Q2.4.5.5.22: swap to engine convention [scale, shift, gate]
+            tag_b1_outer(img_modulated, "05_img_mod1");
             auto img_gate1     = img_mod_param_vec[2];
 
             auto txt_normed    = txt_norm1->forward(ctx, txt);
+            tag_b1_outer(txt_normed, "06_txt_LN1");
             auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_param_vec[1], txt_mod_param_vec[0]);  // Q2.4.5.5.22: swap to engine convention
+            tag_b1_outer(txt_modulated, "07_txt_mod1");
             auto txt_gate1     = txt_mod_param_vec[2];
 
             // Q4 CFG batching: gates arrive as [hidden, N, 1, 1]. At N==1 the subsequent
@@ -332,7 +383,7 @@ namespace Qwen {
                                             txt_gate1->ne[0], 1, txt_gate1->ne[1], txt_gate1->ne[2]);
             }
 
-            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe, attention_mask);
+            auto [img_attn_output, txt_attn_output] = attn->forward(ctx, img_modulated, txt_modulated, pe, attention_mask, block_idx);
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_output, img_gate1));
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
