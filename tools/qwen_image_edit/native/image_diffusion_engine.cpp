@@ -4018,6 +4018,40 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     dump_tensor_f32("24_img_resid2.f32", img_hidden, img_seq * H, /*is_f16*/ false);
     dump_tensor_f32("24_txt_resid2.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
+    // [QIE 5.5.43] Per-block residual trace (always-on per call, gated by
+    // QIE_TRACE_BLOCK_RESID=1). Logs F32 abs-max + NaN count of img/txt
+    // residuals at the END of every forward_block_ invocation, irrespective
+    // of step. Used to bisect the first NaN-introducing block at the first
+    // NaN-introducing step.
+    {
+        static int s_trace = -1;
+        if (s_trace < 0) {
+            const char *v = std::getenv("QIE_TRACE_BLOCK_RESID");
+            s_trace = (v && *v && v[0] != '0') ? 1 : 0;
+        }
+        if (s_trace) {
+            g_cann.aclrtSynchronizeStream(compute_stream_);
+            auto stat = [&](const char *name, void *dev, int64_t n) {
+                std::vector<float> hbuf((size_t)n);
+                aclError me = g_cann.aclrtMemcpy(hbuf.data(), n*sizeof(float), dev, n*sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST);
+                if (me != 0) return;
+                double mx = 0.0;
+                int64_t nanc = 0, infc = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    float v = hbuf[(size_t)i];
+                    if (std::isnan(v)) { ++nanc; continue; }
+                    if (std::isinf(v)) { ++infc; continue; }
+                    double a = std::fabs((double)v);
+                    if (a > mx) mx = a;
+                }
+                QIE_LOG("5.5.43 resid_call=%d %s max_abs=%.4g NaN=%lld Inf=%lld",
+                        s_intra_calls - 1, name, mx, (long long)nanc, (long long)infc);
+            };
+            stat("img_resid", img_hidden, img_seq * H);
+            stat("txt_resid", txt_hidden, txt_seq * H);
+        }
+    }
+
     return true;
 }
 
@@ -5834,6 +5868,26 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
             }
         } else {
             // Degenerate: sigma=0, treat as no-op.
+        }
+
+        // [QIE 5.5.43] Per-step latent dump for NaN bisect.
+        {
+            const char *sd = std::getenv("QIE_DUMP_STEP_LATENT_DIR");
+            if (sd && *sd) {
+                size_t nelt = x_host.size();
+                size_t nan_x = 0, nan_d = 0;
+                float xmin=1e30f,xmax=-1e30f,xsum=0.0f;
+                for (size_t j=0;j<nelt;++j){float v=x_host[j];if(std::isnan(v))++nan_x;else{xsum+=v;if(v<xmin)xmin=v;if(v>xmax)xmax=v;}}
+                for (size_t j=0;j<nelt;++j) if(std::isnan(denoised_host[j])) ++nan_d;
+                float mean = (nelt>nan_x)?(xsum/(nelt-nan_x)):0.0f;
+                QIE_LOG("5.5.43 step=%d sigma=%.4f x_post: NaN=%zu/%zu mean=%.4f min=%.4f max=%.4f denoised_NaN=%zu/%zu",
+                        step,sigma,nan_x,nelt,mean,xmin,xmax,nan_d,nelt);
+                char path[1024];
+                std::snprintf(path,sizeof(path),"%s/step%d_x_post.f32.bin",sd,step);
+                if (FILE*f=std::fopen(path,"wb")) { std::fwrite(x_host.data(),sizeof(float),nelt,f); std::fclose(f); }
+                std::snprintf(path,sizeof(path),"%s/step%d_denoised.f32.bin",sd,step);
+                if (FILE*f=std::fopen(path,"wb")) { std::fwrite(denoised_host.data(),sizeof(float),nelt,f); std::fclose(f); }
+            }
         }
 
         if (per_step_ms) {

@@ -7100,3 +7100,145 @@ that dispatch is correct.
 - Do NOT push: confirmed; commits local only.
 - Do NOT guess tensor layouts: confirmed — read ggml-cann line-by-line, mirrored.
 - No Co-Authored-By Claude: confirmed.
+
+## §5.5.43 — 1-step decode + multi-step NaN bisect
+
+Fork HEAD at start: `ec4f74d` (§5.5.42 V2 mirror).
+
+### Gate A — 1-step latent decode (1024²)
+
+Decoded `/tmp/qie_5542_1step_v2.f32.bin` (mean=-0.0090, std=0.2398,
+NaN=0) via the `OMINIX_QIE_DECODE_ONLY_LATENT` short-circuit on the
+production CLI with `--vae-tiling` (32×32 tile) + `--vae-on-cpu`
++ `--clip-on-cpu` + `--offload-to-cpu`. Decode finished in
+~16 s wall, no HBM exhaustion. Runtime checks:
+
+- `decode_only/x_latent_loaded`: 262144 elt range [-0.413, 0.510], NaN=0.
+- `decode_only/decoded_image`: 3145728 elt range [0.036, 0.327], NaN=0.
+
+PNG: `/tmp/qie_5543_1step_decoded.png` (1024×1024 RGB, 649 KB).
+
+**Eye-check:** uniform olive-green field — NOT a recognizable cat.
+Pixel range is constrained ([0.036, 0.327] post-tonemap) so visually it
+collapses to one color. Critically, this is *not* the §5.5.24 blue
+tile-pattern signature of the V3-broken state — that pathology is
+*gone*. A 1-step Euler from sigma=1 with cfg=1 (no uncond) collapses
+toward the unconditional mean, which is consistent with a uniform
+field. Direction: the dispatch surface is healthy.
+
+vs §5.5.24 1024 baseline (blue tile pattern, V3-broken): visually
+distinct categories — §5.5.43 has no spatial periodic structure at
+all, §5.5.24 had a full-frame 8-px tile lattice.
+
+Verdict: **GREEN-direction** (no NaN, no broken-tile pattern).
+
+### Gate B — multi-step NaN bisect
+
+Sweep at 1024² (W_lat=128, H_lat=128, C_lat=16, joint_dim=3584,
+flow_shift=3, cfg=1, has_uncond=0). Per-step `x_post` and
+`denoised` dumped under `QIE_DUMP_STEP_LATENT_DIR` (added in
+§5.5.43 patch to `image_diffusion_engine.cpp`).
+
+| n_steps | step 0 (sigma=1.0) | step 1                  | final out_latent |
+|---------|--------------------|--------------------------|------------------|
+| 1       | x_post NaN=0/262144 mean=-0.0090 std=0.24 | —             | **GREEN**        |
+| 2       | x_post NaN=0/262144 mean=-0.0029 (sigma=1.0) | x_post **NaN=262144/262144** denoised **NaN=262144/262144** at sigma=0.75 | **RED (all NaN)** |
+| 4       | (skipped — 2 already RED)                    | —                          | **RED (all NaN)** (verified from §5.5.42 `/tmp/qie_5542_4step_latent.f32.bin`)  |
+| 20      | (from §5.5.42 `/tmp/qie_5542_1024_FIXED_latent.f32.bin`) | — | **RED (all NaN)** |
+
+**First-NaN step: step 1 (sigma=0.75).** The forward at sigma=0.75
+produces NaN inside the DiT; `denoised_host` returns all-NaN; Euler
+update `x += d * dt` with `d = (x - NaN)/sigma` propagates NaN.
+
+### Gate C — first-NaN block at step 1
+
+Per-block `img_resid` / `txt_resid` abs-max + NaN trace via new
+`QIE_TRACE_BLOCK_RESID=1` env (§5.5.43 patch, post-residual-2 in
+`forward_block_`). 60 calls per step, so step 0 = calls 0–59,
+step 1 = calls 60–119.
+
+Step 0 progression (representative): img_resid grows monotonically
+7.3e6 → 1.40e8 → 2.7e9 → 5.6e9 → 9.5e9 → **1.005e+10 at block 59**.
+`out_latent` at step 0 is finite (max=3.60, NaN=0), so 1e10 residuals
+are tolerated by the norm_out + proj_out contraction.
+
+Step 1 progression: starts from 5.8e7 at block 0 (after Euler shrunk
+the residual via `x \=\= dt*d` correction), grows again:
+1.5e9 → 5.6e9 → 9.5e9 → 1.314e+10 (block 25) → 1.387e+10 (block 26)
+→ **NaN at block 27**.
+
+| call (step 1 block) | img_resid max_abs | txt_resid max_abs | NaN |
+|---------------------|-------------------|-------------------|-----|
+| 85 (b25)            | 1.314e+10         | 1.026e+08         | 0   |
+| 86 (b26)            | 1.387e+10         | 1.847e+08         | 0   |
+| **87 (b27)**        | **0**             | **0**             | **all (25.16M / 0.65M)** |
+| 88 (b28)            | 0                 | 0                 | all (propagates) |
+
+**First NaN block at step 1: block 27.**
+
+### Most-likely op + recommended §5.5.44 fix
+
+Step 0 block 27 also saw img_resid ≈ 2e9 and survived. Step 1 block 27
+sees 1.39e10 input and explodes. Two factors changed:
+
+1. `t_emb` at step 1 is computed from sigma=0.75 → t_val=750
+   (vs 1000 at step 0). The modulation chunks (`time_linear1 →
+   SiLU → time_linear2 → chunk`) produce different scale1/shift1/
+   gate1/scale2/shift2/gate2 vectors. A `gate` near zero at step 0
+   that masked overflow could be far from zero at step 1.
+2. The residual stream at step 1 is offset from step 0 by the Euler
+   correction; specific row/col extremes line up differently against
+   the F16 saturation point inside the next mod1/mod2 chain.
+
+The proximate op is almost certainly inside block 27 step 1's
+**modulate / LayerNorm-to-F16 cast** path. With `img_hidden` already
+at F32 max≈1.39e10, the `layer_norm_f32_to_f16_` cast in the next
+block's mod1 chain saturates F16 (max≈6.55e4) → Inf → next matmul
+produces Inf*0 = NaN cascade across all rows.
+
+The CUDA reference (and the CPU GGML reference) accumulate a
+similar-magnitude residual stream and survive because they normalize
+inside the modulation in F32. Our path casts to F16 too early.
+
+**Recommended §5.5.44 fix:**
+
+(a) **Force F32 accumulation in the gated_residual_add #2 → next
+mod1 layer_norm path.** Specifically, keep `img_hidden` in F32,
+fuse the LN with a F32→F16 saturation-clamped cast (clip to ±60000
+before the F16 cast). This mirrors how PyTorch's
+`Linear(...).float()` paths in the reference handle large residuals.
+
+(b) **Alternative: enable `QIE_MATMUL_INNER_PRECISE=0` (F32-accum)
+globally for step ≥ 1.** Cheap to test — flip env and re-run 2-step.
+
+(c) **Sanity check: dump `scale1/shift1/gate1` at block 27 step 1
+vs step 0** to verify modulation chunks aren't themselves NaN/Inf
+(would indicate `time_linear2 W·t_emb` overflow). If they are,
+hold the time_linear pipeline in F32.
+
+The §5.5.44 owner should run option (b) first as a 5-minute confirm,
+then implement (a) if (b) brings the 2-step run GREEN.
+
+### Artefacts
+
+- `/tmp/qie_5543_1step_decoded.png` — Gate A decoded PNG (1024×1024, olive-green).
+- `/tmp/qie_5543_2step.log`, `/tmp/qie_5543_2step_trace.log` — Gate B + C logs.
+- `/tmp/qie_5543_step2_trace/step{0,1}_x_post.f32.bin` + `step{0,1}_denoised.f32.bin` — per-step latent dumps.
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp` — §5.5.43 patches:
+  - `QIE_DUMP_STEP_LATENT_DIR` env: dumps x_post + denoised after each Euler step.
+  - `QIE_TRACE_BLOCK_RESID` env: logs per-block residual abs-max + NaN at end of `forward_block_`.
+
+### Saga close
+
+**PARTIAL.** Gate A confirms dispatch is healthy at 1-step (no tile
+pattern, no NaN). Gate B isolates first-NaN to step 1 (sigma=0.75).
+Gate C identifies block 27 step 1 as the first NaN-introducing block
+with F16 saturation of the F32 residual stream as the most-likely
+proximate cause. §5.5.44 owns the fix.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during all engine runs, released after.
+- Do NOT push: confirmed.
+- No Co-Authored-By Claude: confirmed.
