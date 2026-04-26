@@ -287,6 +287,20 @@ struct CannSyms {
     aclnnStatus (*aclnnInplaceCopy)(void *, uint64_t, aclOpExecutor *,
                                      aclrtStream);
 
+    // Q2.4.5.5.44: F32 saturation clamp for inter-block residual stream.
+    // aclnnInplaceHardtanh clamps values into [clipValueMin, clipValueMax].
+    // Used to bound F32 residual magnitude before F16 cast within
+    // layer_norm_f32_to_f16_, so the post-LN F16 cast cannot saturate to Inf
+    // when residual std grows past F16 range at deep layers (block 27+).
+    aclnnStatus (*aclnnInplaceHardtanhGetWorkspaceSize)(aclTensor *selfRef,
+                                                          const aclScalar *clipMin,
+                                                          const aclScalar *clipMax,
+                                                          uint64_t *workspaceSize,
+                                                          aclOpExecutor **executor);
+    aclnnStatus (*aclnnInplaceHardtanh)(void *workspace, uint64_t workspaceSize,
+                                          aclOpExecutor *executor,
+                                          aclrtStream stream);
+
     // TensorList creation / destruction — used to wrap a single K/V tensor for
     // the FusedInferAttention op (which takes lists to support chunked KV).
     aclTensorList *(*aclCreateTensorList)(const aclTensor *const *value,

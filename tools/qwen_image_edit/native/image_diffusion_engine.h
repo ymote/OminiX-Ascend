@@ -800,6 +800,15 @@ private:
     bool layer_norm_f32_to_f16_(const void *x_f32_dev, void *out_f16_dev,
                                    int64_t B, int64_t seq, int64_t hidden);
 
+    // Q2.4.5.5.44: F32 saturation clamp on the inter-block residual stream.
+    // Bounds |x| <= clamp_value (default 60000) so that the post-LN F16
+    // cast in the next layer_norm_f32_to_f16_ cannot saturate to Inf when
+    // residual std grows past F16 range at deep layers (block 27+ at
+    // step 1, σ=0.75). In-place via aclnnInplaceHardtanh on F32. Skipped
+    // (no-op return true) if clamp_value <= 0 (set via QIE_RESID_CLAMP=0).
+    bool clamp_residual_f32_(void *x_f32_dev, int64_t B, int64_t seq,
+                                int64_t hidden, float clamp_value);
+
     // aclnnRmsNorm dispatch over the last dim `head_dim`. Input/output are
     // F16 [B, seq, n_heads, head_dim]; gamma is F32 [head_dim]. For QIE Q2.3
     // we reshape to `[B * seq * n_heads, head_dim]` as required by the op.

@@ -169,6 +169,11 @@ bool load_once() {
                   g_cann.aclnnInplaceCopyGetWorkspaceSize);
     ok &= resolve(h_op,   "aclnnInplaceCopy",         g_cann.aclnnInplaceCopy);
 
+    // Q2.4.5.5.44: F32 saturation clamp helper (aclnnInplaceHardtanh).
+    ok &= resolve(h_op,   "aclnnInplaceHardtanhGetWorkspaceSize",
+                  g_cann.aclnnInplaceHardtanhGetWorkspaceSize);
+    ok &= resolve(h_op,   "aclnnInplaceHardtanh",     g_cann.aclnnInplaceHardtanh);
+
     // TensorList lives in libnnopbase like the other aclCreateTensor helpers.
     ok &= resolve(h_base, "aclCreateTensorList",      g_cann.aclCreateTensorList);
     ok &= resolve(h_base, "aclDestroyTensorList",     g_cann.aclDestroyTensorList);

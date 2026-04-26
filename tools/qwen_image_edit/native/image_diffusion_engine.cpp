@@ -2577,6 +2577,64 @@ bool ImageDiffusionEngine::layer_norm_f32_to_f16_(const void *x_f32_dev,
 }
 
 // ---------------------------------------------------------------------------
+// Q2.4.5.5.44: F32 saturation clamp on the inter-block residual stream.
+//
+// Diagnosis: at step 1 (sigma=0.75) on a 20-step Euler schedule, the F32
+// residual magnitude grows to ~1.4e10 by block 27 entry. aclnnLayerNorm
+// produces ~1sigma output reliably even at this magnitude, but downstream
+// chains in modulate_/gated_residual_add_ (F16 mul of a saturated matmul
+// output by gate) cascade to NaN once any intermediate F16 buffer hits
+// Inf via 65504 saturation.
+//
+// Fix: cap |residual| in F32 at +-60000 right after the residual-add and
+// before it feeds the next block. The post-LN normalized output is bounded
+// by ~sqrt(hidden) anyway so the clamp does not change correct values; it
+// only protects the saturation cascade at deep blocks under aggressive
+// schedules.
+//
+// In-place aclnnInplaceHardtanh on the F32 buffer; cheap (one elementwise
+// pass over [B*seq*hidden] F32). clamp_value <= 0 disables (no-op).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::clamp_residual_f32_(void *x_f32_dev,
+                                                  int64_t B, int64_t seq,
+                                                  int64_t hidden,
+                                                  float clamp_value) {
+    if (clamp_value <= 0.0f) return true;  // disabled
+    if (!x_f32_dev) return true;
+    if (!g_cann.aclnnInplaceHardtanh ||
+        !g_cann.aclnnInplaceHardtanhGetWorkspaceSize) {
+        QIE_LOG("clamp_residual_f32_: aclnnInplaceHardtanh symbol missing");
+        return false;
+    }
+
+    int64_t shape[3] = {B, seq, hidden};
+    int64_t strides[3];
+    make_contig_strides(3, shape, strides);
+    aclTensor *t_x = tensor_nd_f32(x_f32_dev, 3, shape, strides);
+
+    float lo = -clamp_value, hi = clamp_value;
+    aclScalar *s_lo = g_cann.aclCreateScalar(&lo, ACL_FLOAT);
+    aclScalar *s_hi = g_cann.aclCreateScalar(&hi, ACL_FLOAT);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnInplaceHardtanhGetWorkspaceSize(
+        t_x, s_lo, s_hi, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnInplaceHardtanh(ws > 0 ? workspace_dev_ : nullptr,
+                                          ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("clamp_residual_f32_: status=%d clamp=%.1f",
+                          (int)s, clamp_value);
+
+    if (s_lo) g_cann.aclDestroyScalar(s_lo);
+    if (s_hi) g_cann.aclDestroyScalar(s_hi);
+    g_cann.aclDestroyTensor(t_x);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4.5 Step 4: RMSNorm over last dim `inner`, F32 in → F16 out. Used
 // for the global `txt_norm` (RMSNorm over joint_attention_dim=3584) on the
 // raw text-encoder conditioning before `txt_in` matmul. F32-in is required
@@ -3896,6 +3954,24 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     dump_tensor_f32("13_img_resid1.f32", img_hidden, img_seq * H, /*is_f16*/ false);
     dump_tensor_f32("13_txt_resid1.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
+    // Q2.4.5.5.44: F32 saturation clamp on the residual stream — bounds
+    // |x| <= QIE_RESID_CLAMP (default 60000) so the post-LN F16 cast in
+    // the next layer_norm_f32_to_f16_ cannot saturate to Inf at deep
+    // blocks (block 27+ at step 1 sigma=0.75). Skipped if 0.
+    {
+        static float s_clamp = -1.0f;
+        if (s_clamp < 0.0f) {
+            const char *v = std::getenv("QIE_RESID_CLAMP");
+            s_clamp = (v && *v) ? (float)std::atof(v) : 60000.0f;
+        }
+        if (s_clamp > 0.0f) {
+            if (!clamp_residual_f32_(img_hidden, B, img_seq, H, s_clamp))
+                return false;
+            if (!clamp_residual_f32_(txt_hidden, B, txt_seq, H, s_clamp))
+                return false;
+        }
+    }
+
     // ------------------------------------------------------------------
     // 9. LayerNorm2 + modulate(scale2, shift2) — Phase 4.4c F32-in path
     //    (see step 2 for the full-F32 LN rationale).
@@ -4017,6 +4093,23 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("24_txt_resid2", txt_hidden, txt_seq * H, false);
     dump_tensor_f32("24_img_resid2.f32", img_hidden, img_seq * H, /*is_f16*/ false);
     dump_tensor_f32("24_txt_resid2.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
+
+    // Q2.4.5.5.44: end-of-block F32 saturation clamp (mirror of the post-#1
+    // clamp). Bounds the residual before it leaves forward_block_ so the
+    // next block sees a sane magnitude.
+    {
+        static float s_clamp = -1.0f;
+        if (s_clamp < 0.0f) {
+            const char *v = std::getenv("QIE_RESID_CLAMP");
+            s_clamp = (v && *v) ? (float)std::atof(v) : 60000.0f;
+        }
+        if (s_clamp > 0.0f) {
+            if (!clamp_residual_f32_(img_hidden, B, img_seq, H, s_clamp))
+                return false;
+            if (!clamp_residual_f32_(txt_hidden, B, txt_seq, H, s_clamp))
+                return false;
+        }
+    }
 
     // [QIE 5.5.43] Per-block residual trace (always-on per call, gated by
     // QIE_TRACE_BLOCK_RESID=1). Logs F32 abs-max + NaN count of img/txt
