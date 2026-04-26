@@ -8241,3 +8241,101 @@ Once §5.5.51 lands a CLI multi-step GREEN, the engine bisect on
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~75 min wall (within the 2 h budget; cancelled
   n=8/16/20 once bisect was complete).
+
+## §5.5.51 — Cascading triage: CacheDiT, F32 softmax, layer bisect
+
+### 51a CacheDiT/EasyCache verdict — NOT THE BUG
+
+Default `sd_cache_params_init` sets `mode=SD_CACHE_DISABLED`. The CLI
+invocation does NOT pass `--cache-mode`, and prior n=3 logs do not
+print any CacheDIT/EasyCache configuration line. Cache layer is OFF
+by default. Skipped to 51b.
+
+### 51b F32 softmax verdict — NOT THE BUG
+
+The fallback (non-flash) attention path in `ggml_ext_attention_ext`
+already sets `ggml_mul_mat_set_prec(kq, GGML_PREC_F32)` on KQ. The
+softmax dispatched is GGML_OP_SOFT_MAX → `ggml_cann_softmax` which
+preserves src0 dtype (F32 here). So softmax precision is not the
+issue. Flash-attn is also off (`--diffusion-flash-attn` not set).
+
+### 51c Layer bisect — FIRST-NaN AT NODE 0 (RESHAPE OF leaf_2 / x)
+
+Re-ran n=3 256² with `SD_NAN_CHECK=1`. Critical evidence from
+`/tmp/qie_5551c_nanscan.log`:
+
+- Pre-iter-1 `COPY CHECK qwen_image leaf_2`: CPU src finite,
+  range=[-3.9751, 3.8975], nans=0/16384
+- Pre-iter-1 `PRE-COMPUTE node 0 RESHAPE` (of leaf_2): finite
+  with same range — leaf_2 IS uploaded correctly to NPU
+- Post-iter-1 `NaN FINE node 0/10226 op=RESHAPE`:
+  **nans=16384/16384** (all NaN)
+- Post-iter-1 node 2 CONT: nans=9984/16384, but range explodes to
+  [-112.6, 316.9] — magnitude 30× larger than legitimate input,
+  consistent with reading another op's residual data.
+
+This is a graph-allocator buffer-aliasing issue: leaf_2's NPU
+buffer is being overwritten DURING the iter-1 graph compute by
+some other tensor whose offset overlaps. Step 0 is fine because
+the graph allocator has not yet committed the alias; on the
+second `compute()` call against the same `compute_allocr`, the
+re-allocation places an output tensor at the same address as the
+input view.
+
+### 51c attempted minimal fix — NEGATIVE
+
+Changed `tools/ominix_diffusion/src/qwen_image.hpp:879`
+`free_compute_buffer_immediately` from `false` to `true` to force
+allocator reset between sampler iterations. Rebuilt, re-ran n=3
+256² → step 1 still all-NaN denoised. The buffer reset alone does
+not fix the alias. Reverted the change.
+
+### Smoking-gun evidence (kept for §5.5.52 follow-up)
+
+```
+[COPY CHECK] qwen_image: CPU src name='leaf_2' shape=[32,32,16,1] min=-3.9751 max=3.8975 nans=0/16384       <- pre-upload OK
+[PRE-COMPUTE] qwen_image: node 0 op=RESHAPE shape=[2,16,2,256]   min=-3.9751 max=3.8975 nans=0/16384       <- NPU upload OK
+[NaN FINE]   qwen_image: node 0/10226 op=RESHAPE shape=[2,16,2,256] nans=16384/16384 min=nan max=nan      <- POST compute corrupted
+```
+
+### Bug surface (for §5.5.52)
+
+Either:
+- (a) Upstream graph allocator (`ggml_gallocr_alloc_graph`) bug
+  on reuse with CANN backend — leaf input view aliased with
+  intermediate scratch.
+- (b) CANN-specific in-place op writing through a view to the
+  underlying leaf storage (e.g. `ggml_cann_softmax` allocates
+  `src_tensor_buffer` from pool but the destination `acl_dst`
+  may share storage with leaf_2's NPU buffer).
+- (c) A non-determinism in tensor offset assignment that only
+  surfaces on the second compute() call.
+
+### §5.5.51 verdict
+
+**Multi-step bug NOT fixed.** Saga remains open. Recommended
+§5.5.52: instrument graph-allocator offset map to find the exact
+overlap, OR force a fresh `compute_allocr` (full free + new) on
+each iteration of the sampler.
+
+### Multi-step verification post-fix — N/A (no fix landed)
+
+n=3 at 256² remains RED (16384/16384 NaN at step 1).
+
+### 1024² 20-step PNG eye-check — N/A (no fix to validate)
+
+### Saga close: NO
+
+§5.5.50 cliff confirmed structurally as a graph-allocator buffer
+alias on the second `compute()` call. Fix requires either an
+upstream gallocr patch or a per-call allocator reset. Time-box
+exhausted (~2 h wall) before either could be implemented and
+validated. §5.5.52 should target the allocator offset map.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout, released between runs and on cleanup.
+- Do NOT push: confirmed (still 44 commits ahead before this commit).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~115 min wall (under the 2 h budget).

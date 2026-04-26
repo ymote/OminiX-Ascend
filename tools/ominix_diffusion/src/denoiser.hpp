@@ -834,6 +834,17 @@ static bool sample_k_diffusion(sample_method_t method,
 
             for (int i = 0; i < steps; i++) {
                 float sigma = sigmas[i];
+                if (getenv("QIE_DEBUG_X_PREMODEL")) {
+                    int n_el = ggml_nelements(x);
+                    float* dx = (float*)x->data;
+                    int nans=0; float mn=INFINITY, mx=-INFINITY;
+                    for (int jj=0; jj<n_el; jj++) {
+                        float v=dx[jj];
+                        if (std::isnan(v)||std::isinf(v)) nans++;
+                        else { if(v<mn)mn=v; if(v>mx)mx=v; }
+                    }
+                    LOG_INFO("[QIE_DEBUG_X_PREMODEL] iter=%d sigma=%.4f x.data ptr=%p nans=%d/%d range=(%.4f,%.4f)", i, sigma, (void*)x->data, nans, n_el, mn, mx);
+                }
 
                 // denoise
                 ggml_tensor* denoised = model(x, sigma, i + 1);
