@@ -290,11 +290,11 @@ namespace Qwen {
             auto txt_mod_param_vec = get_mod_params_vec(ctx->ggml_ctx, txt_mod_params);
 
             auto img_normed    = img_norm1->forward(ctx, img);
-            auto img_modulated = Flux::modulate(ctx->ggml_ctx, img_normed, img_mod_param_vec[0], img_mod_param_vec[1], modulate_index != nullptr);
+            auto img_modulated = Flux::modulate(ctx->ggml_ctx, img_normed, img_mod_param_vec[1], img_mod_param_vec[0], modulate_index != nullptr);  // Q2.4.5.5.22: swap to engine convention [scale, shift, gate]
             auto img_gate1     = img_mod_param_vec[2];
 
             auto txt_normed    = txt_norm1->forward(ctx, txt);
-            auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_param_vec[0], txt_mod_param_vec[1]);
+            auto txt_modulated = Flux::modulate(ctx->ggml_ctx, txt_normed, txt_mod_param_vec[1], txt_mod_param_vec[0]);  // Q2.4.5.5.22: swap to engine convention
             auto txt_gate1     = txt_mod_param_vec[2];
 
             // Q4 CFG batching: gates arrive as [hidden, N, 1, 1]. At N==1 the subsequent
@@ -318,11 +318,11 @@ namespace Qwen {
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_output, txt_gate1));
 
             auto img_normed2    = img_norm2->forward(ctx, img);
-            auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2, img_mod_param_vec[3], img_mod_param_vec[4], modulate_index != nullptr);
+            auto img_modulated2 = Flux::modulate(ctx->ggml_ctx, img_normed2, img_mod_param_vec[4], img_mod_param_vec[3], modulate_index != nullptr);  // Q2.4.5.5.22: swap to engine convention
             auto img_gate2      = img_mod_param_vec[5];
 
             auto txt_normed2    = txt_norm2->forward(ctx, txt);
-            auto txt_modulated2 = Flux::modulate(ctx->ggml_ctx, txt_normed2, txt_mod_param_vec[3], txt_mod_param_vec[4]);
+            auto txt_modulated2 = Flux::modulate(ctx->ggml_ctx, txt_normed2, txt_mod_param_vec[4], txt_mod_param_vec[3]);  // Q2.4.5.5.22: swap to engine convention
             auto txt_gate2      = txt_mod_param_vec[5];
 
             if (modulate_index == nullptr) {
