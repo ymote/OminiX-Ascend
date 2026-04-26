@@ -67,6 +67,9 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <set>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace ominix_qie {
 
@@ -3165,13 +3168,60 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // 24_img_resid2.f32, 24_txt_resid2.f32 (last two filled at end of
     // forward_block_).
     static std::string s_dump_dir;
+    static std::set<int> s_dump_indices;
     static int         s_dump_init = -1;
     if (s_dump_init < 0) {
         const char *v = std::getenv("QIE_DUMP_BLOCK0_DIR");
         s_dump_dir   = v ? std::string(v) : std::string();
+        const char *idx_csv = std::getenv("QIE_DUMP_BLOCK_INDICES");
+        if (idx_csv && *idx_csv) {
+            std::string csv(idx_csv);
+            size_t i = 0;
+            while (i < csv.size()) {
+                size_t j = csv.find(',', i);
+                std::string tok = csv.substr(i, (j == std::string::npos) ? std::string::npos : j - i);
+                if (!tok.empty()) {
+                    int bi = std::atoi(tok.c_str());
+                    if (bi >= 0) s_dump_indices.insert(bi);
+                }
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+            // Pre-create subdirs (mkdir -p semantics, ignore EEXIST).
+            if (!s_dump_dir.empty()) {
+                ::mkdir(s_dump_dir.c_str(), 0755);
+                for (int bi : s_dump_indices) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "/block%02d", bi);
+                    std::string sub = s_dump_dir + std::string(buf);
+                    ::mkdir(sub.c_str(), 0755);
+                }
+            }
+            QIE_LOG("dump_gate: QIE_DUMP_BLOCK_INDICES=%s -> %zu blocks, dir=%s",
+                    idx_csv, s_dump_indices.size(), s_dump_dir.c_str());
+        }
         s_dump_init  = 1;
     }
-    const bool do_dump = !s_dump_dir.empty() && (s_intra_calls == 1);
+    // Q2.4.5.5.22: per-call block index = s_intra_calls - 1 (post-increment).
+    const int  s_block_idx_now = s_intra_calls - 1;
+    const bool do_dump_legacy  = !s_dump_dir.empty() && s_dump_indices.empty()
+                                  && (s_intra_calls == 1);
+    static std::set<int> s_dump_fired;
+    const bool match_multi = !s_dump_dir.empty() && !s_dump_indices.empty()
+                              && s_dump_indices.count(s_block_idx_now) > 0
+                              && s_dump_fired.count(s_block_idx_now) == 0;
+    const bool do_dump_multi = match_multi;
+    if (match_multi) s_dump_fired.insert(s_block_idx_now);
+    const bool do_dump = do_dump_legacy || do_dump_multi;
+    // Effective per-block dump dir.
+    std::string s_block_dump_dir;
+    if (do_dump_multi) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "/block%02d", s_block_idx_now);
+        s_block_dump_dir = s_dump_dir + std::string(buf);
+    } else if (do_dump_legacy) {
+        s_block_dump_dir = s_dump_dir;
+    }
     auto dump_tensor_dt = [&](const char *fname, void *dev,
                                  int64_t n_elts, ProbeDtype dt) -> void {
         if (!do_dump) return;
@@ -3205,7 +3255,7 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
             std::memcpy(host_f32.data(), raw.data(),
                          (size_t)n_elts * sizeof(float));
         }
-        std::string path = s_dump_dir + "/" + fname;
+        std::string path = s_block_dump_dir + "/" + fname;
         FILE *f = std::fopen(path.c_str(), "wb");
         if (!f) {
             QIE_LOG("dump_tensor_dt[%s]: fopen failed", path.c_str());

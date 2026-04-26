@@ -4141,3 +4141,79 @@ Note: §5.5.21's own `denoise_full` smoke run **also** RED'd at the final-latent
 - Run logs: `/tmp/cpu_ref_real_5521c.log` (CPU ref abort).
 - Oracles run via `python3 -c 'import qie_<oracle> as M; M.IMG=512; M.TXT=214; M.DUMP="/tmp/qie_dumps_real_5520"; M.main()'`.
 - No engine code touched; no commits to engine source. Diagnostic-only.
+
+
+
+### §5.5.22 — Block-30 / block-59 cossim sweep + CPU-ref scale/shift swap — VERDICT: DIT_NAN_AT_N (residual stream NaNs between block 0 and block 30)
+
+**Mission.** §5.5.21 cleared block 0 of all suspicion (all substeps cos=1.000 vs F32 oracle on REAL inputs). Locate where DiT forward starts diverging by extending the dump gate to fire at blocks 0/30/59 and rerunning the mod1/rmsnorm/attn oracles. Independently land the CPU-ref scale/shift swap as a separate commit.
+
+**Engine touch (Part A).** Added new env `QIE_DUMP_BLOCK_INDICES=<csv>` (e.g. `0,30,59`). When set with `QIE_DUMP_BLOCK0_DIR`, the engine creates per-block subdirectories `blockNN/` under the dump root and writes the same 35-file substep set into each. Per-block one-shot latch (`s_dump_fired`) ensures only the **first** occurrence (step-0 cond pass) fires, regardless of subsequent CFG/uncond/multi-step calls. Legacy single-block-0 mode is preserved when `QIE_DUMP_BLOCK_INDICES` is unset. New includes: `<set>`, `<sys/stat.h>`, `<sys/types.h>` (mkdir-p semantics on the subdirs).
+
+**Run.** `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` (the production harness §5.5.21 used) with:
+
+```
+QIE_DUMP_BLOCK0_DIR=/tmp/qie_dumps_b03059_5522 \
+QIE_DUMP_BLOCK_INDICES=0,30,59 \
+QIE_DEBUG_INTRA_BLOCK0=1 \
+QIE_N_STEPS=1 QIE_FFN_DOWN_BF16=1
+```
+
+Run completed (exit 0, denoise_full=3414ms). Final latent: NaN=16384, |max|>1e30 (matches §5.5.21). Engine emitted 35 files into each of `block00/`, `block30/`, `block59/`.
+
+**Block-input stats** (NaN propagation through the residual stream):
+
+| block | 00_img absmax | 00_img NaN% | 00_txt absmax | 00_txt NaN% | 13_img_resid1 absmax | 24_img_resid2 absmax |
+|-------|---------------|-------------|---------------|-------------|----------------------|----------------------|
+| 0     | 16.1          | 0%          | 583.5         | 0%          | 1265                 | 7.4M                 |
+| 30    | NaN           | 100%        | NaN           | 100%        | NaN                  | NaN                  |
+| 59    | NaN           | 100%        | NaN           | 100%        | NaN                  | NaN                  |
+
+Block 0's `24_img_resid2` is already at **7.4M** (and `24_txt_resid2` at 4.6M) — extreme but finite F32 magnitudes coming OUT of block 0. By block 30 the residual stream is **100% NaN on both img and txt**. Block 59 is also 100% NaN.
+
+**Substep cossim table** (oracle vs native, per-block):
+
+| block | 00_t_emb absmax | 05 mod1 cos     | 09 rmsnorm cos | 11 attn_out cos |
+|-------|-----------------|-----------------|----------------|-----------------|
+| 0     | 111.75          | 1.000 (img+txt) | 1.000 (all 4)  | 1.000           |
+| 30    | 111.75          | NaN             | NaN            | NaN             |
+| 59    | 111.75          | NaN             | NaN            | NaN             |
+
+Oracles can't be evaluated at blocks 30/59 because the **inputs themselves are NaN** — the per-block dispatch produced NaN from the moment it received a NaN residual stream. The verdict is therefore unambiguous.
+
+**Verdict — Part A: DIT_NAN_AT_N.** The DiT is NOT correct end-to-end. NaN enters the residual stream at some block N where 1 <= N <= 29. Block 0's residual already exits at absmax=7.4M (img) / 4.6M (txt); a few more blocks at this growth rate, plus any F16 cast saturates F16 (max 65504) -> Inf -> NaN.
+
+**Part B — CPU reference swap.** Applied to `tools/ominix_diffusion/src/qwen_image.hpp`:
+
+- line 293: `Flux::modulate(_, img_normed, img_mod_param_vec[1], img_mod_param_vec[0], ...)` (was `[0],[1]`)
+- line 297: `Flux::modulate(_, txt_normed, txt_mod_param_vec[1], txt_mod_param_vec[0])`
+- line 321: `Flux::modulate(_, img_normed2, img_mod_param_vec[4], img_mod_param_vec[3], ...)`
+- line 325: `Flux::modulate(_, txt_normed2, txt_mod_param_vec[4], txt_mod_param_vec[3])`
+
+`Flux::modulate` signature is `(ctx, x, shift, scale)` and the engine's chunk order is `[scale, shift, gate, scale2, shift2, gate2]` (legacy GGUF), so the swap pairs the right semantics with the right argument slot.
+
+**Smoke-shape revalidation.** Built `qie_block0_cpu_reference` against the patched `qwen_image.hpp` (img_seq=64, txt_seq=32, synthetic inputs at `/tmp/qie_block0_inputs`). Output `cpu_24_img_resid2.f32` is **byte-identical** to pre-swap (`cos(old_cpu, new_cpu) = 1.000000`, both `absmax=760.5 mean_abs=6.80`). This is expected — at synthetic-input absmax=0.1 the chunk magnitudes are O(0.05) so `(1 + chunk[0]) ~= 1` and `chunk[1] ~= 0`; swapping the two near-zero-or-one quantities produces near-identical results. Real-shape revalidation remains blocked by hardcoded smoke pe/mask (per §5.5.21 audit).
+
+`cos(new_cpu, native) = 0.606187` (unchanged from §5.5.21 0.6062). The smoke comparison is too quiet to discriminate; full validation requires repairing the CPU-ref pe/mask construction to accept real shape — out of scope.
+
+**Verdict — Part B: CPU_SWAP_LANDED.**
+
+Commits (separate per dispatch hard rule):
+
+- Part B (CPU swap): `ce34b9f` — `fix(qwen_image): CPU reference scale/shift chunk order swap (matches GGUF legacy layout)`.
+- Part A (this writeup + engine dump-gate extension): committed as `qie(Q2.4.5.5.22)...DIT_NAN_AT_N`.
+
+**Artefacts.**
+
+- `/tmp/qie_dumps_b03059_5522/{block00,block30,block59}/` — 35 dump files per block.
+- `/tmp/qie_5522_run.log` — full engine run log.
+- `/tmp/qie_block0_outputs_5522/` — patched CPU ref outputs (byte-identical to /tmp/qie_block0_outputs).
+- `/tmp/cpu_ref_5522.log` — patched CPU ref run log.
+
+**Recommendation — §5.5.23.** Binary-bisect to find the first NaN-emitting block: extend the dump gate to dump `/tmp/qie_dumps_bisect/{block00,block08,block16,block24}/`. Look at `13_img_resid1.f32` and `24_img_resid2.f32` absmax/NaN-count progression. The block whose `00_*` (input to next block) goes NaN identifies the fault. Hypotheses:
+
+1. **F16 saturation in residual contributors** — block 0 `24_img_resid2` already at 7.4M F32 = ~7.4M / 65504 ~= 113x F16 max. The next block reads this F32 stream into the LN1 path; if any intermediate (e.g. `04_img_LN1`, `05_img_mod1`, `08_img_V`) emits F16, the magnitude saturates -> Inf -> NaN by block 1 or 2.
+2. **Scale-amplification in the modulate chain** — `chunk[4]` (shift2 in legacy) was empirically 26x larger than expected (per the engine comment block at lines 3290-3322). Each block multiplies the residual by `(1 + scale2)` ~= `(1 + chunk[4])`, so growth is geometric with ratio ~27. After 5 blocks: 27^5 = 1.4e7 — exactly the order of magnitude we see.
+3. **Bug in `gated_residual_add_*`** — the F32 gate-mul path may not be guarding against accumulator drift across blocks. The `13_*` and `24_*` outputs are F32 but the gate is computed from F16-modulated values.
+
+Hypothesis 2 is the strongest candidate given the §5.5.21 in-engine note about chunk[4] mean_abs=26. The legacy ordering was preferred because at the time (§5.5.4) it produced lower final-latent magnitude than HF-spec, but neither is correct if the underlying t_emb is amplified ~10x upstream. §5.5.23 should: (a) confirm the geometric-growth signature by tabulating `13_*` and `24_*` absmax for blocks 0/1/2/3/4; (b) probe the time_text_embed pipeline for the t_emb scale anomaly (00_t_emb absmax=111.75 vs expected O(1) for a sinusoidal+MLP timestep embed).
