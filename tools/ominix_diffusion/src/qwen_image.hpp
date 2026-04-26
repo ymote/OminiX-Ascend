@@ -854,6 +854,13 @@ namespace Qwen {
                                                          modulate_index,
                                                          attention_mask);
 
+            // [QIE Q2.4.5.5.56] Protect model_out from gallocr slot recycling
+            // across compute() calls. Without OUTPUT flag, the final transformer
+            // output's allocation slot can be freed and reused for a downstream
+            // temp in the next compute pass, causing NaN poisoning at step 2+ in
+            // multi-step 1024 inference. Pairs with the leaf-INPUT protection
+            // landed in §5.5.53b for the input x.
+            ggml_set_output(out);
             ggml_build_forward_expand(gf, out);
 
             return gf;
