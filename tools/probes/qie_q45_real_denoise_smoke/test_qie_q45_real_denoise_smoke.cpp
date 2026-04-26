@@ -75,6 +75,25 @@ static void fill_random_f16(std::vector<uint16_t> &out, size_t n,
     for (size_t i = 0; i < n; ++i) out[i] = f32_to_f16(dist(rng));
 }
 
+// Q2.4.5.5.34: load REAL t_emb from production-driver dump (F32 .bin) and
+// cast to F16 for engine probe. Returns true if file successfully loaded.
+static bool fill_t_emb_from_f32_file(std::vector<uint16_t> &out, size_t n,
+                                       const char *path) {
+    FILE *f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::vector<float> buf(n);
+    size_t got = std::fread(buf.data(), sizeof(float), n, f);
+    std::fclose(f);
+    if (got != n) {
+        fprintf(stderr, "[smoke45] t_emb file %s short read: got=%zu want=%zu\n",
+                path, got, n);
+        return false;
+    }
+    out.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) out[i] = f32_to_f16(buf[i]);
+    return true;
+}
+
 static void fill_random_f32_via_f16(std::vector<float> &out, size_t n,
                                       float amp, uint64_t seed) {
     out.assign(n, 0.0f);
@@ -302,7 +321,23 @@ int main(int /*argc*/, char ** /*argv*/) {
     fill_random_f32_via_f16(x_img_f32,      (size_t)img_seq * H, 0.1f, 0x4511ULL);
     fill_random_f32_via_f16(txt_cond_f32,   (size_t)txt_seq * H, 0.1f, 0x4522ULL);
     fill_random_f32_via_f16(txt_uncond_f32, (size_t)txt_seq * H, 0.1f, 0x45AAULL);
-    fill_random_f16        (t_emb_f16,      (size_t)H,             0.1f, 0x4533ULL);
+    {
+        const char *te_path = std::getenv("QIE_PROBE_T_EMB_FROM_FILE");
+        bool loaded = false;
+        if (te_path && *te_path) {
+            loaded = fill_t_emb_from_f32_file(t_emb_f16, (size_t)H, te_path);
+            if (loaded) {
+                fprintf(stderr, "[smoke45] §5.5.34 loaded REAL t_emb from %s (H=%d)\n",
+                        te_path, (int)H);
+            } else {
+                fprintf(stderr, "[smoke45] §5.5.34 FAILED to load t_emb from %s; "
+                                "falling back to synthetic\n", te_path);
+            }
+        }
+        if (!loaded) {
+            fill_random_f16(t_emb_f16, (size_t)H, 0.1f, 0x4533ULL);
+        }
+    }
 
     void *x_dev          = upload_f32(x_img_f32.data(),      x_img_f32.size());
     void *txt_cond_dev   = upload_f32(txt_cond_f32.data(),   txt_cond_f32.size());

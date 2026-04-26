@@ -5935,3 +5935,156 @@ because the inputs differ. Candidate bug surfaces still standing:
 HBM lock manually released after both runs. No bytes pushed. Engine and
 CLI binaries rebuilt on ac03 with §5.5.33 dump-call additions only (no
 forward-path code modified).
+
+## Q2.4.5.5.34 — per-block trace at REAL t_emb
+
+**Path chosen**: B (probe patch). Patched `test_qie_q45_real_denoise_smoke.cpp`
+to optionally load `00_t_emb.f32` from `QIE_PROBE_T_EMB_FROM_FILE` (one-time
+F32 to F16 cast + upload). Zero forward-path code modified — only the
+synthetic-t_emb fill site got an env-gated branch. Real t_emb sourced from
+production-driver dump `/tmp/qie_dumps_b03059_5522/block00/00_t_emb.f32`
+(verified byte-stable across §5.5.20 / §5.5.22 / §5.5.26 = production CLI's
+post-time-embedder t_emb at sigma=1.0).
+
+### Step 1 — silu(t_emb) bit-compare
+
+Engine `01_silu_t_emb.f32` vs CLI `01_silu_t_emb.f32.bin` (produced by §5.5.33
+CLI run with same conditioning):
+
+| blk | silu cossim | eng absmax | cli absmax |
+|-----|-------------|------------|------------|
+|  0  |  **1.000000** |  111.7500  |  111.7830  |
+|  1  |  **1.000000** |  111.7500  |  111.7830  |
+|  2  |  **1.000000** |  111.7500  |  111.7830  |
+| 16  |  **1.000000** |  111.7500  |  111.7830  |
+| 30  |  **1.000000** |  111.7500  |  111.7830  |
+| 59  |  **1.000000** |  111.7500  |  111.7830  |
+
+t_emb pipeline + silu (CANN aclnnSilu vs ggml_silu) is bit-accurate. Tiny
+absmax delta (111.7500 vs 111.7830) is F16 quantization at f32 to f16 cast on
+upload — not engine bug.
+
+### Step 2 — CRITICAL: CLI `02_img_mod_out` dump-point is a BIAS VIEW, not the matmul output
+
+CLI's `02_img_mod_out.f32.bin` decomposed as 6x3072 chunks (shift1, scale1,
+gate1, shift2, scale2, gate2) per block:
+
+| blk | full absmax | shift1 | scale1 | gate1 | shift2 | scale2 | gate2 |
+|-----|------------:|-------:|-------:|------:|-------:|-------:|------:|
+|  0  | 19.20  | 19.20 | 19.20 | 19.20 | 19.20 | 19.20 | 19.20 |
+|  1  | 0.5090 | 0.5089 | 0.5083 | 0.5083 | 0.5089 | 0.5084 | 0.5090 |
+|  2  | 0.5090 | (same) | (same) | (same) | (same) | (same) | (same) |
+| 16  | 0.5090 | (same) | (same) | (same) | (same) | (same) | (same) |
+| 30  | 0.5090 | (same) | (same) | (same) | (same) | (same) | (same) |
+| 59  | 75.86  | 75.86 | 75.86 | 75.86 | 75.86 | 75.86 | 75.86 |
+
+**All six chunks within a block share the same absmax to 4 decimals** — this
+is the **bias-only view** at the modulation matmul output. Q4_0 blocks (1-58
+non-Q5_K) have bias absmax ~ 0.509; Q5_K blocks (0, 59) have 19.20 / 75.86
+respectively reflecting Q5_K dequant scale. The dump-point sampling is
+firing **before** the silu(t_emb) @ W contribution adds in (or the silu
+contribution is being lost on the CLI side at the dump point).
+
+This **invalidates §5.5.33 / §5.5.30 mod_out cossim conclusions** — those
+compared engine's real matmul output vs CLI's bias view. The 89x / 0.36x /
+7.4x engine-vs-CLI mod_out absmax ratios reported there were CLI dump-point
+artifacts, not engine bugs.
+
+### Step 3 — engine `02_img_mod_out` per-block
+
+Engine 5534 (REAL t_emb, synthetic img/txt) `02_img_mod_out` absmax per block:
+
+| blk | eng_mod_amx |
+|-----|------------:|
+|  0  |   45.25 |
+|  1  |   59.00 |
+|  2  |   39.81 |
+|  4  |   48.66 |
+|  8  |   40.25 |
+| 16  |   47.81 |
+| 30  |  142.38 |
+| 45  |  331.75 |
+| 59  |   74.06 |
+
+These are stable, plausible scale (silu(t_emb) ~ 111 absmax x per-block
+weight scale + bias). Engine-side mod_out with REAL t_emb is producing
+sensible magnitudes. Cossim against an F32 numpy oracle of the matmul (not
+done here — not part of this gate) is the next bit-bisect.
+
+### Step 4 — residual cossim eng (real t_emb, synthetic img/txt) vs CLI (all real)
+
+| blk | r1_cs | eng_r1_amx | cli_r1_amx | r1_rat | r2_cs | eng_r2_amx | cli_r2_amx | r2_rat |
+|-----|------:|-----------:|-----------:|-------:|------:|-----------:|-----------:|-------:|
+|  0  | 0.829 |    1357 |    1238 | 1.10 | 0.990 |  6.32e+06 |  7.07e+06 | 0.89 |
+|  1  | 0.583 | 6.32e+06 | 8.82e+06 | 0.72 | 0.226 |  6.33e+06 |  1.41e+08 | 0.045 |
+|  2  | 0.215 | 6.33e+06 | 1.47e+08 | 0.04 | 0.159 |  6.34e+06 |  2.22e+08 | 0.029 |
+| 30  | 0.326 | 9.71e+06 | 2.75e+09 | 0.004| 0.321 |  9.59e+06 |  3.32e+09 | 0.003 |
+| 59  | 0.811 | 5.58e+07 | 1.00e+10 | 0.006| 0.802 |  5.60e+07 |  1.00e+10 | 0.006 |
+
+Block 0 cossim 0.83 / 0.99 — order-of-magnitude agreement on residuals
+despite synthetic img/txt. From block 1 onward CLI residuals explode by 2-3
+orders of magnitude per block (cli_r1_amx grows 1.2K to 8.8M to 147M to
+2.7B to 10B) while engine residuals stay at e6 / e7. Comparison is **NOT
+VALID** because probe uses synthetic img/txt
+(`fill_random_f32_via_f16` at amp=0.1) at img_seq=64, CLI uses real
+1024^2 latents at img_seq=4096.
+
+### Step 5 — first true divergence
+
+**Cannot localize from this probe path** — shape incompatibility. The §5.5.34
+contributions are:
+
+1. **t_emb pipeline confirmed bit-accurate** end-to-end (silu cossim=1.0).
+2. **CLI `02_img_mod_out` dump-point falsified** as a bisect signal — it is
+   bias-only. The §5.5.33 / §5.5.30 mod_out divergence findings are
+   retracted as CLI-dump artifacts.
+3. **Probe-based comparison is shape-incompatible** with real img/txt. The
+   probe runs at img_seq=64 or 256 (QIE_Q45_BIG); the real
+   `noised_init_latent` at 1024^2 is img_seq=4096. Only the production
+   driver path can do bit-exact eng-vs-CLI residual comparison.
+
+### Step 6 — decision matrix verdict
+
+- Block 0 cossim 0.83/0.99 with synthetic img/txt is **inconclusive** — not
+  a valid eng-vs-CLI signal because inputs differ.
+- Real divergence localization **deferred to §5.5.35** with one of two paths.
+
+### Step 7 — recommended §5.5.35
+
+**Two parallel paths.**
+
+**Path A** (cleanest, deferred from §5.5.33): instrument the production
+driver `qwen_image_edit_native`. Engine-side dump points are already
+gated by `QIE_DUMP_BLOCK0_DIR` + `QIE_DUMP_BLOCK_INDICES`, no source
+change needed. Run `qwen_image_edit_native` with same conditioning as
+CLI (cat.jpg, "make the cat smile", 1-step), let it dump per-block
+residuals to `/tmp/qie_5535_eng_prod/`. Compare against
+`/tmp/qie_5529_cli_blocks/`. Wall: ~14 min. **Yields the bit-exact
+eng-vs-CLI residual trace at REAL inputs that §5.5.34 could not
+produce.**
+
+**Path B** (5-line CLI patch, narrower): fix CLI's `02_img_mod_out`
+dump-point in `tools/ominix_diffusion/src/qwen_image.hpp` to dump the
+**post-matmul** tensor not the bias view. Add a `ggml_set_name` +
+`ggml_set_output` on the result of the modulation matmul (search for
+`img_mod_1` Linear forward, tag the output node before the chunk_split).
+Re-run §5.5.33 CLI dump. The CLI's mod_out then becomes a valid bit-bisect
+target.
+
+**Recommended order**: **Path A first**. The full per-block residual trace
+at real inputs is the definitive answer. If Path A localizes divergence to
+mod_out (block N's `02_img_mod_out`), then Path B unlocks the next-level
+bisect.
+
+### Artefacts
+
+- `/tmp/qie_5534_eng/blockNN/*.f32` — engine probe with REAL t_emb
+- `/tmp/qie_5533_cli/blockNN/*.f32.bin` — CLI dumps (silu, mod-bias-view)
+- `/tmp/qie_5529_cli_blocks/blockNN/qie_cli_blk*_13/24_*.f32.bin` — CLI residuals
+- `/tmp/cmp_5534.py`, `/tmp/cmp_5534b.py`, `/tmp/cmp_5534c.py` — comparison
+- `/tmp/qie_5534_eng.log` — runtime log
+- `/tmp/run_5534_engine.sh` — engine run script
+
+HBM lock auto-released after probe finished. No bytes pushed. Probe binary
+rebuilt on ac03 with §5.5.34 t_emb-from-file additions only (zero
+forward-path code modification).
