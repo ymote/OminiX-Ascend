@@ -817,6 +817,23 @@ private:
     // clamp_value <= 0.
     bool clamp_f16_(void *x_f16_dev, int64_t n_elts, float clamp_value);
 
+    // Q2.4.5.5.46: BF16 → F16 cast helper (n elements). Mirrors
+    // cast_f32_to_f16_ but for BF16-source buffers (e.g. Q/K/V matmul
+    // outputs widened under QIE_QKV_BF16). Saturates BF16 magnitudes
+    // beyond F16 finite range to ±Inf — caller must clamp upstream
+    // when used outside the RMSNorm-bounded path.
+    bool cast_bf16_to_f16_(const void *in_bf16_dev, void *out_f16_dev,
+                            int64_t n);
+
+    // Q2.4.5.5.46: aclnnRmsNorm dispatch with BF16 input, F16 output.
+    // Used on Q/K under QIE_QKV_BF16 — the BF16 storage preserves the
+    // legitimate ~7e4 matmul output magnitudes without F16 saturation,
+    // and RMSNorm bounds the per-row output to ~1σ so the F16 cast on
+    // exit is safe regardless of input range.
+    bool rms_norm_head_bf16_(void *x_bf16_dev, void *out_bf16_dev,
+                              void *gamma_f32_dev,
+                              int64_t rows, int64_t head_dim);
+
     // aclnnRmsNorm dispatch over the last dim `head_dim`. Input/output are
     // F16 [B, seq, n_heads, head_dim]; gamma is F32 [head_dim]. For QIE Q2.3
     // we reshape to `[B * seq * n_heads, head_dim]` as required by the op.

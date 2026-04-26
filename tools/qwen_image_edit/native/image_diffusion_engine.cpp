@@ -2673,6 +2673,97 @@ bool ImageDiffusionEngine::clamp_f16_(void *x_f16_dev, int64_t n_elts,
 }
 
 // ---------------------------------------------------------------------------
+// Q2.4.5.5.46: BF16 → F16 cast helper. n-element flat aclnnCast wrapper,
+// mirrors cast_f32_to_f16_ but with BF16 source. Used to bring Q/V matmul
+// outputs back to F16 for the downstream RoPE/FIA chain (Q after BF16
+// RMSNorm; V directly, since V has no norm — V tail values beyond ±65504
+// will saturate to F16 Inf and require the §5.5.45 clamp on the BF16
+// buffer first when input magnitudes exceed F16 range).
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::cast_bf16_to_f16_(const void *in_bf16_dev,
+                                                void *out_f16_dev,
+                                                int64_t n) {
+    if (!g_cann.aclnnCast || !g_cann.aclnnCastGetWorkspaceSize) {
+        QIE_LOG("cast_bf16_to_f16_: aclnnCast symbol missing");
+        return false;
+    }
+    if (!in_bf16_dev || !out_f16_dev) {
+        QIE_LOG("cast_bf16_to_f16_: null buffer (in=%p out=%p)",
+                in_bf16_dev, out_f16_dev);
+        return false;
+    }
+    int64_t shape[1]   = {n};
+    int64_t strides[1] = {1};
+    aclTensor *t_in  = tensor_nd_bf16(const_cast<void *>(in_bf16_dev),
+                                         1, shape, strides);
+    aclTensor *t_out = tensor_nd_f16(out_f16_dev, 1, shape, strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnCastGetWorkspaceSize(
+        t_in, ACL_FLOAT16, t_out, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnCast(ws > 0 ? workspace_dev_ : nullptr, ws, exec,
+                              compute_stream_);
+    }
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    if (s != 0) QIE_LOG("cast_bf16_to_f16_: status=%d", (int)s);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Q2.4.5.5.46: aclnnRmsNorm with BF16 input and BF16 output. Used on Q/K
+// under QIE_QKV_BF16: the projection matmul writes BF16 (no saturation
+// at the legitimate ~7e4 magnitude), RMSNorm consumes BF16, emits BF16
+// (~1σ). Caller subsequently casts BF16→F16 — the cast is safe because
+// the post-RMSNorm magnitude is bounded.
+// (v1 attempted BF16-in/F16-out but aclnnRmsNorm returned status=161002
+// — version didn't support mixed dtype; v2 keeps dtypes uniform.)
+// ---------------------------------------------------------------------------
+bool ImageDiffusionEngine::rms_norm_head_bf16_(void *x_bf16_dev,
+                                                  void *out_bf16_dev,
+                                                  void *gamma_f32_dev,
+                                                  int64_t rows,
+                                                  int64_t head_dim) {
+    if (!g_cann.aclnnRmsNorm || !gamma_f32_dev) {
+        QIE_LOG("rms_norm_head_bf16_: missing symbol or gamma (gamma=%p)",
+                gamma_f32_dev);
+        return false;
+    }
+
+    int64_t x_shape[2]   = {rows, head_dim};
+    int64_t x_strides[2] = {head_dim, 1};
+    aclTensor *t_in  = tensor_nd_bf16(x_bf16_dev, 2, x_shape, x_strides);
+    aclTensor *t_out = tensor_nd_bf16(out_bf16_dev, 2, x_shape, x_strides);
+
+    int64_t g_shape[1]   = {head_dim};
+    int64_t g_strides[1] = {1};
+    aclTensor *t_g = tensor_nd_f32(gamma_f32_dev, 1, g_shape, g_strides);
+
+    int64_t r_shape[2]   = {rows, 1};
+    int64_t r_strides[2] = {1, 1};
+    aclTensor *t_rstd = tensor_nd_f32(rstd_dev_, 2, r_shape, r_strides);
+
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnRmsNormGetWorkspaceSize(
+        t_in, t_g, (double)cfg_.rms_norm_eps, t_out, t_rstd, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnRmsNorm(ws > 0 ? workspace_dev_ : nullptr,
+                                  ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("rms_norm_head_bf16_: status=%d", (int)s);
+    g_cann.aclDestroyTensor(t_in);
+    g_cann.aclDestroyTensor(t_out);
+    g_cann.aclDestroyTensor(t_g);
+    g_cann.aclDestroyTensor(t_rstd);
+    return s == 0;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4.5 Step 4: RMSNorm over last dim `inner`, F32 in → F16 out. Used
 // for the global `txt_norm` (RMSNorm over joint_attention_dim=3584) on the
 // raw text-encoder conditioning before `txt_in` matmul. F32-in is required
@@ -3735,26 +3826,51 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     auto offset_rows = [&](void *base, int64_t rows) {
         return (uint8_t *)base + (size_t)rows * H * sizeof(uint16_t);
     };
+    // Q2.4.5.5.46: BF16 widening for Q/K/V projection outputs. Default ON
+    // (set QIE_QKV_BF16=0 to revert to F16-output + §5.5.45 clamp legacy).
+    // Rationale: at deep blocks the F16 cast on the matmul output saturated
+    // to ±Inf for ~200/1.5M elements (txt_K Inf=214 at call 228). §5.5.45
+    // clamped post-hoc at ±60000 closing NaN class but truncating real
+    // signal — final latent ends up at std=14.6 / range ±40 (VAE expects
+    // ±15). BF16 has F32 dynamic range so the matmul output is stored
+    // losslessly; we cast back to F16 only AFTER aclnnRmsNorm (Q/K) bounds
+    // output to ~1σ. V has no norm — BF16 → F16 cast + safety clamp below.
+    static int s_qkv_bf16 = -1;
+    if (s_qkv_bf16 < 0) {
+        const char *v = std::getenv("QIE_QKV_BF16");
+        s_qkv_bf16 = (v && *v && v[0] == '0') ? 0 : 1;
+        QIE_LOG("forward_block_: QIE_QKV_BF16=%d (1=BF16 storage on Q/K/V "
+                "projection outputs, F16 cast deferred to post-RMSNorm; "
+                "0=legacy F16 output + §5.5.45 clamp)", s_qkv_bf16);
+    }
+    const aclDataType qkv_out_dtype = s_qkv_bf16 ? ACL_BF16 : ACL_FLOAT16;
+
     // txt QKV (rows 0 .. txt_seq) — head of scratch buffers.
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_q_w_q4, lw.add_q_scale,
-                          lw.add_q_b, txt_seq, H, H, scratch_q_dev_))
+                          lw.add_q_b, txt_seq, H, H, scratch_q_dev_,
+                          qkv_out_dtype))
         return false;
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_k_w_q4, lw.add_k_scale,
-                          lw.add_k_b, txt_seq, H, H, scratch_k_dev_))
+                          lw.add_k_b, txt_seq, H, H, scratch_k_dev_,
+                          qkv_out_dtype))
         return false;
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.add_v_w_q4, lw.add_v_scale,
-                          lw.add_v_b, txt_seq, H, H, scratch_v_dev_))
+                          lw.add_v_b, txt_seq, H, H, scratch_v_dev_,
+                          qkv_out_dtype))
         return false;
     // img QKV (rows txt_seq .. seq_total).
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_q_w_q4, lw.to_q_scale,
                           lw.to_q_b, img_seq, H, H,
-                          offset_rows(scratch_q_dev_, txt_seq))) return false;
+                          offset_rows(scratch_q_dev_, txt_seq),
+                          qkv_out_dtype)) return false;
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_k_w_q4, lw.to_k_scale,
                           lw.to_k_b, img_seq, H, H,
-                          offset_rows(scratch_k_dev_, txt_seq))) return false;
+                          offset_rows(scratch_k_dev_, txt_seq),
+                          qkv_out_dtype)) return false;
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.to_v_w_q4, lw.to_v_scale,
                           lw.to_v_b, img_seq, H, H,
-                          offset_rows(scratch_v_dev_, txt_seq))) return false;
+                          offset_rows(scratch_v_dev_, txt_seq),
+                          qkv_out_dtype)) return false;
     intra_probe("08_img_Q", offset_rows(scratch_q_dev_, txt_seq),
                 img_seq * H, true);
     intra_probe("08_img_K", offset_rows(scratch_k_dev_, txt_seq),
@@ -3774,7 +3890,12 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // |x| <= QIE_QKV_CLAMP (default 60000) so F16 saturation to Inf at deep
     // blocks (e.g. txt_K Inf=214 at call 228 with §5.5.44 residual clamp)
     // does not feed RMSNorm/RoPE/attention with NaN. Skipped if 0.
-    {
+    // Q2.4.5.5.46: under QIE_QKV_BF16=1 the buffers are BF16 not F16, so
+    // an F16-view in-place clamp is dtype-incorrect — skip and rely on
+    // BF16 storage (no saturation at the legitimate ~7e4 matmul output
+    // magnitude) + post-RMSNorm F16 cast for Q/K. V is clamped via the
+    // BF16-aware path inside the Q/K/V → F16 dtype-restore block below.
+    if (!s_qkv_bf16) {
         static float s_qkv_clamp = -1.0f;
         if (s_qkv_clamp < 0.0f) {
             const char *v = std::getenv("QIE_QKV_CLAMP");
@@ -3804,22 +3925,86 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     //    [seq, n_heads, head_dim] and RMSNorm is over head_dim, we view
     //    each as [seq * n_heads, head_dim].
     //    Reference: qwen_image.hpp:147-148, 157-158.
+    //    Q2.4.5.5.46: under QIE_QKV_BF16 the input is BF16 — dispatch
+    //    to rms_norm_head_bf16_in_f16_out_ which writes F16 in place
+    //    (same physical buffer, BF16/F16 both 2-byte/element). After
+    //    this call the Q/K buffers are F16 again and the downstream
+    //    RoPE/FIA chain is byte-identical to the §5.5.45 path.
+    //    For V, RMSNorm doesn't apply — we cast BF16→F16 separately
+    //    after this block (with a §5.5.45-style clamp on BF16 first
+    //    so the F16 cast doesn't saturate).
     // ------------------------------------------------------------------
-    // img Q/K (rows = img_seq * n_heads).
-    {
+    if (s_qkv_bf16) {
+        // BF16 in/out RMSNorm + BF16→F16 cast on the result. RMSNorm
+        // bounds output to ~1σ so the F16 cast is saturation-free.
+        const int64_t img_qk_total = img_seq * H;
+        const int64_t txt_qk_total = txt_seq * H;
+        // img Q/K (rows = img_seq * n_heads).
         void *img_q = offset_rows(scratch_q_dev_, txt_seq);
         void *img_k = offset_rows(scratch_k_dev_, txt_seq);
-        if (!rms_norm_head_(img_q, img_q, lw.norm_q_w,
-                            img_seq * NH, HD)) return false;
-        if (!rms_norm_head_(img_k, img_k, lw.norm_k_w,
-                            img_seq * NH, HD)) return false;
+        if (!rms_norm_head_bf16_(img_q, img_q, lw.norm_q_w,
+                                   img_seq * NH, HD)) return false;
+        if (!rms_norm_head_bf16_(img_k, img_k, lw.norm_k_w,
+                                   img_seq * NH, HD)) return false;
+        // txt Q/K (rows = txt_seq * n_heads) — head of scratch buffers.
+        if (!rms_norm_head_bf16_(scratch_q_dev_, scratch_q_dev_,
+                                   lw.norm_added_q_w,
+                                   txt_seq * NH, HD)) return false;
+        if (!rms_norm_head_bf16_(scratch_k_dev_, scratch_k_dev_,
+                                   lw.norm_added_k_w,
+                                   txt_seq * NH, HD)) return false;
+        // Q/K are now BF16, magnitude ~1σ. Cast back to F16 in place.
+        if (!cast_bf16_to_f16_(img_q, img_q, img_qk_total)) return false;
+        if (!cast_bf16_to_f16_(img_k, img_k, img_qk_total)) return false;
+        if (!cast_bf16_to_f16_(scratch_q_dev_, scratch_q_dev_, txt_qk_total))
+            return false;
+        if (!cast_bf16_to_f16_(scratch_k_dev_, scratch_k_dev_, txt_qk_total))
+            return false;
+        // V: stays BF16 in scratch_v_dev_; cast to F16 inside the V
+        // block below right before FIA.
+    } else {
+        // Legacy F16 path (unchanged from §5.5.45).
+        // img Q/K (rows = img_seq * n_heads).
+        {
+            void *img_q = offset_rows(scratch_q_dev_, txt_seq);
+            void *img_k = offset_rows(scratch_k_dev_, txt_seq);
+            if (!rms_norm_head_(img_q, img_q, lw.norm_q_w,
+                                img_seq * NH, HD)) return false;
+            if (!rms_norm_head_(img_k, img_k, lw.norm_k_w,
+                                img_seq * NH, HD)) return false;
+        }
+        // txt Q/K (rows = txt_seq * n_heads) — head of scratch buffers.
+        {
+            if (!rms_norm_head_(scratch_q_dev_, scratch_q_dev_,
+                                lw.norm_added_q_w, txt_seq * NH, HD)) return false;
+            if (!rms_norm_head_(scratch_k_dev_, scratch_k_dev_,
+                                lw.norm_added_k_w, txt_seq * NH, HD)) return false;
+        }
     }
-    // txt Q/K (rows = txt_seq * n_heads) — head of scratch buffers.
-    {
-        if (!rms_norm_head_(scratch_q_dev_, scratch_q_dev_,
-                            lw.norm_added_q_w, txt_seq * NH, HD)) return false;
-        if (!rms_norm_head_(scratch_k_dev_, scratch_k_dev_,
-                            lw.norm_added_k_w, txt_seq * NH, HD)) return false;
+    // Q2.4.5.5.46: cast V BF16→F16 in place (V has no RMSNorm so its
+    // tail can saturate; clamp BF16 first at ±60000 if magnitude exceeds
+    // F16 range — but evidence from §5.5.45 trace showed Inf only on K,
+    // not V, so V's magnitude is naturally bounded. Keep clamp as a
+    // safety net at the legacy default 60000 anyway, applied as a
+    // BF16→F16 saturating cast).
+    if (s_qkv_bf16) {
+        const int64_t v_total = (txt_seq + img_seq) * H;
+        // In-place cast: read BF16 from scratch_v_dev_, write F16 back to
+        // the same buffer. aclnnCast is a row-wise elementwise op so
+        // input/output aliasing on identical-byte-size dtypes is safe.
+        if (!cast_bf16_to_f16_(scratch_v_dev_, scratch_v_dev_, v_total))
+            return false;
+        // Safety-net clamp on the now-F16 V buffer (§5.5.45 default 60000
+        // behaviour — Inf-from-saturation → ±60000).
+        static float s_v_clamp = -1.0f;
+        if (s_v_clamp < 0.0f) {
+            const char *v = std::getenv("QIE_QKV_CLAMP");
+            s_v_clamp = (v && *v) ? (float)std::atof(v) : 60000.0f;
+        }
+        if (s_v_clamp > 0.0f) {
+            if (!clamp_f16_(scratch_v_dev_, v_total, s_v_clamp))
+                return false;
+        }
     }
     intra_probe("09_img_Q_rmsnorm", offset_rows(scratch_q_dev_, txt_seq),
                 img_seq * H, true);
