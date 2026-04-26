@@ -862,6 +862,36 @@ static bool sample_k_diffusion(sample_method_t method,
                         vec_x[j] = vec_x[j] + vec_d[j] * dt;
                     }
                 }
+                // QIE_SAMPLER_TRACE - per-step diagnostic
+                if (getenv("QIE_SAMPLER_TRACE")) {
+                    int n_el = ggml_nelements(x);
+                    float* d_x = (float*)x->data;
+                    float* d_dn = (float*)denoised->data;
+                    double sum=0, sum_sq=0;
+                    float mn = INFINITY, mx = -INFINITY;
+                    int nan_count = 0, finite_count = 0;
+                    double dn_sum=0, dn_sq=0;
+                    float dn_mn=INFINITY, dn_mx=-INFINITY;
+                    int dn_nan=0;
+                    for (int j = 0; j < n_el; j++) {
+                        float v = d_x[j];
+                        if (std::isnan(v) || std::isinf(v)) { nan_count++; }
+                        else { sum+=v; sum_sq+=(double)v*v; if(v<mn)mn=v; if(v>mx)mx=v; finite_count++; }
+                        float dv = d_dn[j];
+                        if (std::isnan(dv) || std::isinf(dv)) { dn_nan++; }
+                        else { dn_sum+=dv; dn_sq+=(double)dv*dv; if(dv<dn_mn)dn_mn=dv; if(dv>dn_mx)dn_mx=dv; }
+                    }
+                    double mean = finite_count>0 ? sum/finite_count : 0;
+                    double var = finite_count>0 ? sum_sq/finite_count - mean*mean : 0;
+                    double std_dev = var>0 ? sqrt(var) : 0;
+                    int dn_finite = n_el - dn_nan;
+                    double dn_mean = dn_finite>0 ? dn_sum/dn_finite : 0;
+                    double dn_var = dn_finite>0 ? dn_sq/dn_finite - dn_mean*dn_mean : 0;
+                    double dn_std = dn_var>0 ? sqrt(dn_var) : 0;
+                    LOG_INFO("[QIE_SAMPLER_TRACE] step=%d sigma=%.4f sigma_next=%.4f dt=%.4f x std=%.4f range=(%.2f,%.2f) NaN=%d/%d denoised std=%.4f range=(%.2f,%.2f) dnNaN=%d",
+                             i, sigma, sigmas[i+1], dt, (float)std_dev, mn, mx, nan_count, n_el,
+                             (float)dn_std, dn_mn, dn_mx, dn_nan);
+                }
             }
         } break;
         case HEUN_SAMPLE_METHOD: {

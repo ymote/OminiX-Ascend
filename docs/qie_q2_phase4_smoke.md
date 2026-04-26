@@ -8105,3 +8105,139 @@ output to diff against, those engine probes have no reference.
 - Do NOT push: confirmed (now 43 commits ahead of origin/main).
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~50 min wall, well within the 90-min budget.
+
+
+## §5.5.50 — CLI step-count sweep + Euler sampler trace — VERDICT: STEP-1_NAN_CLIFF (n>=3)
+
+### Setup
+
+Probe at 256² with cat-edit prompt. Patched
+`tools/ominix_diffusion/src/denoiser.hpp` EULER_SAMPLE_METHOD with
+env-gated `QIE_SAMPLER_TRACE=1` instrumentation that prints, after
+every Euler step, sigma / sigma_next / dt / x std+range+NaN /
+denoised std+range+NaN. Built ominix-diffusion-cli with the patch
+applied. HBM lock held throughout; lock released between runs.
+
+### Probe A — step-count sweep at 256²
+
+Wrapper `/tmp/probe_a_sweep.sh` ran `euler` at n_steps in
+{1, 2, 4} (n=8/16/20 cancelled after n=4 NaN, since the bug
+clearly enters at n=3 — bisect completed by Probe-bisect run).
+
+| n  | rc | PNG bytes | latent NaN          | verdict |
+|----|----|-----------|---------------------|---------|
+| 1  | 0  | 181 502   | 0 / 16384           | GREEN   |
+| 2  | 0  | 181 442   | 0 / 16384           | GREEN   |
+| 3  | 0  |   2 313   | 16384 / 16384       | RED     |
+| 4  | 0  |   2 313   | 16384 / 16384       | RED     |
+
+PNG eye-check: n=1, n=2 are real cat edits (~181 KB); n=3, n=4
+are 2.3 KB degenerate solid-color images (NaN → 0).
+
+**Largest-n CLI-finite at 256² = 2.** Bug enters at n=3.
+
+### Probe B — per-step QIE_SAMPLER_TRACE
+
+#### n=3 trace (RED)
+
+```
+step=0 sigma=1.0000 sigma_next=0.7504 dt=-0.2496 x std=0.9984 range=(-3.98,3.90) NaN=0/16384       denoised std=1.0236 range=(-4.12,3.80) dnNaN=0
+step=1 sigma=0.7504 sigma_next=0.0030 dt=-0.7474 x std=0.0000 range=(inf,-inf) NaN=16384/16384  denoised std=0.0000 range=(inf,-inf) dnNaN=16384
+step=2 sigma=0.0030 sigma_next=0.0000 dt=-0.0030 x std=0.0000 range=(inf,-inf) NaN=16384/16384  denoised std=0.0000 range=(inf,-inf) dnNaN=16384
+```
+
+#### n=4 trace (RED)
+
+```
+step=0 sigma=1.0000 sigma_next=0.8573 dt=-0.1427 x std=0.9973 range=(-3.95,3.91) NaN=0/16384       denoised std=1.0236 range=(-4.12,3.80) dnNaN=0
+step=1 sigma=0.8573 sigma_next=0.6007 dt=-0.2566 x std=0.0000 range=(inf,-inf) NaN=16384/16384  denoised std=0.0000 range=(inf,-inf) dnNaN=16384
+step=2 sigma=0.6007 sigma_next=0.0030 dt=-0.5977 x std=0.0000 range=(inf,-inf) NaN=16384/16384  denoised std=0.0000 range=(inf,-inf) dnNaN=16384
+step=3 sigma=0.0030 sigma_next=0.0000 dt=-0.0030 x std=0.0000 range=(inf,-inf) NaN=16384/16384  denoised std=0.0000 range=(inf,-inf) dnNaN=16384
+```
+
+**First-NaN step = step 1, in BOTH n=3 and n=4. The denoiser
+forward pass returns all-NaN denoised at the SECOND model call.**
+
+In both cases:
+- step=0: x finite (std ~1.0, range ±4), denoised finite (std ~1.02,
+  range ±4.12). Sigma=1.0 input. Identical to single-step §5.5.25.
+- step=1: model called with sigma_step1 (0.7504 for n=3, 0.8573 for
+  n=4), x post-Euler-update is in principle fine (x*0.857+
+  denoised*0.143 is range ±4ish). **The denoised tensor returned
+  by the model is all-NaN.** That means the NaN originates inside
+  the diffusion-model forward at step 1, NOT in the Euler arithmetic.
+
+### Probe C — 1024² at largest-n-finite
+
+Skipped: largest-n-finite at 256² is n=2, and we already verified
+in §5.5.25 that 1024² 1-step works (cli_dump.png is the cat). A
+1024² 2-step probe would consume ~7 minutes for marginal value
+(2-step euler with sigma=[1.0, 0.5, 0.0] is essentially a midpoint
+correction over 1-step). Defer to §5.5.51 if needed.
+
+### Identified bug class
+
+**Class: model-forward instability at the SECOND timestep call,
+specifically when sigma_step1 is in the (0.6, 0.95) range.**
+
+Ruled out by trace:
+1. ~~Sigma schedule edge case in Euler arithmetic~~. The Euler dt
+   computation is finite, the post-update x at step 0 has finite
+   std/range. Bug enters during model() at step 1, not in the
+   sampler glue.
+2. ~~Quantization compounding error~~. Step 0 is finite; the very
+   first multi-step model call NaN's. There is no compounding
+   over many steps; ONE extra step is enough.
+3. ~~Mod-chunk amplification at low σ~~. NaN appears at sigma=0.857
+   (n=4 step 1), nowhere near σ→0.
+
+Surviving hypotheses (in priority order):
+1. **F16 attention softmax overflow at step-1 timestep embedding**.
+   Sigma=0.857/0.7504 maps to a timestep index like ~857/750 in
+   the 1000-step schedule. The model's timestep embedding for that
+   value, combined with the slightly perturbed x post-step-0 update,
+   may produce attention scores that saturate F16 inside softmax →
+   NaN. Step 0 (sigma=1.0, t=999) is a training-frequent regime;
+   step 1 (mid-sigma) is also valid in training, but the
+   COMBINATION of (post-Euler x, mid-sigma timestep) may not be
+   covered if the sampler post-step-0 latent has a slightly
+   different distribution than the noised reference latent the
+   model expects.
+2. **CacheDiT/EasyCache state leak**. If a kv-cache or residual
+   cache is populated at step 0 and reused at step 1 with stale
+   shape/dtype assumptions, the second forward could blow up.
+   This would fully explain why step 0 is fine and step 1 is
+   100 % NaN regardless of sigma value.
+3. **Timestep-conditioned modulation overflow at non-extreme t**.
+   AdaLayerNorm-style modulation tables may have an entry that's
+   only used at intermediate timesteps and contains a bad value
+   (sentinel, garbage from quantisation rounding).
+
+### Recommended §5.5.51 fix path
+
+Bisect the two surviving hypotheses by ablating in this order:
+
+1. **§5.5.51a — disable any cache (CacheDiT/EasyCache) for the
+   CLI run**. Find the off switch in qwen_image.hpp /
+   stable-diffusion.cpp and force-disable. Re-run n=3 at 256².
+   If GREEN → cache state leak, fix in cache invalidation.
+2. **§5.5.51b — F32 attention softmax at all layers**. If §5.5.51a
+   still RED, force the attention softmax to F32 throughout (the
+   §5.5.45 widening only covered Q/K/V projections; softmax may
+   still be F16). Re-run n=3 at 256².
+3. **§5.5.51c — dump x and timestep embedding** at start of step
+   1 of n=3 from CLI; compare against equivalent JOINT QIE-Edit
+   engine V2 mirror to localise WHICH layer first NaN's.
+
+Once §5.5.51 lands a CLI multi-step GREEN, the engine bisect on
+§5.5.42-§5.5.47 fixes can resume against a real ground-truth.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout, released between runs and on cleanup.
+- Do NOT push: confirmed (44 commits ahead of origin/main after
+  this commit).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~75 min wall (within the 2 h budget; cancelled
+  n=8/16/20 once bisect was complete).
