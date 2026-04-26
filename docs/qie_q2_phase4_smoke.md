@@ -6730,3 +6730,138 @@ diff), 60 min for sub-task 2 (force-fallback experiment + re-dump).
 - Do NOT modify forward code: confirmed (no engine source touched).
 - Time-box 90 min: ~30 min wall.
 - No Co-Authored-By Claude: confirmed.
+
+## §5.5.40 — WQBMMv3 ABI audit + dispatch fix attempts — VERDICT: BUG_DEEPER_THAN_DISPATCH
+
+### Mission
+
+Per §5.5.39 Recommended work, fix the aclnnWeightQuantBatchMatmulV3
+dispatch so the Q4_0 GGUF weight matmuls produce numerically correct
+output without falling back to dequant-to-F16 (which OOMs the 32 GiB
+HBM at full 1024-squared shape — confirmed below).
+
+### ABI audit (Gate A)
+
+Cross-referenced tools/qwen_image_edit/native/image_diffusion_engine.cpp
+dispatch_matmul_ (lines 1463-1900) and repack_q4_0_upload (lines
+284-425) against:
+
+1. The aclnn V2 op proto (/usr/local/Ascend/ascend-toolkit/8.3.RC1/opp/built-in/op_proto/inc/fusion_ops.h:1738).
+2. ggml-cann mul_mat_quant path (ggml/src/ggml-cann/aclnn_ops.cpp:2713-2870).
+3. ggml-cann transform_q4_0 buffer layout (ggml/src/ggml-cann/ggml-cann.cpp:916-949).
+4. The internal V2 mangled symbol l0op::WeightQuantBatchMatmulV2(..., bool transposeX, bool transposeWeight, ...).
+
+Spec quote (V2 op proto): When transpose_weight is false, weights
+shape is (k, n), antiquant_scale shape (ceil(k/antiquant_group_size), n).
+Matches the engine [K, N] weight + [K/32, N] scale views with strides
+(1, K) and (N, 1).
+
+Findings — for each potential issue we either ruled out or could not
+isolate via code-read alone:
+
+- Scale layout: engine declares scale shape [K/32, N] strides (N, 1),
+  spec-conformant for transpose_weight=false. Repack writes
+  out_s[b*N+n] = d. ggml-cann uses transpose_weight=true convention:
+  shape [N, K/32] strides (K/32, 1) with scale[n*BLK + b] = d. Both
+  layouts are spec-conformant; the kernel infers transpose_weight from
+  declared shape.
+- Antiquant offset: engine passes nullptr; bias-8 to signed conversion
+  is baked into nibbles via XOR 0x08 at repack time. ggml-cann does
+  the same (XOR 0x88 per byte). Symmetric per-group quant is supported
+  with null offset for both V2 and V3.
+- Activation dtype: engine pre-casts F16 to BF16 before matmul when
+  use_bf16=1 (default). Spec requires x dtype to match scale/y dtype
+  combo (BF16/INT4/BF16/BF16). Satisfied.
+- Output dtype: BF16 by default. Engine handles cast.
+- transposeX / transposeW: V3 does not expose these. Default
+  (transpose_*=false) is inferred from declared tensor shapes.
+- groupSize: engine passes 32, matching Q4_0 block size (V2 spec
+  requires antiquant_group_size %% 32 == 0). OK.
+- Nibble interleave: initially suspected GGUF (j, j+16) per-block
+  interleave was required. Re-checked ggml-cann transform_q4_0: it
+  emits sequential (2j, 2j+1) pairs per byte (XOR 0x88 per byte for
+  bias-8 to signed). Engine repack produces byte-identical output to
+  ggml-cann transform, modulo scale-buffer layout. So nibble convention
+  is not the bug.
+
+### Gate-B fix attempts (all RED)
+
+Three patches built + ran 1024-squared 1-step on ac03 with substep
+dumps. All hit either ACL_ERR_PARAM_INVALID (161002) at workspace-size
+query, or the same numerical RED as §5.5.39:
+
+1. v3 — full ggml-cann mirror: rewrite scale to [N, K/32] n-major,
+   declare weight [N, K], scale [N, K/32], x [K, M] strides (1, K),
+   y [N, M] strides (1, N). Builds, but WQBMMv3 workspace status=161002
+   at first invocation. Validator rejects either the y view shape or
+   the activation transpose.
+2. v4 — scale-only flip: keep weight [K, N] but rewrite scale memory
+   + descriptor to [N, K/32]. Same 161002 — kernel cross-checks weight
+   and scale shape consistency.
+3. v6 — transpose_weight=true mirror with x/y unchanged: weight [N, K],
+   scale [N, K/32], x [M, K], y [M, N]. Same 161002.
+
+Conclusion: the V3 public API appears to enforce transpose_weight=false
+regardless of declared shape, contradicting the V2 op-proto
+transpose_weight=true branch. Existing [K, N] weight + [K/32, N] scale
+view is the only shape combination V3 accepts AT WORKSPACE QUERY. Yet
+on real Q4_0 GGUF data that combo produces numerically-wrong output
+(cos~0; §5.5.39).
+
+The disagreement between V2 op proto and V3 API enforcement is the
+likely root — V3 added validation that V2 did not have, and ggml-cann
+working backend uses V2 (which accepts the transpose_weight=true shape
+the kernel actually wants). Without access to V3 internal validation
+source, the next step is either:
+
+  (a) Switch from V3 to V2 in dispatch. V2 is exported by libopapi.so
+      per symbol scan. V2 has the same workspace query signature plus
+      transpose flags inferred from shape — and ggml-cann proves it
+      works for real Q4_0 with transpose_weight=true shape.
+  (b) CPU dequant on the fly for the Q4_0 weights at forward time,
+      avoiding WQBMMv3 entirely. Memory-prohibitive at 1024-squared.
+  (c) Pre-dequant a subset — keep blocks 0/59 (Q5_K) on F16 fallback
+      as-is, route the 58 Q4_0 blocks through F16 fallback too.
+      Confirmed RED here: with QIE_DISABLE_WQBMMV3=1 the run OOMs at
+      block 44 during init weight upload (aclrtMalloc 18 MiB failed
+      err=207001 after consuming ~28 GiB HBM). F16 fallback cannot fit
+      1024-squared + all-Q4_0-blocks-as-F16.
+
+### Gate-D PNG eye-check
+
+NOT RUN. Without a working dispatch fix or a memory budget for full
+F16 fallback, the end-to-end harness either REDs at block 1 (current
+WQBMMv3) or OOMs at init (QIE_DISABLE_WQBMMV3=1).
+
+### Verdict
+
+```
+WQBMMV3_DISPATCH_BUG_DEEPER_THAN_SHAPE_LAYOUT
+ROOT      = unknown internal V3 validation that accepts only
+            transpose_weight=false-spec shapes but produces wrong
+            numerics on real Q4_0 GGUF data. Synthetic-data probe
+            (qie_q2_q4resident_probe.md) was GREEN at cos=0.999 with
+            same shapes — symmetric per-group random data is invariant
+            to the actual nibble decode convention, so probe did not
+            stress the dispatch.
+NEXT STEP = switch dispatch to aclnnWeightQuantBatchMatmulV2 (which
+            ggml-cann proves works for real Q4_0 GGUF in
+            transpose_weight=true shape mode). Estimated 1 hour:
+            change cp_cann symbol resolution + dispatch_matmul_ to
+            target V2 with the ggml-cann tensor convention.
+```
+
+### Artefacts
+
+- /tmp/qie_5540_post_fix/block00, /tmp/qie_5540_post_fix/block01 —
+  v6 attempts substep dumps up to the WQBMMv3 failure (block 1 stops
+  at 01_silu_t_emb).
+- v6 patch python script saved in agent transcript only (not in tree).
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during runs (/tmp/ac03_hbm_lock touched).
+- Do NOT push: confirmed (engine source reverted to baseline).
+- Time-box 2h: ~95 min wall.
+- No Co-Authored-By Claude: confirmed.
