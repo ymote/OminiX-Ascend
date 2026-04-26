@@ -809,6 +809,14 @@ private:
     bool clamp_residual_f32_(void *x_f32_dev, int64_t B, int64_t seq,
                                 int64_t hidden, float clamp_value);
 
+    // Q2.4.5.5.45: F16 saturation clamp on Q/K/V projection outputs before
+    // the RMSNorm op. Bounds |x| <= clamp_value (default 60000) so the F16
+    // matmul output cast cannot saturate to Inf at deep blocks (call 228
+    // ≈ step 3 block 48 with the §5.5.44 residual clamp active). In-place
+    // aclnnInplaceHardtanh on the F16 buffer. Skipped (return true) when
+    // clamp_value <= 0.
+    bool clamp_f16_(void *x_f16_dev, int64_t n_elts, float clamp_value);
+
     // aclnnRmsNorm dispatch over the last dim `head_dim`. Input/output are
     // F16 [B, seq, n_heads, head_dim]; gamma is F32 [head_dim]. For QIE Q2.3
     // we reshape to `[B * seq * n_heads, head_dim]` as required by the op.

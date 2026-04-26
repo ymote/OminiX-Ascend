@@ -2634,6 +2634,44 @@ bool ImageDiffusionEngine::clamp_residual_f32_(void *x_f32_dev,
     return s == 0;
 }
 
+// Q2.4.5.5.45: F16 in-place clamp via aclnnInplaceHardtanh. Used on the
+// Q/K/V projection outputs to bound them strictly inside the F16 finite
+// range before RMSNorm — escapes the saturation at deep blocks where the
+// matmul output cast produces Inf (e.g. txt_K Inf=214 at call 228 with
+// §5.5.44 residual clamp active).
+bool ImageDiffusionEngine::clamp_f16_(void *x_f16_dev, int64_t n_elts,
+                                         float clamp_value) {
+    if (clamp_value <= 0.0f) return true;
+    if (!x_f16_dev || n_elts <= 0) return true;
+    if (!g_cann.aclnnInplaceHardtanh ||
+        !g_cann.aclnnInplaceHardtanhGetWorkspaceSize) {
+        QIE_LOG("clamp_f16_: aclnnInplaceHardtanh symbol missing");
+        return false;
+    }
+    int64_t shape[1]   = {n_elts};
+    int64_t strides[1] = {1};
+    aclTensor *t_x = tensor_nd_f16(x_f16_dev, 1, shape, strides);
+
+    float lo = -clamp_value, hi = clamp_value;
+    aclScalar *s_lo = g_cann.aclCreateScalar(&lo, ACL_FLOAT);
+    aclScalar *s_hi = g_cann.aclCreateScalar(&hi, ACL_FLOAT);
+    uint64_t ws = 0;
+    aclOpExecutor *exec = nullptr;
+    aclnnStatus s = g_cann.aclnnInplaceHardtanhGetWorkspaceSize(
+        t_x, s_lo, s_hi, &ws, &exec);
+    if (s == 0) {
+        ensure_workspace_(ws);
+        s = g_cann.aclnnInplaceHardtanh(ws > 0 ? workspace_dev_ : nullptr,
+                                          ws, exec, compute_stream_);
+    }
+    if (s != 0) QIE_LOG("clamp_f16_: status=%d clamp=%.1f n=%lld",
+                          (int)s, clamp_value, (long long)n_elts);
+    if (s_lo) g_cann.aclDestroyScalar(s_lo);
+    if (s_hi) g_cann.aclDestroyScalar(s_hi);
+    g_cann.aclDestroyTensor(t_x);
+    return s == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4.5 Step 4: RMSNorm over last dim `inner`, F32 in → F16 out. Used
 // for the global `txt_norm` (RMSNorm over joint_attention_dim=3584) on the
@@ -3456,6 +3494,62 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                         is_f16 ? PROBE_F16 : PROBE_F32);
     };
 
+    // Q2.4.5.5.45: per-call FFN substep tracer. Fires for every
+    // forward_block_ invocation (NOT only call-0) when env
+    // QIE_TRACE_FFN_SUBSTEPS=1, optionally bracketed by
+    // QIE_TRACE_FFN_CALL_MIN / QIE_TRACE_FFN_CALL_MAX (inclusive bounds
+    // on s_intra_calls-1, the post-increment block call index).
+    static int s_ffn_trace = -1;
+    static int s_ffn_trace_min = -1;
+    static int s_ffn_trace_max = -1;
+    if (s_ffn_trace < 0) {
+        const char *v = std::getenv("QIE_TRACE_FFN_SUBSTEPS");
+        s_ffn_trace = (v && *v && v[0] != '0') ? 1 : 0;
+        const char *vmin = std::getenv("QIE_TRACE_FFN_CALL_MIN");
+        const char *vmax = std::getenv("QIE_TRACE_FFN_CALL_MAX");
+        s_ffn_trace_min = (vmin && *vmin) ? std::atoi(vmin) : 0;
+        s_ffn_trace_max = (vmax && *vmax) ? std::atoi(vmax) : 100000;
+    }
+    const int  s_call_idx = s_intra_calls - 1;
+    const bool do_ffn_trace = s_ffn_trace
+                              && (s_call_idx >= s_ffn_trace_min)
+                              && (s_call_idx <= s_ffn_trace_max);
+    auto ffn_probe = [&](const char *label, void *dev, int64_t n_elts,
+                          ProbeDtype dt) -> void {
+        if (!do_ffn_trace) return;
+        g_cann.aclrtSynchronizeStream(compute_stream_);
+        const size_t bpe = (dt == PROBE_F32) ? 4 : 2;
+        std::vector<uint8_t> host((size_t)n_elts * bpe);
+        aclError me = g_cann.aclrtMemcpy(host.data(), host.size(), dev,
+                                           host.size(),
+                                           ACL_MEMCPY_DEVICE_TO_HOST);
+        if (me != 0) return;
+        double max_abs = 0.0;
+        int64_t nanc = 0, infc = 0;
+        for (int64_t i = 0; i < n_elts; ++i) {
+            float v;
+            if (dt == PROBE_F16) {
+                __fp16 hh; std::memcpy(&hh, host.data() + (size_t)i*2, 2);
+                v = (float)hh;
+            } else if (dt == PROBE_BF16) {
+                uint16_t bh; std::memcpy(&bh, host.data() + (size_t)i*2, 2);
+                uint32_t bits = ((uint32_t)bh) << 16;
+                std::memcpy(&v, &bits, 4);
+            } else {
+                std::memcpy(&v, host.data() + (size_t)i*4, 4);
+            }
+            if (std::isnan(v)) { ++nanc; continue; }
+            if (std::isinf(v)) { ++infc; continue; }
+            double a = std::fabs((double)v);
+            if (a > max_abs) max_abs = a;
+        }
+        const char *dts = (dt == PROBE_F32) ? "F32" :
+                           (dt == PROBE_F16) ? "F16" : "BF16";
+        QIE_LOG("5.5.45 ffn_call=%d %s %s max_abs=%.4g NaN=%lld Inf=%lld",
+                 s_call_idx, label, dts, max_abs,
+                 (long long)nanc, (long long)infc);
+    };
+
     intra_probe("00_img_hidden_in", img_hidden, img_seq * H, false);
     intra_probe("00_txt_hidden_in", txt_hidden, txt_seq * H, false);
     intra_probe("00_t_emb_in", t_emb, H, true);
@@ -3612,19 +3706,23 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                   B, img_seq, H))
         return false;
     intra_probe("04_img_LN1", scratch_img_norm_dev_, img_seq * H, true);
+    ffn_probe("04_img_LN1", scratch_img_norm_dev_, img_seq * H, PROBE_F16);
     dump_tensor_f32("04_img_LN1.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_img_norm_dev_, img_scale1, img_shift1,
                    B, img_seq, H)) return false;
     intra_probe("05_img_mod1", scratch_img_norm_dev_, img_seq * H, true);
+    ffn_probe("05_img_mod1", scratch_img_norm_dev_, img_seq * H, PROBE_F16);
     dump_tensor_f32("05_img_mod1.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
     intra_probe("06_txt_LN1", scratch_txt_norm_dev_, txt_seq * H, true);
+    ffn_probe("06_txt_LN1", scratch_txt_norm_dev_, txt_seq * H, PROBE_F16);
     dump_tensor_f32("06_txt_LN1.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale1, txt_shift1,
                    B, txt_seq, H)) return false;
     intra_probe("07_txt_mod1", scratch_txt_norm_dev_, txt_seq * H, true);
+    ffn_probe("07_txt_mod1", scratch_txt_norm_dev_, txt_seq * H, PROBE_F16);
     dump_tensor_f32("07_txt_mod1.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
@@ -3666,6 +3764,30 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     intra_probe("08_txt_Q", scratch_q_dev_, txt_seq * H, true);
     intra_probe("08_txt_K", scratch_k_dev_, txt_seq * H, true);
     intra_probe("08_txt_V", scratch_v_dev_, txt_seq * H, true);
+    ffn_probe("08_img_Q", offset_rows(scratch_q_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("08_img_K", offset_rows(scratch_k_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("08_img_V", offset_rows(scratch_v_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("08_txt_Q", scratch_q_dev_, txt_seq * H, PROBE_F16);
+    ffn_probe("08_txt_K", scratch_k_dev_, txt_seq * H, PROBE_F16);
+    ffn_probe("08_txt_V", scratch_v_dev_, txt_seq * H, PROBE_F16);
+    // Q2.4.5.5.45: F16 clamp on Q/K/V projection outputs (in-place) — bounds
+    // |x| <= QIE_QKV_CLAMP (default 60000) so F16 saturation to Inf at deep
+    // blocks (e.g. txt_K Inf=214 at call 228 with §5.5.44 residual clamp)
+    // does not feed RMSNorm/RoPE/attention with NaN. Skipped if 0.
+    {
+        static float s_qkv_clamp = -1.0f;
+        if (s_qkv_clamp < 0.0f) {
+            const char *v = std::getenv("QIE_QKV_CLAMP");
+            s_qkv_clamp = (v && *v) ? (float)std::atof(v) : 60000.0f;
+        }
+        if (s_qkv_clamp > 0.0f) {
+            const int64_t total_elts = (txt_seq + img_seq) * H;
+            if (!clamp_f16_(scratch_q_dev_, total_elts, s_qkv_clamp)) return false;
+            if (!clamp_f16_(scratch_k_dev_, total_elts, s_qkv_clamp)) return false;
+            if (!clamp_f16_(scratch_v_dev_, total_elts, s_qkv_clamp)) return false;
+        }
+    }
+
     // Q2.4.5.4k: disk dumps for QKV-projection substep bisect.
     dump_tensor_f32("08_img_Q.f32", offset_rows(scratch_q_dev_, txt_seq),
                      img_seq * H, /*is_f16*/ true);
@@ -3705,6 +3827,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 img_seq * H, true);
     intra_probe("09_txt_Q_rmsnorm", scratch_q_dev_, txt_seq * H, true);
     intra_probe("09_txt_K_rmsnorm", scratch_k_dev_, txt_seq * H, true);
+    ffn_probe("09_img_Q_rms", offset_rows(scratch_q_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("09_img_K_rms", offset_rows(scratch_k_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("09_txt_Q_rms", scratch_q_dev_, txt_seq * H, PROBE_F16);
+    ffn_probe("09_txt_K_rms", scratch_k_dev_, txt_seq * H, PROBE_F16);
     dump_tensor_f32("09_img_Q_rmsnorm.f32",
                      offset_rows(scratch_q_dev_, txt_seq), img_seq * H, true);
     dump_tensor_f32("09_img_K_rmsnorm.f32",
@@ -3740,6 +3866,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                 img_seq * H, true);
     intra_probe("10_txt_Q_rope", scratch_q_dev_, txt_seq * H, true);
     intra_probe("10_txt_K_rope", scratch_k_dev_, txt_seq * H, true);
+    ffn_probe("10_img_Q_rope", offset_rows(scratch_q_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("10_img_K_rope", offset_rows(scratch_k_dev_, txt_seq), img_seq * H, PROBE_F16);
+    ffn_probe("10_txt_Q_rope", scratch_q_dev_, txt_seq * H, PROBE_F16);
+    ffn_probe("10_txt_K_rope", scratch_k_dev_, txt_seq * H, PROBE_F16);
     // Q2.4.5.5.16: F32 disk dumps of RoPE-applied Q/K so the
     // numpy attention oracle can use the actual FIA inputs.
     dump_tensor_f32("10_img_Q_rope.f32",
@@ -3891,6 +4021,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         }
     }
     intra_probe("11_attn_out_txt", scratch_attn_dev_, txt_seq * H, true);
+    ffn_probe("11_attn_out_txt", scratch_attn_dev_, txt_seq * H, PROBE_F16);
+    ffn_probe("11_attn_out_img_pre", offset_rows(scratch_attn_dev_, txt_seq), img_seq * H, PROBE_F16);
     intra_probe("11_attn_out_img", offset_rows(scratch_attn_dev_, txt_seq),
                 img_seq * H, true);
     dump_tensor_f32("11_attn_out_txt.f32", scratch_attn_dev_, txt_seq * H, /*is_f16*/ true);
@@ -3951,6 +4083,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     }
     intra_probe("13_img_resid1", img_hidden, img_seq * H, false);
     intra_probe("13_txt_resid1", txt_hidden, txt_seq * H, false);
+    ffn_probe("13_img_resid1", img_hidden, img_seq * H, PROBE_F32);
+    ffn_probe("13_txt_resid1", txt_hidden, txt_seq * H, PROBE_F32);
     dump_tensor_f32("13_img_resid1.f32", img_hidden, img_seq * H, /*is_f16*/ false);
     dump_tensor_f32("13_txt_resid1.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
@@ -3980,19 +4114,23 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                                   B, img_seq, H))
         return false;
     intra_probe("14_img_LN2", scratch_img_norm_dev_, img_seq * H, true);
+    ffn_probe("14_img_LN2", scratch_img_norm_dev_, img_seq * H, PROBE_F16);
     dump_tensor_f32("14_img_LN2.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_img_norm_dev_, img_scale2, img_shift2,
                    B, img_seq, H)) return false;
     intra_probe("15_img_mod2", scratch_img_norm_dev_, img_seq * H, true);
+    ffn_probe("15_img_mod2", scratch_img_norm_dev_, img_seq * H, PROBE_F16);
     dump_tensor_f32("15_img_mod2.f32", scratch_img_norm_dev_, img_seq * H, /*is_f16*/ true);
     if (!layer_norm_f32_to_f16_(txt_hidden, scratch_txt_norm_dev_,
                                   B, txt_seq, H))
         return false;
     intra_probe("16_txt_LN2", scratch_txt_norm_dev_, txt_seq * H, true);
+    ffn_probe("16_txt_LN2", scratch_txt_norm_dev_, txt_seq * H, PROBE_F16);
     dump_tensor_f32("16_txt_LN2.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
     if (!modulate_(scratch_txt_norm_dev_, txt_scale2, txt_shift2,
                    B, txt_seq, H)) return false;
     intra_probe("17_txt_mod2", scratch_txt_norm_dev_, txt_seq * H, true);
+    ffn_probe("17_txt_mod2", scratch_txt_norm_dev_, txt_seq * H, PROBE_F16);
     dump_tensor_f32("17_txt_mod2.f32", scratch_txt_norm_dev_, txt_seq * H, /*is_f16*/ true);
 
     // ------------------------------------------------------------------
@@ -4040,8 +4178,10 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           lw.img_ff_up_scale, lw.img_ff_up_b,
                           img_seq, H, FF, scratch_mlp_dev_)) return false;
     intra_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, true);
+    ffn_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, PROBE_F16);
     if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
     intra_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, true);
+    ffn_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, PROBE_F16);
     // Q2.4.5.4c: ff_down output dtype gated by QIE_FFN_DOWN_BF16 (or its
     // superset QIE_ALL_BF16). F16 by default (Step 1 synthetic regression
     // invariant); BF16 escapes the ~65504 saturation observed in §5.5.3
@@ -4052,6 +4192,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
     intra_probe_dt("20_img_ff_down", scratch_img_out_dev_, img_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
+    ffn_probe("20_img_ff_down", scratch_img_out_dev_, img_seq * H,
+               ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
     dump_tensor_dt("20_img_ff_down.f32", scratch_img_out_dev_, img_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
@@ -4060,14 +4202,18 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
                           lw.txt_ff_up_scale, lw.txt_ff_up_b,
                           txt_seq, H, FF, scratch_mlp_dev_)) return false;
     intra_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF, true);
+    ffn_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF, PROBE_F16);
     if (!gelu_activate(scratch_mlp_dev_, txt_seq)) return false;
     intra_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, true);
+    ffn_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, PROBE_F16);
     if (!dispatch_matmul_(scratch_mlp_dev_, lw.txt_ff_down_w_q4,
                           lw.txt_ff_down_scale, lw.txt_ff_down_b,
                           txt_seq, FF, H, scratch_txt_out_dev_,
                           ffn_down_bf16 ? ACL_BF16 : ACL_FLOAT16)) return false;
     intra_probe_dt("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
+    ffn_probe("23_txt_ff_down", scratch_txt_out_dev_, txt_seq * H,
+               ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
     dump_tensor_dt("23_txt_ff_down.f32", scratch_txt_out_dev_, txt_seq * H,
                     ffn_down_bf16 ? PROBE_BF16 : PROBE_F16);
 
@@ -4091,6 +4237,8 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     }
     intra_probe("24_img_resid2", img_hidden, img_seq * H, false);
     intra_probe("24_txt_resid2", txt_hidden, txt_seq * H, false);
+    ffn_probe("24_img_resid2", img_hidden, img_seq * H, PROBE_F32);
+    ffn_probe("24_txt_resid2", txt_hidden, txt_seq * H, PROBE_F32);
     dump_tensor_f32("24_img_resid2.f32", img_hidden, img_seq * H, /*is_f16*/ false);
     dump_tensor_f32("24_txt_resid2.f32", txt_hidden, txt_seq * H, /*is_f16*/ false);
 
