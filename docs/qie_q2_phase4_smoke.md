@@ -7923,3 +7923,185 @@ QIE_ATTN_SOFTMAX_F32 ablation) remains; defer until after the
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~25 min wall (CLI was already at step 14/20 when
   dispatch arrived; 6 steps × 52 s + analysis + commit).
+
+## §5.5.49 — CLI 1024² 20-step verification — CLI_NAN_AT_1024_20_TOO
+
+### Setup
+
+§5.5.48 found the CLI itself produces 100% NaN at 256² 20-step. To
+test whether 1024² (the original Phase-1 baseline regime) is the
+working ground-truth target, dispatch the CLI end-to-end at
+**1024² 20-step** with the same `cat.jpg` + `'make the cat smile'`
+conditioning, capturing every QIE_DUMP tag including `x0_sampled_0`.
+
+### Run
+
+```
+OMINIX_QIE_DUMP_DIR=/tmp/qie_5549_cli_dump \
+ominix-diffusion-cli \
+  --diffusion-model Qwen-Image-Edit-2509-Q4_0.gguf \
+  --llm Qwen2.5-VL-7B-Instruct-Q4_0.gguf \
+  --llm_vision mmproj-BF16.gguf \
+  --vae qwen_image_vae.safetensors \
+  -r cat.jpg -p 'make the cat smile' \
+  -W 1024 -H 1024 --steps 20 --cfg-scale 1.0 \
+  --sampling-method euler --vae-tiling \
+  -o /tmp/qie_5549_cli_1024_n20.png --seed 42 --color
+```
+
+PID 1234432, wall ~50 min total (image-encoder pre-pass 480 s,
+condition encode 8 s, 20-step Euler sample 1212 s = ~60 s/step,
+VAE 49-tile decode ~16 min).
+
+### Latent NaN verdict — RED
+
+CLI explicitly flagged the post-sample latent:
+
+```
+[ERROR] [NaN CHECK] diffusion/x_0 (sampled latent): 262144 elements
+        — 262144 NaN, 0 Inf
+        range=[3.4e38, -3.4e38]
+[QIE dump]  x0_sampled_0 -> /tmp/qie_5549_cli_dump/x0_sampled_0.f32.bin
+            (262144 F32 elts, shape=[128,128,16,1])
+```
+
+Confirmed locally:
+
+```python
+>>> d = np.fromfile('/tmp/qie_5549_cli_dump/x0_sampled_0.f32.bin',
+...                 dtype=np.float32)
+>>> np.isnan(d).sum(), np.isinf(d).sum(), len(d)
+(262144, 0, 262144)
+```
+
+**100% NaN**, identical to the §5.5.48 256² result.
+
+### Pre-sample dumps OK
+
+The four dumps captured before the sampler are all healthy:
+
+| Dump                  | Shape           | Range / health                  |
+|-----------------------|-----------------|----------------------------------|
+| cond_c_crossattn      | [3584,212,1,1]  | OK, range [-159.24, +108.69]    |
+| init_latent           | [128,128,16,1]  | f32 finite                       |
+| ref_latent_0          | [128,128,16,1]  | f32 finite                       |
+| noised_init_latent    | [128,128,16,1]  | f32 finite                       |
+| model_out_step0_cond  | [128,128,16,1]  | f32 finite                       |
+
+The bug is again **between step-0 model_out and the final x_0** —
+identical signature to §5.5.48 256². The Euler sampler trajectory
+saturates to ±inf within the 20 steps regardless of resolution.
+
+### Eye-check
+
+Solid-black PNG — VAE faithfully propagates NaN to the decoded
+image (same as 256²). Pixel diff vs CUDA reference
+`/tmp/phase1_baseline_1024_20step.png` skipped: meaningless against
+an all-NaN→all-zero output.
+
+### CLI vs engine comparison at 1024² 20-step
+
+| Metric               | CLI 1024² 20-step | Engine (§5.5.46-7) 1024² 20-step |
+|----------------------|--------------------|-----------------------------------|
+| final latent std     | NaN                | 12-15                             |
+| final latent range   | NaN                | ±33–41                            |
+| NaN element count    | 262144 / 262144    | 0                                 |
+| VAE output           | solid black        | structured noise / tile           |
+
+The engine produces *finite-but-wrong* latent; the CLI produces
+NaN-saturated latent. **Both are broken at 1024² 20-step**, in
+different ways. The engine has actually been *more numerically
+stable* than the CLI on this exact configuration.
+
+### Decision matrix outcome
+
+The §5.5.48 matrix listed three outcomes for the CLI 1024² rerun:
+
+- (1) CLI 1024² is a CAT → 1024² is the working ground-truth
+  regime → engine bisect proceeds at 1024².
+- (2) CLI 1024² is **also NaN** → both engines broken at multi-step,
+  joint precision issue.
+- (3) CLI 1024² is structured noise (not NaN, not cat) → joint
+  sampler precision problem.
+
+Outcome **(2) — CLI 1024² 20-step is also 100% NaN.**
+
+The two-week saga's working assumption — *engine is regressing
+against a CLI that produces a clean cat at multi-step* — is now
+**fully invalidated** at every measured (resolution × step) point:
+
+| Config           | CLI verdict          | Engine verdict       |
+|------------------|----------------------|----------------------|
+| 1024² 1-step     | CAT (§5.5.25)        | CAT-ish (§5.5.43)    |
+| 256² 20-step     | NaN (§5.5.48)        | std=15 ±41 (§5.5.46) |
+| 1024² 20-step    | **NaN (§5.5.49)**    | std=13 ±33 (§5.5.47) |
+
+The only known-good ground-truth for QIE-Edit Q4_0 + EDIT mode +
+Euler sampler on this platform is **1-step** at 1024². At
+20-step, the upstream CLI itself diverges to ±inf inside the
+sampler — the engine has been chasing a moving target whose
+canonical reference is broken at the same regime.
+
+### Implications
+
+1. The QIE-Edit cat-PNG saga is now **a joint Q4_0 + sampler
+   precision issue**, not a pure engine regression. Any §5.5.50+
+   fix must improve numerics in *both* engines or replace the
+   sampler reference.
+2. The ±15-40 magnitude leak the engine produces at 20-step may
+   still be a real *additional* engine-only bug (it shouldn't be
+   ±40 on a flow model where ±5 is canonical), but it **cannot
+   be diagnosed by diff vs CLI** at this regime — CLI is NaN.
+3. The §5.5.46 unfinished tasks (per-block residual trace at
+   1024², attention-softmax F32 ablation) are now lower-priority
+   than precision audit of the *sampler itself* (Euler sigma
+   schedule precision, F32 vs F16 sigmas, cumulative numerical
+   error per step).
+4. The 1-step regime is the only point where engine and CLI agree
+   and produce a recognizable cat. That is the workable
+   baseline; multi-step is broken upstream.
+
+### Verdict
+
+**RED again on the experimental hypothesis.** CLI 1024² 20-step
+is *also* NaN, identical signature to 256² 20-step. **The CLI has
+no working multi-step ground truth** at any tested resolution
+with the current Q4_0 weights + EDIT mode + Euler config.
+
+This is informative: it stops the engine bisect from chasing
+phantom magnitude leaks against a NaN reference, and pivots the
+saga to a **shared upstream precision problem**.
+
+### Recommended §5.5.50
+
+**Pivot from engine-only bisect to CLI sampler precision audit.**
+
+Two parallel probes:
+
+1. **§5.5.50a — Sigma schedule precision in CLI Euler sampler.**
+   Patch upstream `denoiser.hpp` / `stable-diffusion.cpp` Euler
+   path to log per-step `(sigma, dt, x_pred std/range)` and find
+   the step at which the CLI itself crosses into ±inf at 1024²
+   20-step. If the explosion is at a specific sigma boundary
+   (e.g. sigma_min), the fix is sigma-schedule clamping or F32
+   accumulator widening on the sampler side.
+
+2. **§5.5.50b — Step-count sweep on CLI** at 1024²: 1, 2, 4, 8,
+   12, 16, 20. Find the largest n at which the CLI x0 is finite.
+   That n becomes the new ground-truth ceiling for engine bisect.
+   Together with §5.5.50a, identifies whether the regression is
+   step-count linear or threshold-cliff.
+
+Defer all engine-side §5.5.46 follow-ups (per-block residual,
+attention-softmax F32 ablation) until §5.5.50a/b finds a working
+upstream baseline at multi-step. Without a clean CLI multi-step
+output to diff against, those engine probes have no reference.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held throughout the ~50-min CLI run; released after
+  CLI exit.
+- Do NOT push: confirmed (now 43 commits ahead of origin/main).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~50 min wall, well within the 90-min budget.
