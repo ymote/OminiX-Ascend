@@ -6536,3 +6536,197 @@ diagnose first divergent substep + write fix patch).
   is a default-initialized optional that does not affect existing
   call semantics; debug LOG_INFO probes were removed before commit.
 - No Co-Authored-By Claude: confirmed.
+
+
+---
+
+## §5.5.38 — Block-1 F32 numpy oracle bisect — Q4_0 dispatch RED
+
+### Mission
+
+Per §5.5.37 dispatch-bypass blocker, bisect block 1 from the engine side
+using F32 numpy oracles applied to the existing
+`/tmp/qie_5536_eng_real/block01/` substep dumps. The §5.5.21 oracles
+gave cos=1.000 for block 0 — re-validate block 1 with the same math.
+
+### Method
+
+Wrote `/tmp/qie_b1_oracle.py` (single-file, REAL 1024² shape:
+IMG_SEQ=8192, TXT_SEQ=212, NH=24, HD=128). The oracle takes engine
+substep dumps as inputs, applies the engine's documented math
+(LayerNorm + modulate + matmul + RmsNorm + joint SDPA + matmul +
+gated residual), and emits per-substep cossim oracle vs engine.
+
+Step 1 — Block-1 input vs block-0 output bit-compare:
+
+```
+md5sum /tmp/qie_5536_eng_real/block01/00_img.f32 \
+       /tmp/qie_5536_eng_real/block00/24_img_resid2.f32
+944495d6b9c01117032db0ccfd807509  block01/00_img.f32
+944495d6b9c01117032db0ccfd807509  block00/24_img_resid2.f32
+```
+
+Bit-identical → block residual chain is intact (cos=1.000 by definition).
+
+Step 2 — Oracle vs engine, block 1:
+
+```
+[01_silu_t_emb]    cos=1.000000   (sanity, F16 round)
+[02_img_mod_out]   cos=0.045529   DIV     ← FIRST DIVERGENT
+[04_img_LN1]       cos=1.000000   PASS    (engine LN1 used as input)
+[05_img_mod1]      cos=1.000000   PASS    (engine LN1 + engine chunks)
+[08_img_Q]         cos=0.004642   DIV
+[08_img_K]         cos=-0.017528  DIV
+[08_img_V]         cos=-0.003391  DIV
+[09_img_Q_rmsnorm] cos=1.000000   PASS    (engine Q used as input)
+[09_img_K_rmsnorm] cos=1.000000   PASS
+[11_attn_out_img]  cos=1.000000   PASS    (engine RoPE Q/K, V used)
+[12_to_out_0]      cos=0.011985   DIV
+[13_img_resid1]    cos=1.000000   PASS    (engine to_out_0 used)
+```
+
+Same oracle on block 0:
+
+```
+ALL substeps cos = 1.000000 PASS
+```
+
+### Root cause — Q5_K vs Q4_0 weight quant type
+
+GGUF reader confirms:
+
+```
+transformer_blocks.0.{img_mod.1,attn.to_*}.weight  qt = Q5_K
+transformer_blocks.[1..58].{...}.weight            qt = Q4_0
+transformer_blocks.59.{...}.weight                 qt = Q5_K
+```
+
+Block 0 oracle used Q5_K dequant → matched engine bit-exactly.
+Block 1 oracle uses Q4_0 dequant → catastrophic mismatch on every
+matmul (cos ~ 0.0).
+
+The §5.5.4l `qie_q4_repack_check.py` probe noted exactly this layout:
+
+> "Q5_K appears only in blocks 0 and 59 — every other block is Q4_0.
+>  load_matmul_weight_upload() falls through to dequant_upload_f16 …
+>  the Q4_0 repack path is bypassed entirely on block 0, so a Q4_0
+>  round-trip cannot exercise the failing codepath."
+
+Block 1 IS the first block that exercises the Q4_0 dispatch
+(`repack_q4_0_upload` → WQBMMv3 / aclnnMm + scale path). Both legs
+disagree:
+
+  - Oracle Q4_0 dequant via gguf-py `quants.dequantize_blocks`
+  - Engine Q4_0 path via `repack_q4_0_upload` + dispatch_matmul_
+
+### Engine vs CLI residual cross-check
+
+```
+                   block 00            block 01
+13_img_resid1      cos=0.9906          cos=0.5831     ← divergence enters here
+24_img_resid2      cos=0.9992          cos=0.1883
+```
+
+Engine and CLI agree at block 0 (Q5_K) and diverge at block 1 (Q4_0).
+This corroborates an engine-side Q4_0 numerical bug — independent of
+whether the oracle's numpy dequant is correct.
+
+### Verdict
+
+```
+ENGINE_HAS_BUG_AT_SUBSTEP_02_img_mod_out
+SCOPE     = ALL Q4_0 weight matmuls in DiT (mod1, QKV proj,
+            to_out.0, FFN up/down — every block 1..58)
+ROOT      = Q4_0 dispatch path (repack_q4_0_upload + WQBMMv3
+            scale chain) produces numerically incorrect output
+            relative to a CPU reference and to the CLI ggml backend.
+EVIDENCE  = engine vs CLI cossim drops 0.99→0.58 at block-1 13_img_resid1
+            → 0.19 at 24_img_resid2; oracle vs engine cos≈0 on every
+            Q4_0 matmul; block-0 Q5_K matmuls all cos=1.000 in both
+            legs. Same defect drives the cat-PNG at high resolution
+            (every block beyond 0 amplifies the Q4_0 error).
+```
+
+### Per-substep cossim summary (block 1)
+
+| Substep              | oracle vs engine | first divergent? |
+|----------------------|-----------------:|:----------------:|
+| 01_silu_t_emb        | 1.000000         |                  |
+| **02_img_mod_out**   | **0.045529**     | **YES**          |
+| 04_img_LN1           | 1.000000         |                  |
+| 05_img_mod1          | 1.000000         | (engine input)   |
+| 08_img_Q             | 0.004642         |                  |
+| 08_img_K             | -0.017528        |                  |
+| 08_img_V             | -0.003391        |                  |
+| 09_img_Q_rmsnorm     | 1.000000         | (engine input)   |
+| 09_img_K_rmsnorm     | 1.000000         | (engine input)   |
+| 11_attn_out_img      | 1.000000         | (engine input)   |
+| 12_to_out_0          | 0.011985         |                  |
+| 13_img_resid1        | 1.000000         | (engine input)   |
+
+The "PASS (engine input)" rows use the engine's own dump as the
+oracle's input, so they are compositional sanity checks — they do
+not exonerate the engine math, they confirm that downstream
+components (LN, modulate, RmsNorm, attention math, residual add)
+work correctly when their *inputs* are taken from the engine.
+
+The substeps that genuinely test "engine matmul vs F32 reference"
+are 02, 08-Q/K/V, 12 — and ALL of them fail.
+
+### Path 1 fallback — not run
+
+Time-boxed; not required because Path 2 produced a definitive verdict.
+The dispatch search recommendation from §5.5.37 should still happen
+for *future* (non-Q4_0) bug hunts but is not on the critical path for
+this bug — the bug surface is already fully localized.
+
+### Recommended §5.5.39
+
+**Fix the Q4_0 dispatch.** Two concrete sub-tasks:
+
+1. **Round-trip the Q4_0 dequant in isolation**: instrument the
+   engine to dump its own dequantized `img_mod.1.weight` at block 1
+   right after `repack_q4_0_upload`, and compare to the gguf-py
+   numpy dequant (variant A, [N, K] row-major, `dequantize_blocks`
+   bias-8 → signed). This will tell us whether the engine repack or
+   the WQBMMv3 inner kernel is wrong.
+
+   Concretely: extend `repack_q4_0_upload` to optionally
+   D2H-dequant the uploaded weights via aclnnDequantizeQuantized
+   or a CPU re-dequant of the repacked tile, write to disk under
+   `QIE_DUMPS`, and point the existing `qie_q4_repack_check.py`
+   probe at it.
+
+2. **If the repack is bit-exact with numpy**: the bug is in
+   `dispatch_matmul_` for Q4_0 src. Compare with the Q5_K dispatch
+   path used at block 0 (`load_matmul_weight_upload` →
+   `dequant_upload_f16` → `aclnnMm` fallback). The simplest fix is
+   to FORCE the Q4_0 path through the same `dequant_upload_f16` →
+   F16 weight + aclnnMm fallback at runtime (lose the WQBMMv3
+   speedup, gain numerical correctness) and re-run §5.5.36 dump.
+   If block-1 oracle then comes back cos=1.000, the bug is
+   confirmed in WQBMMv3 / repack chain and the fix is either to
+   debug WQBMMv3 args (scale dtype, zero-point handling, antiquant
+   offset) or to keep the F16-fallback as the production path for
+   all 58 Q4_0 blocks.
+
+Time-box estimate: 60 min for sub-task 1 (instrumentation + run +
+diff), 60 min for sub-task 2 (force-fallback experiment + re-dump).
+
+### Artefacts
+
+- `/tmp/qie_b1_oracle.py` — block-1 oracle bisect script.
+- `/tmp/qie_b1_oracle.log` — block-1 run output.
+- `/tmp/qie_b0_oracle.log` — block-0 sanity run (cos=1.000 everywhere).
+- `/tmp/qie_b1_dequant_check.py` — variant A/B layout tester (also RED
+  for block 2 → confirms it's all Q4_0 blocks, not block-1 specific).
+- `/tmp/qie_b1_engine_vs_cli.py` — engine vs CLI residual cross-check.
+
+### Hard rules check
+
+- ac03 ONLY: yes (oracle ran on ac03; no NPU dispatch invoked).
+- HBM lock: not required (pure numpy on existing dumps).
+- Do NOT push: confirmed.
+- Do NOT modify forward code: confirmed (no engine source touched).
+- Time-box 90 min: ~30 min wall.
+- No Co-Authored-By Claude: confirmed.
