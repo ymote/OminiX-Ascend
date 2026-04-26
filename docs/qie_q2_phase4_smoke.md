@@ -6865,3 +6865,109 @@ NEXT STEP = switch dispatch to aclnnWeightQuantBatchMatmulV2 (which
 - Do NOT push: confirmed (engine source reverted to baseline).
 - Time-box 2h: ~95 min wall.
 - No Co-Authored-By Claude: confirmed.
+
+## 5.5.41 — V2 API migration RED (status=161002 at workspace query)
+
+### Mission
+
+§5.5.40 closed with NEXT_STEP = migrate Q4_0 dispatch from
+aclnnWeightQuantBatchMatmulV3 (which produced cos=0 on real Q4_0
+GGUF data) to aclnnWeightQuantBatchMatmulV2 (which ggml-cann's
+mul_mat_quant proves works for the same data in transpose_weight=true
+shape mode). §5.5.41 is the V2 migration attempt.
+
+### Patch summary
+
+`tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+
+1. `repack_q4_0_upload`: switch scale buffer layout from K-major
+   (`out_s[b * N + n] = d`) to N-major (`out_s[n * BLK + b] = d`)
+   so the resulting `[N, K/32]` view is contiguous (V2 calls
+   CheckContiguous on antiquant_scale per libopapi disasm).
+
+2. `dispatch_matmul_`: gated on `QIE_USE_WQBMMV2` (default 1):
+   - weight tensor: `[N, K]` strides `(K, 1)` (V2 ggml-cann
+     convention) vs V3 legacy `[K, N]` strides `(1, K)`.
+   - scale tensor: `[N, K/32]` strides `(K/32, 1)` (now contig
+     against the N-major buffer above).
+   - call `aclnnWeightQuantBatchMatmulV2GetWorkspaceSize` /
+     `aclnnWeightQuantBatchMatmulV2` with `antiquantGroupSize=32`,
+     no `innerPrecise` param (V2 has no precision flag).
+
+### Probe
+
+`tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` rebuilt
+against patched engine, then `./test_qie_q45_step4_full_denoise` on
+the standard Step 4 dump (1024² 20-step Q4_0 GGUF, cfg=1.0, no uncond).
+
+### Result
+
+```
+[qie_native] dispatch_matmul_: QIE_USE_WQBMMV2=1
+[qie_native] dispatch_matmul_: WQBMMv2 workspace status=161002
+                              (M=1 K=3072 N=18432)
+[qie_native] forward_all_blocks_test: block 1 returned error
+[qie_native] denoise_full: cond forward failed step=0
+[smoke45s4] denoise_full returned false (1248.57 ms) — RED
+```
+
+V2 `aclnnWeightQuantBatchMatmulV2GetWorkspaceSize` rejects the call
+with status=161002 (ACL parameter validation failure) on the very
+first Q4_0 dispatch (block 1, M=1 K=3072 N=18432 — t_embed projection
+in time/text adaptors). No workspace allocated, no execution, no
+fresh latent written, cannot proceed to PNG decode.
+
+### Diagnosis
+
+161002 is an ACL host-side input-validation reject, not a kernel
+failure. The V2 symbol IS resolved (we get past the symbol-presence
+guard). Likely cause hypotheses:
+
+(a) Tensor layout mismatch with V2's expectations. ggml-cann's
+    mul_mat_quant uses transpose_weight=TRUE with weight shape
+    `[K, N]` strides `(1, K)` (NOT `[N, K]` (K, 1) as the V2
+    disasm "CheckContiguous on antiquant_scale" might suggest).
+    Need to re-read ggml-cann `aclnn_ops.cpp` mul_mat_quant call
+    site for the exact shape/stride combo.
+
+(b) V2 may require a non-null `antiquantOffset` even for symmetric
+    Q4_0 (zero-point=0). ggml-cann passes a zeros buffer; we passed
+    nullptr. Symmetric quant can ride on offset=nullptr in V3 but
+    V2 may require an explicit zeros tensor.
+
+(c) V2's M=1 case. Some V2 variants reject M<8 or require batched
+    input. Our t_embed dispatch is M=1; ggml-cann mul_mat_quant
+    typically operates at much larger M.
+
+### Decode + PNG eye-check
+
+NOT RUN. No fresh latent produced.
+
+### Verdict
+
+```
+V2_API_MIGRATION_RED
+STATUS    = aclnnWeightQuantBatchMatmulV2GetWorkspaceSize=161002
+            on first Q4_0 dispatch (M=1 K=3072 N=18432).
+ROOT      = layout/argument convention for V2 not yet matched to
+            ggml-cann's working call site. Disasm-derived layout
+            (N-major scale, [N, K] weight) was a guess.
+NEXT_STEP = read ggml-cann/src/ggml-cann/aclnn_ops.cpp
+            mul_mat_quant at the V2 invocation; copy its tensor
+            shapes/strides verbatim including any antiquantOffset
+            zeros buffer. Estimated 1-2h.
+```
+
+### Artefacts
+
+- `/tmp/qie_5541_v2_run.log` — full probe log (status=161002 line).
+- Engine patch reverted (`git checkout --`); only the doc ships.
+- No PNG produced.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during the run, released after.
+- Do NOT push: confirmed (engine reverted; doc commit local only).
+- Time-box 60min: ~30 min wall.
+- No Co-Authored-By Claude: confirmed.
