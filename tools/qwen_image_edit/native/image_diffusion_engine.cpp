@@ -443,12 +443,86 @@ bool load_matmul_weight_upload(ggml_context *ggml_ctx, const char *name,
         return false;
     }
     if (t->type == GGML_TYPE_Q4_0) {
-        return repack_q4_0_upload(t, K, N, w_dev, scale_dev,
-                                   stats.q4_weight_bytes,
-                                   stats.q4_scale_bytes,
-                                   stats.q4_tensors,
-                                   stats.tensors_uploaded,
-                                   load_ms);
+        // Q2.4.5.5.39 Gate B: env-gated F16-fallback bypass.
+        //   QIE_DISABLE_WQBMMV3=1 forces Q4_0 weights through the F16
+        //   dequant path (scale_dev=null → dispatch_matmul_ aclnnMm branch).
+        //   QIE_DISABLE_WQBMMV3_TENSOR=<substr> forces only matching names.
+        static int s_disable_all = -1;
+        static std::string s_disable_substr;
+        if (s_disable_all < 0) {
+            const char *v = std::getenv("QIE_DISABLE_WQBMMV3");
+            s_disable_all = v ? std::atoi(v) : 0;
+            const char *vs = std::getenv("QIE_DISABLE_WQBMMV3_TENSOR");
+            s_disable_substr = vs ? std::string(vs) : std::string();
+            QIE_LOG("load_matmul_weight_upload: QIE_DISABLE_WQBMMV3=%d substr=%s",
+                    s_disable_all, s_disable_substr.c_str());
+        }
+        bool force_fallback = (s_disable_all == 1);
+        if (!force_fallback && !s_disable_substr.empty() && name) {
+            // Comma-separated list of substrings; match if ANY substring is found.
+            const std::string &pat = s_disable_substr;
+            size_t i = 0;
+            while (i < pat.size() && !force_fallback) {
+                size_t j = pat.find(',', i);
+                std::string tok = pat.substr(i, (j == std::string::npos) ? std::string::npos : j - i);
+                if (!tok.empty() && std::strstr(name, tok.c_str()) != nullptr) {
+                    force_fallback = true;
+                }
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+        }
+        if (force_fallback) {
+            QIE_LOG("load_matmul_weight_upload[%s]: Q4_0 -> F16 fallback (Gate B)",
+                    name);
+            scale_dev = nullptr;
+            const size_t expected = (size_t)K * N;
+            stats.f16_fallback_tensors += 1;
+            return dequant_upload_f16(ggml_ctx, name, expected, w_dev,
+                                       stats.f16_weight_bytes,
+                                       stats.tensors_uploaded, load_ms);
+        }
+        bool ok = repack_q4_0_upload(t, K, N, w_dev, scale_dev,
+                                       stats.q4_weight_bytes,
+                                       stats.q4_scale_bytes,
+                                       stats.q4_tensors,
+                                       stats.tensors_uploaded,
+                                       load_ms);
+        if (ok) {
+            // Q2.4.5.5.39 Gate A: post-repack D2H dump (env-gated). Reads
+            // back the on-NPU INT4 weight + F16 scale and writes raw
+            // bytes to host so Python can re-dequant and compare to
+            // gguf-py.
+            const char *dd = std::getenv("QIE_DUMP_REPACK_DIR");
+            const char *dt = std::getenv("QIE_DUMP_REPACK_TENSOR");
+            if (dd && dt && name && std::strstr(name, dt) != nullptr) {
+                ::mkdir(dd, 0755);
+                const size_t w_bytes = (size_t)K * (size_t)N / 2;
+                const size_t s_bytes = (size_t)(K / 32) * (size_t)N * 2;
+                std::vector<uint8_t> hw(w_bytes), hs(s_bytes);
+                aclError e1 = g_cann.aclrtMemcpy(hw.data(), w_bytes,
+                                                  w_dev, w_bytes,
+                                                  ACL_MEMCPY_DEVICE_TO_HOST);
+                aclError e2 = g_cann.aclrtMemcpy(hs.data(), s_bytes,
+                                                  scale_dev, s_bytes,
+                                                  ACL_MEMCPY_DEVICE_TO_HOST);
+                if (e1 == 0 && e2 == 0) {
+                    char buf[512];
+                    std::snprintf(buf, sizeof(buf), "%s/%s.q4int4.bin", dd, name);
+                    FILE *fw = std::fopen(buf, "wb");
+                    if (fw) { std::fwrite(hw.data(), 1, w_bytes, fw); std::fclose(fw); }
+                    std::snprintf(buf, sizeof(buf), "%s/%s.scale_f16.bin", dd, name);
+                    FILE *fs = std::fopen(buf, "wb");
+                    if (fs) { std::fwrite(hs.data(), 1, s_bytes, fs); std::fclose(fs); }
+                    QIE_LOG("dump_repack[%s]: K=%lld N=%lld w=%zu s=%zu -> %s",
+                            name, (long long)K, (long long)N, w_bytes, s_bytes, dd);
+                } else {
+                    QIE_LOG("dump_repack[%s]: D2H err w=%d s=%d",
+                            name, (int)e1, (int)e2);
+                }
+            }
+        }
+        return ok;
     }
     // Fallback: dequant-to-F16 path. `scale_dev` stays null so forward can
     // branch on scale-null → aclnnMm / scale-non-null → WQBMMv3.
