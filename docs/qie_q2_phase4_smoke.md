@@ -4552,19 +4552,39 @@ than 256² (14.85s vs 1.21s), broadly consistent with O(seq²)
 attention + 16x more img tokens + 8192² joint attention vs 470² at
 256².
 
-#### Step-3 1024² eye-check — TBD (decode in progress)
+#### Step-3 1024² eye-check — TILE PATTERN
 
 VAE decode of the 1024² latent at full resolution requires
 `--vae-tiling` (without it CANN OOM at 17.5 GiB params + tile
-scratch).  Decode wall ~3-5 min.  PNG saved to
-`/tmp/qie_5524_1024_decoded.png`; pixel diff vs CUDA ref pending.
+scratch).  Decode wall: 49 tiles × ~20s = 990s (16.5 min total).
+Total CLI wall (encode 8 min + decode 16.5 min = 24.6 min) with
+`OMINIX_QIE_DECODE_ONLY_LATENT` short-circuit honored.  PNG saved
+to `/tmp/qie_5524_1024_decoded.png` (1543806 B, 1024×1024 RGB).
 
-#### Decision matrix
+Pixel diff vs CUDA reference `/tmp/phase1_baseline_1024_20step.png`
+(both 1024², no resize):
 
-Based on the 256² eye-check (TILE_PATTERN) and the 1024² numerical
-VERDICT (GREEN), this is consistent with the `256² tile pattern AND
-1024² tile pattern` row of the matrix (regardless of pending 1024²
-PNG).  The numerical fix flips the GREEN-numerical gate ON by
+```
+CUDA-ref @1024: mean=104.68 std=52.54
+5524     @1024: mean=128.57 std=73.13
+5524 vs CUDA @1024: mean_abs=76.666 max=253 pct_identical=0.40% RMSE=93.40
+```
+
+Eye-check: BLUE TILE PATTERN, identical structure to the 256²
+PNG (5524 1024² vs 5524 256²-resized: mean_abs=42.5/255).  The
+tile pattern scales with the latent grid (~periodic at the
+patch_size=2 frequency on 128×128 grid).  No cat anywhere in the
+1024² output.
+
+**1024² eye-check verdict: TILE_PATTERN.**
+
+#### Decision matrix — CONFIRMED row: 256² TILE AND 1024² TILE
+
+The 256² eye-check (TILE_PATTERN, byte-identical to §5.5.14 PNG
+within 1/255 decode rounding) and the 1024² eye-check (TILE_PATTERN,
+0.40% pct_identical vs CUDA reference, RMSE=93.40) jointly land us
+on the `256² tile pattern AND 1024² tile pattern` row.  The
+numerical fix flips the GREEN-numerical gate ON by
 default but does NOT close the semantic cat-PNG bug.  The §5.5.14
 diagnosis stands: the engine is **deterministic and bug-stable** —
 re-runs and same-stats latents produce byte-identical PNGs.
@@ -4635,4 +4655,6 @@ Pixel-diff oracle:
 - 5524 vs §5.5.14 256²:    mean_abs=0.006  max=1  pct_identical=99.35%
 - 5524 vs §5.5.5  256²:    mean_abs=0.367  max=3  pct_identical=64.61%
 - 5524 vs CUDA-ref @256²:  mean_abs=75.288 max=255 pct_identical=0.41%
+- 5524 vs CUDA-ref @1024²: mean_abs=76.666 max=253 pct_identical=0.40% RMSE=93.40
+- 5524-1024² vs 5524-256² (resized): mean_abs=42.46 pct_identical=1.26% (same tile structure)
 
