@@ -2447,6 +2447,14 @@ public:
                         return nullptr;
                     }
                     cache_after_condition(active_condition, *active_output);
+                    // [QIE Phase 4.5 Step 5.5.28] One-shot dump of raw cond
+                    // model_out at step==1 (the very first sampler step) for
+                    // direct engine-vs-CLI cossim against the engine’s
+                    // denoised_host. Gated by OMINIX_QIE_DUMP_DIR so it
+                    // co-locates with the existing qie_q45_inputs_1024 dump.
+                    if (step == 1) {
+                        qie_dump_tensor(*active_output, "model_out_step0_cond");
+                    }
                 }
 
                 bool current_step_skipped = cache_step_is_skipped();

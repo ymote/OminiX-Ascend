@@ -5689,6 +5689,29 @@ bool ImageDiffusionEngine::denoise_full(const float *initial_latent,
                                 W_lat, H_lat, cfg_.out_channels, B,
                                 PATCH, denoised_host.data());
 
+        // [QIE Phase 4.5 Step 5.5.28] One-shot dump of the engine raw
+        // model_out (unpatchified DiT output, BEFORE any Euler step or
+        // c_skip/c_out reconstruction). Compared byte-for-byte against
+        // CLI out_cond (also pre-Euler) for direct engine-vs-CLI cossim.
+        // Gated by QIE_DEBUG_DUMP_STEP0_TOKENS.
+        if (step == 0) {
+            const char *dp = std::getenv("QIE_DEBUG_DUMP_STEP0_TOKENS");
+            if (dp && *dp && dp[0] != 0x30) {
+                FILE *f = std::fopen("/tmp/qie_step0_engine_model_out.f32.bin",
+                                       "wb");
+                if (f) {
+                    std::fwrite(denoised_host.data(), sizeof(float),
+                                 denoised_host.size(), f);
+                    std::fclose(f);
+                    QIE_LOG("5.5.28-bisect: dumped engine model_out (%zu F32)"
+                            " W_lat=%lld H_lat=%lld C_out=%d B=%lld",
+                            denoised_host.size(),
+                            (long long)W_lat, (long long)H_lat,
+                            cfg_.out_channels, (long long)B);
+                }
+            }
+        }
+
         // --- (8) Euler step on host. ---
         // Qwen-Image (flow-matching) Euler reference:
         //     d[j] = (x[j] - denoised[j]) / sigma

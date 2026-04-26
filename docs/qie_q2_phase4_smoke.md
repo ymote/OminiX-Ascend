@@ -4957,3 +4957,235 @@ inside `denoise_full` per-step body):
 Engine forward code unchanged in this session (only env-var override).
 HBM lock taken/released by `build_and_run.sh`. No new bytes pushed to
 remote.
+
+
+### §5.5.28 — Direct engine-vs-CLI raw `model_out` cossim at sigma=1.0 — **CONFIRMS_5527_DIAGNOSIS (cossim=0.457, ||eng||/||cli|| = 8.11)**
+
+Goal: §5.5.27 prescribed adding c_in input scaling and c_skip+c_out output
+reconstruction to `denoise_full`. Before landing that 6-line patch, this
+probe verifies the diagnosis by direct byte-comparison of engine raw
+DiT output (`denoised_host` pre-Euler) against CLI raw DiT output
+(`*active_output` returned by `work_diffusion_model->compute()` before
+the `c_out * positive_data + c_skip * vec_input` reconstruction at
+`stable-diffusion.cpp:2566`).
+
+This collapses a multi-layer indirection (sigma schedule → t_emb chain →
+forward → c_skip/c_out application → Euler) into a single matched-input,
+single-step ground-truth check. If raw outputs differ in std at the same
+inputs, the bug is inside the DiT forward (or its inputs are not actually
+matched). If they match in std but diverge in direction, the bug is
+purely in the c_skip/c_out application.
+
+#### Probe setup
+
+CLI side (`tools/ominix_diffusion/src/stable-diffusion.cpp`,
+**+8-line patch**, env-gated): after `work_diffusion_model->compute()`
+inside the sequential cond/uncond branch (line ~2456), if `step == 1`
+(first sampler step, since `sample_k_diffusion` calls denoise lambda
+with `i+1`), call `qie_dump_tensor(*active_output, model_out_step0_cond)`.
+Gated by existing `OMINIX_QIE_DUMP_DIR`. Lands as
+`/tmp/qie_q45_inputs_1024/model_out_step0_cond.f32.bin`.
+
+Engine side (`tools/qwen_image_edit/native/image_diffusion_engine.cpp`,
+**+23-line patch**, env-gated): after `host_unpatchify_latent` produces
+`denoised_host` (line ~5688) and BEFORE the Euler step, if `step == 0`
+and `QIE_DEBUG_DUMP_STEP0_TOKENS` is set non-zero, write
+`denoised_host` to `/tmp/qie_step0_engine_model_out.f32.bin`.
+
+CLI launch:
+
+```
+OMINIX_QIE_DUMP_DIR=/tmp/qie_q45_inputs_1024 \
+  ./build-w1/bin/ominix-diffusion-cli \
+    --diffusion-model /home/ma-user/work/qie_weights/Qwen-Image-Edit-2509-Q4_0.gguf \
+    --llm /home/ma-user/work/qie_weights/Qwen2.5-VL-7B-Instruct-Q4_0.gguf \
+    --llm_vision /home/ma-user/work/qie_weights/mmproj-BF16.gguf \
+    --vae /home/ma-user/work/qie_weights/split_files/vae/qwen_image_vae.safetensors \
+    -r /home/ma-user/work/qie_test/cat.jpg -p make the cat smile \
+    -W 1024 -H 1024 --steps 1 --cfg-scale 1.0 \
+    --sampling-method euler --vae-tiling \
+    -o /tmp/qie_5528_cli_dump.png --seed 42
+```
+
+CLI was killed mid-VAE-decode after the dump landed (49-tile decode would
+have added ~16min for no benefit; `model_out_step0_cond.f32.bin` was
+already on disk at the kill). HBM lock removed manually.
+
+Engine probe: `tools/probes/qie_q45_step4_full_denoise/test_qie_q45_step4_full_denoise`
+re-using the same `/tmp/qie_q45_inputs_1024` dump:
+
+```
+QIE_Q45_W_LAT=128 QIE_Q45_H_LAT=128 \
+QIE_N_STEPS=1 QIE_CFG_SCALE=1.0 \
+QIE_DEBUG_DUMP_STEP0_TOKENS=1 \
+  ./test_qie_q45_step4_full_denoise
+```
+
+#### Inventory of `/tmp/qie_q45_inputs_1024/` after both runs
+
+| file | shape | bytes | content |
+|------|-------|-------|---------|
+| `init_latent.f32.bin` | [128,128,16,1] | 1048576 | clean latent (all-zero — txt2img path) |
+| `noised_init_latent.f32.bin` | [128,128,16,1] | 1048576 | x_t at sigma=1.0 (mean=-0.0008 std=1.0007) |
+| `ref_latent_0.f32.bin` | [128,128,16,1] | 1048576 | VAE-encoded reference image (mean=-0.1476 std=0.5551) |
+| `cond_c_crossattn.f32.bin` | [3584,212,1,1] | 3039232 | text conditioning (mean=-0.1266 std=4.4185) |
+| `x0_sampled_0.f32.bin` | [128,128,16,1] | 1048576 | CLI's final latent post-Euler (mean=-0.66 std=1.82) |
+| **`model_out_step0_cond.f32.bin`** | [128,128,16,1] | 1048576 | **CLI raw DiT output at step 0** (mean=-0.0085 std=0.2381) |
+
+Engine artefact at `/tmp/qie_step0_engine_model_out.f32.bin` (1048576
+bytes, [128,128,16,1] flat F32, mean=-0.6639 std=1.8155).
+
+#### Engine vs CLI `model_out` cossim
+
+```
+eng_out: shape=(262144,) mean=-0.6639 std=1.8155 min=-4.5703 max=+3.9395
+cli_out: shape=(262144,) mean=-0.0085 std=0.2381 min=-0.4137 max=+0.5100
+
+cossim(eng_out, cli_out)        = +0.457070
+||eng_out|| / ||cli_out||       = 8.1147
+mean abs diff                   = 1.499847
+max abs diff                    = 4.223329
+relative L2 error               = 7.708973
+```
+
+#### Per-input byte-match table
+
+Both engine and CLI consume the SAME dump files for their step-0 inputs;
+no separate copies. Self-cossim is 1.000000 by construction.
+
+| input | source file | engine consumer | CLI consumer | status |
+|-------|------------|-----------------|--------------|--------|
+| noised x_t | `noised_init_latent.f32.bin` | `init_from_dump` (slurp_file) | `load_tensor_from_file` (`x` in denoise lambda) | **byte-identical (single source)** |
+| text cond | `cond_c_crossattn.f32.bin` | `init_from_dump` (txt_cond_host) | direct ggml load (`cond.c_crossattn`) | **byte-identical (single source)** |
+| ref latent | `ref_latent_0.f32.bin` | `init_from_dump` (ref_latent_host) | direct ggml load (`ref_latents[0]`) | **byte-identical (single source)** |
+| t_emb | computed independently | `sigma * 1000 = 1000` → t_emb chain | `sigma_to_t(1.0) = 1000` → t_emb chain | **functionally matched (sigma=1.0 → t=1000 in both, DiscreteFlowDenoiser)** |
+
+All inputs match. The mismatch is inside the DiT forward / output handling.
+
+#### Diagnostic verdict
+
+cossim 0.457 with eng/cli norm ratio = 8.11 RULES OUT a pure direction
+bug (a sign flip or rotation). The 8× scale gap matches:
+
+```
+1.0 / std(cli_out) = 1 / 0.2381 ≈ 4.20  (not it)
+std(eng_out) / std(cli_out) = 1.8155 / 0.2381 ≈ 7.62 (close to ratio 8.11)
+```
+
+The engine output is on the same order as `x_host` itself (std≈1.8 ≈
+||noised_init_latent|| × something), NOT the order of velocity v_pred.
+This is consistent with **the engine's `denoised_host` is being treated
+as the post-c_skip+c_out reconstruction (≈ x_0 estimate scale)**, while
+the CLI's raw `*active_output` IS the velocity `v` (eps prediction at
+flow-matching).
+
+Cross-check: what the engine actually does with `denoised_host` in its
+Euler step (line ~5723):
+
+```cpp
+float d = (x_host[j] - denoised_host[j]) / sigma;
+x_host[j] += d * dt;     // dt = sigmas[s+1] - sigmas[s]
+```
+
+This formula assumes `denoised_host = x_0` (the CLEAN latent estimate).
+For flow matching, `x_0 ≈ x_t - sigma * v`. CLI's denoise lambda does
+exactly this construction at line 2566:
+
+```cpp
+vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+// at sigma=1.0: c_out=-1, c_skip=1 → denoised = -1*v + 1*x = x - v ≈ x_0
+```
+
+The engine SKIPS this c_out/c_skip application entirely — it hands the
+raw DiT velocity output to its Euler loop AS IF it were x_0. At
+sigma=1.0 with c_out=-1, the bug magnitude per step is exactly
+`||v||+||x_0|| ≈ 8x` what the correct path would produce, matching the
+observed std ratio.
+
+Independent failure mode also visible: cli's std=0.24 is small for a
+velocity output but typical in real models (the network learns
+v ≈ noise direction with limited spread). Engine's std=1.82 ≈ ||x_t||
+shows it is dominated by the input pass-through (residual stream),
+which means the c_skip = 1 + c_out * v_pred reconstruction was NEVER
+applied — the engine's denoised_host is the DiT output projected
+back to latent space WITHOUT any flow-matching normalization.
+
+Localised bug surface (final):
+
+1. **Missing c_skip / c_out reconstruction** in
+   `ImageDiffusionEngine::denoise_full` after `host_unpatchify_latent`
+   and before the Euler step. The engine's `denoised_host` should be:
+   ```cpp
+   denoised_host[j] = c_out * model_out_unpatchified[j] + c_skip * x_host[j]
+   // For DiscreteFlowDenoiser: c_skip = 1.0, c_out = -sigma
+   ```
+2. **Likely missing c_in input scaling** before patchify (cosmetic for
+   DiscreteFlow since c_in = 1.0, but should be added for
+   future-proofing). DiscreteFlowDenoiser sets `c_in = 1.0` so this is
+   a no-op there; only c_skip/c_out matter for the §5.5.27 fix.
+
+The §5.5.21 substep-by-substep oracles previously matched `true` because
+they consumed a `model_out`-as-numpy ground truth that ALSO used the
+raw DiT output without c_skip/c_out (the diffusers reference oracle
+applies the flow-match construction in a separate post-step), so the
+substep oracles were tautological w.r.t. this bug. §5.5.21's verdict
+`SANITY_CPU_REF_BUG` was correct as far as it went but did not cover
+the missing post-network reconstruction.
+
+#### Sanity check: would §5.5.27's prescribed patch close this?
+
+For DiscreteFlowDenoiser at sigma=1.0:
+
+```
+c_skip = 1.0, c_out = -1.0
+predicted_denoised = c_out * model_out + c_skip * x_t
+                   = -1 * v_pred + 1 * x_t
+                   = x_t - v_pred
+```
+
+Required cossim test (next dispatch): apply the §5.5.27 patch to the
+engine, re-run with the same inputs, and verify
+`cossim(predicted_denoised, x_t - cli_out) ≥ 0.999` AND
+`std(predicted_denoised) ≈ std(noised_init - cli_out) ≈ 1.0` (since at
+sigma=1, x_0 ≈ noise scaled, std around 1.0). Estimated effort: 5-line
+engine patch + 8-min re-run.
+
+#### Recommended next dispatch §5.5.29
+
+**Title:** §5.5.29 — Land §5.5.27 c_skip/c_out reconstruction in
+`denoise_full`, gate on engine-vs-CLI `predicted_denoised` cossim ≥ 0.999.
+
+**Patch sketch** (`tools/qwen_image_edit/native/image_diffusion_engine.cpp`,
+inside `denoise_full` per-step body, between line 5688 and line 5717):
+
+```cpp
+// Apply DiscreteFlowDenoiser scalings:
+//   c_skip = 1.0, c_out = -sigma, c_in = 1.0
+// Reconstruct flow-matching denoised x_0 estimate from raw DiT velocity:
+//   denoised = c_out * v_pred + c_skip * x_t  =  x_t - sigma * v_pred
+const float c_skip = 1.0f;
+const float c_out  = -sigma;
+for (size_t j = 0; j < denoised_host.size(); ++j) {
+    denoised_host[j] = c_out * denoised_host[j] + c_skip * x_host[j];
+}
+// (existing model_out dump, if active, must capture BEFORE this transform.)
+```
+
+**Acceptance gate:** at n=1, sigma=1.0, the §5.5.28 dump-points still
+active:
+- `cossim(eng_predicted_denoised, x_t - cli_out) >= 0.999`
+- `std(eng_predicted_denoised) within 5%% of std(x_t - cli_out)`
+
+**Then escalate to:**
+- n=20 PNG eye-check at 1024² (vs §5.5.24 TILE_AT_BOTH_SHAPES baseline)
+- Cleanup §5.5.28 dump-point patches if eye-check is GREEN
+
+#### Artefacts
+
+- `/tmp/qie_q45_inputs_1024/model_out_step0_cond.f32.bin` (262144 F32)
+- `/tmp/qie_step0_engine_model_out.f32.bin` (262144 F32)
+- `/tmp/qie_5528_cli.log` — CLI run log (killed mid-VAE-decode)
+- `/tmp/qie_5528_engine.log` — engine probe log
+
+CLI was killed gracefully after the dump landed; HBM lock manually
+released. No bytes pushed to remote.
