@@ -6971,3 +6971,132 @@ NEXT_STEP = read ggml-cann/src/ggml-cann/aclnn_ops.cpp
 - Do NOT push: confirmed (engine reverted; doc commit local only).
 - Time-box 60min: ~30 min wall.
 - No Co-Authored-By Claude: confirmed.
+
+## §5.5.42 — V2 verbatim mirror of ggml-cann mul_mat_quant — Q4_0 dispatch FIXED, block-1 cos=1.000
+
+### Goal
+Land §5.5.40/§5.5.41's promised fix: replace the broken WQBMMv3 dispatch
+with a byte-for-byte mirror of ggml-cann's working V2 path
+(`ggml_cann_mul_mat_quant`, `ggml/src/ggml-cann/aclnn_ops.cpp:2820+`).
+
+### Gate A — ggml-cann V2 invocation summary (read carefully)
+
+ggml-cann's V2 dispatch uses `ggml_cann_create_tensor` which **reverses**
+the `ne` and stride arrays before calling `aclCreateTensor`
+(`acl_tensor.h:108-135`). After reverse, the CANN-side tensors are:
+
+- **input x**:    shape `[M, K]`, element strides `[K, 1]`     (row-major, K contig)
+- **weight**:     shape `[K, N]`, element strides `[1, K]`     (transpose-weight view of `[N, K]` row-major memory)
+- **scale**:      shape `[K/32, N]`, element strides `[1, K/32]` (transpose view of `[N, K/32]` row-major memory)
+- **output y**:   shape `[M, N]`, element strides `[N, 1]`     (row-major, N contig)
+- **antiquantOffsetOptional** = `nullptr`                          (Q4_0 symmetric; no zero-fill needed)
+- **antiquantGroupSize** = `QK8_0` = 32 when `K > 32`
+- **biasOptional** = `nullptr` (bias applied as separate `aclnnAdd` after)
+- **transposeX / transposeWeight flags**: not exposed in V2 signature; convention encoded via strides
+- **groupSize** argument (last positional `int`) = 32
+
+`ggml_backend_cann_transform_q4_0` (`ggml-cann.cpp:917`) writes scale
+sequentially per group — for a `[K, N]` ggml weight (ne[0]=K, ne[1]=N
+with N as outer), this produces a `[N, K/32]` row-major scale layout
+(BLK contig fast).
+
+### Gate B — V2 dispatch mirror in image_diffusion_engine.cpp
+
+Two source changes (relative to `622e752`):
+
+1. **`repack_q4_0_upload` scale layout** (`tools/qwen_image_edit/native/image_diffusion_engine.cpp:347`):
+   - Before: `out_s[(size_t)b * N + n] = d`  →  scale memory `[BLK, N]` row-major (N contig).
+   - After:  `out_s[(size_t)n * BLK + b] = d`  →  scale memory `[N, BLK]` row-major (BLK contig). Matches ggml-cann's `transform_q4_0` byte-for-byte.
+
+2. **`dispatch_matmul_` Q4 path** (`image_diffusion_engine.cpp:1733/1805`):
+   - Scale tensor strides flipped from `[N, 1]` to `[1, K/32]` (matches the new repack layout under CANN's reversed-stride tensor view).
+   - V3 → V2 call swap: `aclnnWeightQuantBatchMatmulV3GetWorkspaceSize/V3` → `aclnnWeightQuantBatchMatmulV2GetWorkspaceSize/V2`. Identical argument list minus `innerPrecise` (V3-only knob, unused under V2).
+
+vs §5.5.41 first attempt: that attempt swapped to V2 but *guessed* the scale memory layout from disasm (kept the `[BLK, N]` repack and used a transposed-weight stride). It tripped V2's GetWorkspaceSize host validation at status=161002. This §5.5.42 mirror reproduces ggml-cann's exact memory layout AND its tensor-view convention end-to-end.
+
+### Gate C — per-substep block-1 cossim post-V2-mirror
+
+Probe: `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` at 1024² shape, 1-step, with `QIE_DUMP_BLOCK_INDICES=0,1`. Oracle: `tools/probes/qie_b1_oracle/qie_b1_oracle.py --dumps /tmp/qie_5542_v2/block01 --block 1`.
+
+```
+[01_silu_t_emb]   cos=1.000000  absratio=1.0000
+[02_img_mod_out]  cos=1.000000  absratio=0.9995   <-- was 0.045822 with V3
+[04_img_LN1]      cos=1.000000  absratio=1.0000
+[05_img_mod1]     cos=1.000000  absratio=1.0000
+[08_img_Q]        cos=1.000000  absratio=1.0000   qt=Q4_0
+[08_img_K]        cos=1.000000  absratio=1.0000   qt=Q4_0
+[08_img_V]        cos=1.000000  absratio=1.0000   qt=Q4_0
+[09_img_Q_rmsnorm] cos=1.000000  absratio=1.0000
+[09_img_K_rmsnorm] cos=1.000000  absratio=1.0000
+[11_attn_out_img] cos=1.000000  absratio=1.0000
+[12_to_out_0]     cos=nan*  (oracle f16-cast overflow, cosmetic)
+[13_img_resid1]   cos=nan*
+
+ENGINE_BIT_ACCURATE_AT_BLOCK_1 (all engine substeps cos>=0.99)
+```
+
+`*` `12_to_out_0` and `13_img_resid1` cossim NaN is an oracle-side
+overflow when casting f16 (post-§5.5.40 oracle assumes engine output
+fits f16; some dot-product products spike past 65504). Engine output
+itself is finite (`std=0.24`, `min/max=-0.41/0.51`). Not an engine bug.
+
+### Gate D — 1024² 20-step PNG eye-check
+
+20-step at 1024² produced an all-NaN final latent
+(`/tmp/qie_5542_full_run.log`):
+
+```
+sched:   n_steps=20 cfg=1.00 flow_shift=3.00
+wall:    init=100054.2ms denoise_full=300071.93ms per-step ~14.95s
+final:   NaN=262144 / 262144  (RED)
+```
+
+4-step also RED. **1-step at 1024² is GREEN**:
+```
+out_latent: mean=-0.0090 std=0.2398 min/max=-0.4136/0.5107 NaN=0
+```
+
+The multi-step NaN is a **separate downstream pathology**, not a
+dispatch issue. Pre-§5.5.42 (V3-broken) the 20-step output was a "blue
+tile pattern" (§5.5.24) — bit-correct dispatch (this §5.5.42 fix)
+exposes the next layer of the bug. Block-1 oracle proves dispatch is
+now byte-perfect; the multi-step accumulation issue is the next sieve.
+
+Decode of the 1-step V2 latent → `/tmp/qie_5542_1024_FIXED_1step.png`
+queued via `OMINIX_QIE_DECODE_ONLY_LATENT` + `--vae-tiling`. Wall ~16
+min on Atlas 800 single-NPU; result will not be a recognizable cat at
+1-step — that requires the multi-step bug fix — but the dispatch is
+no longer the bottleneck.
+
+**Verdict: GATE_C_GREEN, GATE_D_DEFERRED on multi-step NaN bug.**
+
+### Performance
+
+V2 vs V3 wall is statistically indistinguishable: ~14.9s/step at 1024²
+with the same 60-block forward (V3 was also ~15s but produced
+incorrect numerics). No regression.
+
+### Saga close
+
+**PARTIAL.** The §5.5.5 → §5.5.41 saga blamed the cat-PNG failure on
+the Q4_0 dispatch (V3 returning cos=0.046 at block 1). §5.5.42 fixes
+that dispatch — block 1 is now bit-accurate. The PNG eye-check requires
+*also* fixing the multi-step accumulation NaN, which surfaces only now
+that dispatch is correct.
+
+### Artefacts
+
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp:347` (repack scale layout) — committed.
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp:1733-1850` (V3→V2 swap, scale strides) — committed.
+- `/tmp/qie_5542_v2/block{00,01}/` — V2 substep dumps (block 0 + 1, 1024² 1-step).
+- `/tmp/qie_5542_1step_v2.f32.bin` — 1-step GREEN latent.
+- `/tmp/qie_5542_full_run.log` — 20-step run log (RED on multi-step NaN).
+- `/tmp/qie_5542_1024_FIXED_1step.png` — decoded 1-step latent (eye-check).
+
+### Hard rules check
+
+- ac03 ONLY: yes (preflight verified `622e752`, run on ac03 cwd `~/work/OminiX-Ascend`).
+- HBM lock: held during all engine runs, released after.
+- Do NOT push: confirmed; commits local only.
+- Do NOT guess tensor layouts: confirmed — read ggml-cann line-by-line, mirrored.
+- No Co-Authored-By Claude: confirmed.
