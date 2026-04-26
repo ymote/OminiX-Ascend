@@ -4787,3 +4787,173 @@ Code paths examined:
 - `tools/qwen_image_edit/native/image_diffusion_engine.cpp:5697-5716` — `denoise_full` Euler step
 
 No engine forward-code changes this session.  No new dumps.  Doc-only commit.
+
+
+### §5.5.26 — Single-step trajectory cossim — **SINGLE_STEP_BUG (cossim=0.111 at n=1)**
+
+**Verdict: SINGLE_STEP_BUG.** At `n_steps=1` with sigma_init=1.0 the
+probe-harness output already has cossim **0.111** vs the CLI reference
+`x0_sampled_0` and std **1.82** vs CLI std 0.36 — i.e. the bug is **not**
+multi-step state carry in the Euler loop, it is a wrong-direction
+single-forward `denoise()` result. The 14× magnification reported in
+§5.5.25 is the n=1 wrongness compounding ~1.084×/step over 20 steps; the
+underlying defect is per-step.
+
+#### Probe invocation (ac03, HBM-locked, no engine code changes)
+
+```
+QIE_N_STEPS=1 QIE_CFG_SCALE=1.0 \
+QIE_Q45_W_LAT=128 QIE_Q45_H_LAT=128 \
+QIE_Q45_DUMP_DIR=/tmp/qie_q45_inputs_1024 \
+QIE_Q45_LATENT_OUT=/tmp/qie_5526_n1/out_latent.f32.bin \
+GGML_CANN_QUANT_BF16=on \
+./tools/probes/qie_q45_step4_full_denoise/build_and_run.sh
+```
+
+Used the existing `QIE_N_STEPS` env override (harness line 110-112). No
+patch to engine forward code; only the env var was changed for this probe.
+
+#### Receipts
+
+```
+shape  W_lat=128 H_lat=128 C_lat=16 B=1
+       img_tokens=4096+4096=8192 txt_seq=213 joint_dim=3584
+       n_steps=1 cfg=1.00 flow_shift=3.00 sigma[0]=1.0 sigma[1]=0.0
+denoise_full OK (19357 ms)
+out_latent: mean=-0.6644 std=1.8164 min/max=-4.5703/3.9590 NaN=0 inf=0
+```
+
+Stats vs CLI reference:
+
+```
+                              mean      std    min       max
+probe_n1     /tmp/qie_5526_n1 -0.6644  1.8164  -4.57   3.96
+cli_x0       (CLI 1-step)     -0.0699  0.3618  -1.28   1.56
+noised_init  (engine input)   -0.0008  1.0007   ~      ~
+init_latent                    0.0000  0.0000   0      0
+ref_latent_0                  -0.1416  0.5561   ~      ~
+
+cossim(probe_n1, cli_x0)               = 0.111013
+cossim(probe_n1, noised_init)          = 0.009953
+cossim(probe_n1, init_latent)          = 0.000000
+cossim(noised_init, cli_x0)            = -0.037512
+cossim(noised - probe_n1, cli_x0)      = -0.116310   (rejects "missing
+                                                      x_new = noised - sigma*proj_out
+                                                      reconstruction" hypothesis at n=1)
+v_cli = noised_init - cli_x0:  mean=0.069  std=1.077
+cossim(probe_n1, v_cli)                = -0.028672   (engine model output is
+                                                      neither denoised x0 nor
+                                                      velocity v from CLI run)
+std_ratio probe / v_cli  = 1.687  (vs sqrt(2)=1.414 — close but not exact)
+```
+
+#### Decision matrix outcome
+
+n=1 cossim **0.111** (< 0.5) → **single-step transform bug already at one
+step**. The trajectory loop in `image_diffusion_engine.cpp:5697-5716` is
+mathematically equivalent to the CLI Euler step (verified against
+`tools/ominix_diffusion/src/denoiser.hpp:790-815`), but **only if** the
+model output is interpreted consistently between CLI and engine. The
+single-step result rules out multi-step state carry as the primary defect.
+
+#### Identified defects (CLI vs engine reconciliation)
+
+The CLI denoiser-wrapper applies two transforms around the model that the
+Ascend engine does not. Both refs in `tools/ominix_diffusion/src/`:
+
+**(D1) `c_in` input pre-scaling — MISSING in engine.**
+- CLI (`stable-diffusion.cpp:2294-2295`):
+  `noised_input = input * c_in`, where for DiscreteFlowDenoiser
+  (`denoiser.hpp:692-696`) `c_in = 1 / sqrt(sigma² + 1)`. At
+  `sigma_init=1.0` this is `1/sqrt(2) ≈ 0.7071` — i.e. CLI feeds the model
+  a scaled-down latent.
+- Engine (`image_diffusion_engine.cpp:5293-5314`): host-patchifies
+  `x_host` directly into `concat_tokens_f32` and uploads to `img_in_in_f16`
+  with NO `c_in` multiplication.
+
+**(D2) `c_skip + c_out` output reconstruction — MISSING in engine.**
+- CLI (`stable-diffusion.cpp:2557`):
+  `denoised[i] = model_out[i] * c_out + input[i] * c_skip`,
+  with `c_skip = 1.0`, `c_out = -sigma`, so
+  `denoised = input - sigma * model_out` (i.e. the model predicts
+  velocity `v`, and CLI converts `v → x0` before Euler).
+- Engine (`image_diffusion_engine.cpp:5710-5704`): treats the unpatchified
+  `proj_out` (variable name `eps_out_f16` and `denoised_host` at the
+  Euler call site) directly as `denoised`, then runs
+  `d = (x - denoised)/sigma; x += d * dt`. **This double-uses the
+  velocity-predicting output as if it were the predicted x0.**
+
+The two defects compose: even if D2 alone were fixed, the model would
+still receive a 1.41×-too-large input at sigma=1.0 (and proportionally
+too-large for all sigma during the schedule), so D1 must also be fixed.
+
+#### Why neither single hypothesis matches at n=1
+
+If only D2 were the bug:
+  recovered_x0 = noised - 1.0 * probe_n1
+  cossim(recovered_x0, cli_x0) = -0.116  → rejects D2-only fix.
+
+If only D1 were the bug:
+  engine model output ≈ 1.41× CLI velocity, and engine treats this as
+  denoised; expected probe_n1 ≈ 1.41 * v_cli with cossim ≈ +0.95 to v_cli.
+  Observed: cossim(probe_n1, v_cli) = -0.029 → rejects D1-only fix.
+
+Both must be fixed together. Possibility of additional defect (e.g.
+timestep formula `t = sigma * 1000` vs CLI `t = sigma_to_t(sigma)` when
+`flow_shift=3` is in play) cannot be ruled out from this probe alone and
+is a §5.5.27 secondary investigation.
+
+#### Recommended fix dispatch §5.5.27
+
+**Title:** §5.5.27 — Apply `c_in` input scaling and `c_skip+c_out` output
+reconstruction to `denoise_full` per-step body.
+
+**Patch sketch** (`tools/qwen_image_edit/native/image_diffusion_engine.cpp`,
+inside `denoise_full` per-step body):
+
+1. Compute scalings each step before patchify:
+   ```cpp
+   const float c_skip = 1.0f;
+   const float c_out  = -sigma;
+   const float c_in   = 1.0f / std::sqrt(sigma * sigma + 1.0f);
+   ```
+2. Before host_patchify_latent (line ~5298), apply c_in into a scratch
+   latent buffer:
+   ```cpp
+   std::vector<float> x_scaled(x_host.size());
+   for (size_t j = 0; j < x_host.size(); ++j)
+       x_scaled[j] = x_host[j] * c_in;
+   host_patchify_latent(x_scaled.data(), W_lat, H_lat, C_lat, B,
+                         PATCH, init_tokens, rs, rtd);
+   ```
+3. After unpatchify (line ~5689), reconstruct `denoised_host` via
+   `c_out * model_out + c_skip * x`:
+   ```cpp
+   for (size_t j = 0; j < denoised_host.size(); ++j)
+       denoised_host[j] = denoised_host[j] * c_out + x_host[j] * c_skip;
+   ```
+4. Leave the existing Euler step (lines 5700-5707) unchanged — it is
+   correct once `denoised_host` actually holds the predicted x0.
+
+**Pre-flight verification before re-running 20-step:**
+- Re-run the n=1 probe with the patch and the same CLI 1024² conditioning
+  dump; gate on cossim(probe_n1, cli_x0) ≥ 0.99 and std ≈ 0.36.
+- Only after green at n=1 should §5.5.27 escalate to n=20 and the
+  end-to-end PNG eye-check.
+
+**Secondary investigation (if n=1 still < 0.99 after D1+D2 fix):**
+- Compare engine `t_val = sigma * 1000.0` vs CLI `denoiser->sigma_to_t(sigma)`
+  for DiscreteFlowDenoiser when `flow_shift=3.0` is applied at sigma
+  schedule construction. The shift is already baked into the sigma
+  schedule via `make_qwen_image_sigmas(n_steps, flow_shift)`, so
+  `sigma_to_t(sigma) = sigma * 1000` should hold for DiscreteFlow, but
+  this assumption deserves a 5-line cross-check probe.
+
+#### Artefacts
+
+- `/tmp/qie_5526_n1/out_latent.f32.bin` — n=1 probe latent (262144 F32)
+- `/tmp/qie_5526_n1.log` — full probe stdout/stderr
+
+Engine forward code unchanged in this session (only env-var override).
+HBM lock taken/released by `build_and_run.sh`. No new bytes pushed to
+remote.
