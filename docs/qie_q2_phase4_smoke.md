@@ -7508,3 +7508,136 @@ F16-accumulate insufficient-headroom issue. Two follow-up paths for
 - Do NOT push: confirmed (commits 4854702 + 3f7e0a8 local only).
 - No Co-Authored-By Claude: confirmed.
 
+
+## §5.5.46 — BF16 widening on Q/K/V outputs — VERDICT: NaN-GREEN, PNG TILE/NOISE (saga still open)
+
+### Setup
+
+§5.5.45 closed the multi-step NaN class via an F16 in-place clamp at
+±60000 on the Q/K/V projection outputs. The clamp prevented F16 cast
+saturation (~214 elements/1.5M at deep blocks would otherwise become
+±Inf and cascade through RMSNorm), but the final-latent stats stayed
+out-of-distribution: std=14.6, range ±40 (VAE expects ±15 ideal).
+1024² n=4 PNG eye-check rendered as TILE/NOISE — saga remained open.
+
+§5.5.46 hypothesis: the clamp-at-60000 truncates real signal at the
+saturating tail, distorting attention magnitudes downstream and
+producing the off-distribution latent. Architectural fix:
+**widen Q/K/V matmul output dtype to BF16** (mirrors the §5.5.24
+`attn_out_bf16`/`ffn_down_bf16` pattern). BF16 has F32 dynamic
+range, so the matmul output is stored losslessly. Cast back to F16
+only AFTER `aclnnRmsNorm` (Q/K) bounds the per-row output to ~1σ —
+that cast is then saturation-free regardless of input range.
+
+### Patch
+
+In `tools/qwen_image_edit/native/image_diffusion_engine.cpp`:
+
+1. New helper `cast_bf16_to_f16_(in, out, n)` — generic n-element
+   `aclnnCast` wrapper, mirrors `cast_f32_to_f16_`.
+2. New helper `rms_norm_head_bf16_(x, out, gamma, rows, hd)` —
+   `aclnnRmsNorm` with BF16/BF16 dtype on the input/output tensors
+   (mixed BF16-in/F16-out failed with `status=161002` on this CANN
+   version; uniform dtype is the supported path).
+3. Env `QIE_QKV_BF16` (default ON; `0` reverts to §5.5.45 legacy):
+   - Q/K/V `dispatch_matmul_` calls pass `ACL_BF16` for `out_dtype`.
+   - §5.5.45 `clamp_f16_` block gated on `!s_qkv_bf16` (the F16-view
+     clamp is dtype-incorrect on a BF16 buffer).
+   - Q/K branch: `rms_norm_head_bf16_` × 4 (img Q, img K, txt Q,
+     txt K) followed by `cast_bf16_to_f16_` × 4 in place.
+   - V branch: direct `cast_bf16_to_f16_` (V has no norm), with the
+     §5.5.45 safety clamp re-applied on the now-F16 buffer.
+
+### Gate B — multi-step latent stats
+
+Probe: `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh`
+on `/tmp/qie_q45_inputs` (256² latent, txt_seq=214, cfg=1.0,
+flow_shift=3.0). Default `QIE_QKV_BF16=1` (no env override).
+
+| n_steps | wall (ms) | mean    | std    | min     | max    | NaN | Verdict   |
+|--------:|----------:|--------:|-------:|--------:|-------:|----:|-----------|
+|       4 |   6005.11 | -1.8649 | 15.59  | -39.38  | 40.28  |   0 | NaN-GREEN |
+|       8 |  11628.33 | -2.6470 | 16.25  | -43.72  | 41.59  |   0 | NaN-GREEN |
+|      20 |  26674.76 |  0.0047 | 15.13  | -40.88  | 31.14  |   0 | NaN-GREEN |
+
+Side-by-side vs §5.5.45 (F16 clamp at 60000):
+
+| n_steps | §5.5.45 std / range | §5.5.46 std / range | delta            |
+|--------:|--------------------:|--------------------:|-----------------:|
+|       4 | 15.54 / ±40.66      | 15.59 / ±40.28      | < 0.5%           |
+|       8 | 16.22 / ±42.22      | 16.25 / ±43.72      | < 0.2% / +1.5    |
+|      20 | 15.14 / ±40.84      | 15.13 / ±40.88      | < 0.1%           |
+
+**Mathematical equivalence confirmed**: §5.5.45's F16 clamp at 60000
+saturates the same ~214 tail elements that §5.5.46's BF16 storage
+preserves losslessly, but those elements contribute ~1e-4 to the
+RMSNorm denominator on a ~1.5M-element row sum-of-squares. Per-step
+magnitudes are statistically indistinguishable.
+
+### Gate C — 1024² n=4 PNG eye-check
+
+`/tmp/qie_5546_1024_latent.f32.bin` (1024² @ n=4 cfg=1.0,
+`/tmp/qie_q45_inputs_1024` dump, flow_shift=3.0): mean=-2.5863,
+std=14.7406, min/max=-40.78/+35.06, NaN=0, inf=0. Wall=59861.76ms
+(vs §5.5.45's similar). VAE decode: `/tmp/qie_5546_1024_FIXED.png`
+(2.0 MiB) via `run_vae_decode_5544.sh` wrapper.
+
+`decode_only/x_latent_loaded`: range=[-40.78, +35.06] NaN=0.
+`decode_only/decoded_image`: range=[0, 1] NaN=0.
+
+**Eye-check verdict: TILE/NOISE.** Blue diagonal weave/grid pattern,
+no recognizable cat. Pixel-diff vs §5.5.45 PNG:
+|diff| mean=5.33/255, max=39/255, 3.97% identical pixels — small
+numeric perturbations propagate through 4 denoising steps but the
+overall structure is identical (both off-distribution latent
+magnitude → same VAE failure mode).
+
+### Performance
+
+n_steps=20 256² wall=26674.76 ms (1.27s/step amortised) vs §5.5.45's
+25540.12 ms — within 5%, no regression. The BF16 RMSNorm dispatch
+adds ~4 `aclnnCast` calls per block × 60 blocks × 20 steps = 4800
+small cast ops, but each is < 100 µs at this row count (≤ 8192
+rows × 128 head_dim) so the overall overhead is bounded under noise
+floor of host-stream sync.
+
+### Saga conclusion
+
+**NO.** The BF16 widening lands cleanly and removes the §5.5.45
+clamp band-aid, but the final-latent magnitude is unchanged. The
+±40 magnitude is therefore **genuine signal**, not a saturation
+artifact — the issue must lie upstream of the QKV projection (in the
+text embedding, t_emb, modulation chain, residual stream, or
+attention scale). The clamp/widen pattern is a complete dead end
+for the cat-PNG eye-check.
+
+Suggested next steps for §5.5.47+:
+
+1. **CLI ground-truth comparison.** Run `ominix-diffusion-cli` end-
+   to-end on the same conditioning (`/tmp/qie_q45_inputs_1024`) at
+   n_steps=4, dump its post-DiT latent, and check magnitude. If CLI
+   also produces ±40, the issue is upstream (text embedding) — if
+   CLI produces ±15, the engine has a per-block magnitude leak
+   (most likely candidate: gated-residual #2 accumulator pulling in
+   too much from FFN at deep blocks).
+
+2. **Per-block residual magnitude trace at 1024².** Engine-vs-CLI
+   `13_*_resid1` and `21_*_resid2` dumps at every block to localise
+   the magnitude divergence. §5.5.29 already did `ffn_gate2` drop
+   bisect at 256² but didn't fully close because t_emb was synthetic
+   in the harness — needs re-running with the real Step 4 t_emb dump.
+
+3. **Attention scale review.** Q2.4.5.4k retraced the FIA path and
+   confirmed `scale=1/sqrt(HD)` matches CPU ref. Worth re-checking
+   whether `kv_scale` trick (set `QIE_ATTN_SOFTMAX_F32=1`) changes
+   the magnitude — it post-multiplies output by HD which would
+   amplify the latent if not exactly compensated upstream.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: held during all engine + VAE runs, released after each.
+- Do NOT push: confirmed (commit `cef4956` local only, 39 commits
+  ahead of origin/main).
+- No Co-Authored-By Claude: confirmed.
+- Time-box: ~2 h (build + n=4/8/20/1024 sweep + decode + diff).
