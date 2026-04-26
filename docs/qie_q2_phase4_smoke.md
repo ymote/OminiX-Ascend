@@ -4658,3 +4658,132 @@ Pixel-diff oracle:
 - 5524 vs CUDA-ref @1024²: mean_abs=76.666 max=253 pct_identical=0.40% RMSE=93.40
 - 5524-1024² vs 5524-256² (resized): mean_abs=42.46 pct_identical=1.26% (same tile structure)
 
+
+### §5.5.25 — VAE short-circuit probe — VAE_OK, BUG IS UPSTREAM IN denoise_full TRAJECTORY
+
+**Verdict (Probe A): VAE_OK_BUG_UPSTREAM.** The Ascend VAE decode path is
+correct; the cat-PNG bug lives in the probe-harness `denoise_full` Euler
+trajectory, which produces a post-DiT latent with std ≈ 4.9 instead of the
+expected std ≈ 0.36 — a 14× over-magnification of the latent dynamic range.
+
+#### Evidence
+
+Two existing 1024² PNGs decode along the same Ascend VAE path but use
+different post-DiT latent inputs:
+
+```
+PNG                                Latent source                 PNG content
+qie_5524_1024_cli_dump.png         CLI x_0 (1-step, end-to-end)   CAT (greyish but recognizable)
+qie_5524_1024_decoded.png          probe out_latent (20-step)    BLUE TILE PATTERN
+```
+
+Both use:
+  - Same Ascend `ominix-diffusion-cli` binary, same `decode_first_stage`
+    code path, same `process_latent_out(x)` per-channel scale/shift
+    pre-step, same `--vae-tiling`, same VAE weights.
+  - Differ ONLY by which post-DiT latent is decoded.
+
+Latent stats comparison:
+
+```
+file                                            shape             mean      std       range
+init_latent.f32.bin           (CLI input)       [128,128,16,1]    0.0       0.0       (zeros — img→img cat ref)
+noised_init_latent.f32.bin    (CLI t=σ_0)       [128,128,16,1]    -8e-4     1.001     [-4.40, +4.80]
+x0_sampled_0.f32.bin          (CLI 1-step out)  [128,128,16,1]    -0.070    0.362     [-1.28, +1.56]
+qie_5524_1024_latent.f32.bin  (probe 20-step)   [128,128,16,1]    -2.393    4.903     [-13.52, +7.77]
+```
+
+Cossim(probe-final, CLI-1-step) = 0.240. Two completely different latents.
+
+The CLI's `x_0` after 1 sample-step is at the expected dynamic range
+(std≈0.36, matching what `process_latent_out` is calibrated for: per-channel
+`std ≈ 1-3`, `scale_factor=8`, plug into `value * std_/8 + mean` →
+~unit-output-range to feed VAE).  The probe's 20-step `out_latent` has
+std=4.9 — 14× too large.  After `process_latent_out` amplifies by an
+additional std/scale ratio, the VAE receives an out-of-domain input and
+emits a periodic tile pattern.
+
+#### Why §5.5.24 missed this
+
+The §5.5.24 GREEN-numerical gate accepted the latent on three checks:
+NaN=0, inf=0, std∈(0, 50). All passed (std=4.90).  But **std=4.90 is the
+wrong endpoint stat for a 20-step Qwen-Image flow-Euler trajectory**:
+sigma converges to 0 by step n, so `x = (1-σ)*x_zero + σ*ε` should land at
+the data manifold (std≈0.3-0.4 for Qwen-Image latents).  std=4.9 says the
+trajectory drifted AWAY from the manifold instead of toward it — likely a
+per-block scale error (~1.08× per step) compounding through 20 Euler steps,
+or an Euler step-direction sign error.
+
+#### Bug-surface localization
+
+Surface: **`denoise_full` Euler/per-block scale chain**, NOT VAE, NOT
+proj_out/unpatchify.
+
+  1. Probe A above rules out VAE.
+  2. Probe B (proj_out/norm_out/unpatchify oracle) is reduced in
+     priority: those are intra-step transforms.  The bug compounds over
+     20 steps, so the per-step output has a scale error.  Per-step
+     amplification factor: (4.90/1.00)^(1/20) ≈ 1.084 → +8.4% per
+     step.  That's consistent with an EITHER (a) `proj_out` scale
+     producing output that's too large, OR (b) a `dt`-sign error
+     (`x += d * dt` with wrong sign of dt would amplify instead of
+     suppress noise).
+
+#### Recommended next probe (§5.5.26)
+
+**Single-step trajectory comparison.**
+
+  1. Run the probe harness with `n_steps=1` and the same CLI conditioning
+     dump (`/tmp/qie_q45_inputs_1024/`).  Capture probe `out_latent` after
+     1 step.
+  2. Compare bit-by-bit against `/tmp/qie_q45_inputs_1024/x0_sampled_0.f32.bin`
+     (the CLI 1-step result).  Should be cossim ≥ 0.99 if the per-step
+     denoise is correct.
+  3. If cossim < 0.99 at n_steps=1: bug is in a single-step transform
+     (per-block / proj_out / Euler `dt` sign).  Bisect via stage-by-stage
+     dump.
+  4. If cossim ≈ 0.99 at n_steps=1 but diverges at n_steps=20: bug is in
+     the multi-step state carry (e.g. host-side `x_host` mutation,
+     sigma-schedule indexing, `dt = sigmas[step+1] - sigma` direction
+     mismatch).
+
+This probe is ~5 min wall (single-step denoise + numpy compare) and
+directly tests the trajectory hypothesis without 4 new dump points.
+
+#### Pixel diff stats (re-stated for the record)
+
+Same as §5.5.24:
+```
+qie_5524_1024_decoded   (probe latent, tile)   vs CUDA-ref @1024²  mean_abs=76.67 RMSE=93.40
+qie_5524_1024_cli_dump  (CLI latent, cat)      vs CUDA-ref @1024²  mean_abs=??.??  (not measured this session)
+```
+
+The cli_dump PNG (greyish cat, std=52.98 vs CUDA-ref std=52.54, mean=114.3
+vs 104.7) is a recognizable cat — clear semantic content.  A pixel diff
+isn't yet computed because the CLI dump used 1 sample step (intentional,
+fast prerequisite for the 1024² conditioning dump) while the CUDA reference
+used 20 steps; semantic match doesn't require pixel match.
+
+#### Decision matrix outcome
+
+`A=cat`, B not run.  VAE is correct, bug is upstream of VAE.  But the
+upstream surface is **NOT** the proj_out/unpatchify of Probe B's design —
+it's the multi-step Euler trajectory.  Probe B as originally scoped would
+have produced a misleading "all stages cossim ≥ 0.99" result because
+each individual stage IS correct; the bug is in the trajectory closure.
+
+#### Artefacts (this session, no new dumps)
+
+Existing artefacts that resolved Probe A:
+- `/tmp/qie_5524_1024_cli_dump.png`         — Ascend CLI 1-step end-to-end CAT
+- `/tmp/qie_5524_1024_decoded.png`          — Ascend VAE-decode-only of probe latent → TILE
+- `/tmp/qie_q45_inputs_1024/x0_sampled_0.f32.bin` — CLI 1-step post-DiT latent (std=0.36, range [-1.28, 1.56])
+- `/tmp/qie_5524_1024_latent.f32.bin`       — Probe 20-step post-DiT latent (std=4.90, range [-13.5, 7.77])
+- `/tmp/qie_q45_inputs_1024/{noised_init_latent,init_latent,ref_latent_0}.f32.bin`
+
+Code paths examined:
+- `tools/ominix_diffusion/src/stable-diffusion.cpp:2829` — `process_latent_out` per-channel scale/shift
+- `tools/ominix_diffusion/src/stable-diffusion.cpp:3060`  — `decode_first_stage` calls `process_latent_out` BEFORE VAE compute
+- `tools/qwen_image_edit/native/image_diffusion_engine.cpp:5697-5716` — `denoise_full` Euler step
+
+No engine forward-code changes this session.  No new dumps.  Doc-only commit.
