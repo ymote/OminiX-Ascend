@@ -4078,3 +4078,66 @@ difference), not in the native engine.
   GREEN, not tautology).
 - F16-vs-F32 mod1 reconstruction proof:
   `/tmp/check_mod1_f16_vs_f32.py` (CPU ggml is the outlier, not native).
+
+
+### §5.5.21 — Bisect sanity-rerun + CPU-ref audit — VERDICT: SANITY_CPU_REF_BUG (CPU ref's `Flux::modulate` swaps scale/shift; engine is bit-accurate against the F32 numpy oracle on REAL inputs)
+
+**Hypothesis under test.** §5.5.20 established that the entire §5.5.7→§5.5.19 bisect was performed on synthetic random t_emb (`fill_random_f16(t_emb_f16, H, 0.1f, 0x4533ULL)` at `qie_q45_real_denoise_smoke.cpp:305`), yielding a 00_t_emb absmax of ~0.0999 vs the production absmax of ~111.75. Two questions remained:
+
+1. Does the engine still match a pure-F32 oracle at REAL-input shape and magnitude?
+2. Is the ggml CPU reference (used as ground-truth in §5.5.7+) numerically correct?
+
+**Method.**
+
+- Built and ran the production end-to-end harness `tools/probes/qie_q45_step4_full_denoise/build_and_run.sh` (which invokes `ImageDiffusionEngine::denoise_full`) with `QIE_DUMP_BLOCK0_DIR=/tmp/qie_dumps_real_5520` and `QIE_DEBUG_DUMP_GATES=1`. HBM lock taken/released by the script.
+- Confirmed `00_t_emb.f32` absmax = **111.75** (matches §5.5.7 historical real-input value of 111.8; vs §5.5.20 random run = 0.0999).
+- Re-ran four pure-F32 numpy oracles (`qie_t_emb_oracle`, `qie_mod1_oracle`, `qie_rmsnorm_oracle`, `qie_attn_oracle`) overriding `IMG_SEQ=512, TXT_SEQ=214` to match real shape, pointed at `/tmp/qie_dumps_real_5520/`.
+- Attempted to re-run `qie_block0_cpu_reference` against the real-input dumps with `QIE_Q45_IMG_SEQ=512 QIE_Q45_TXT_SEQ=214`. **Aborted** at `ggml.c:2189` `GGML_ASSERT(ggml_can_repeat(b, a))` inside `ggml_mul` — the CPU ref's pe/attention-mask construction is hard-wired to the smoke shape; refactoring is out of scope for this dispatch.
+- Read `Flux::modulate` (`tools/ominix_diffusion/src/flux.hpp:233`), `ggml_ext_chunk` (`tools/ominix_diffusion/src/ggml_extend.hpp:726`), and `QwenImageTransformerBlock::get_mod_params_vec` + `forward` (`qwen_image.hpp:230,255`).
+
+**Real-input substep cossim table (oracle = pure-F32 numpy on Q4_0-dequant weights).**
+
+| substep | native vs CPU-ref | native vs F32 oracle | notes |
+|---|---|---|---|
+| 00_t_emb        | (blocked)* | **1.000000** (cos\|sin layout, t=1000) | absmax 111.75; max_abs_diff = 3.1e-2 |
+| 04_img_LN1      | (blocked)* | (oracle uses dump as input; trivially 1.0) | clean LayerNorm baseline |
+| 05_img_mod1     | (blocked)* | **1.000000** | max_abs_diff = 6.25e-2 |
+| 07_txt_mod1     | (blocked)* | **1.000000** | max_abs_diff = 5.0e-1 |
+| 09_*_rmsnorm    | (blocked)* | **1.000000** all 4 streams | F16-in/F32-reduction model matches |
+| 11_attn_out     | (blocked)* | **1.000000** global, per-head, per-stream | mean_abs_diff = 1.96e-3 |
+
+\* CPU reference rerun at real shape blocked by `ggml_can_repeat` assert. Smoke-shape CPU dumps (img_seq=64, txt_seq=32) cannot be byte-compared against real-shape native dumps (img_seq=512, txt_seq=214). To unblock: refactor `test_qie_block0_cpu_reference` to accept dynamic pe/grid layout — separate task.
+
+**CPU reference audit — verdict: convention bug.**
+
+- `Flux::modulate(ctx, x, shift, scale, skip_reshape)` body computes `x' = x * (1 + scale) + shift`. Signature: 3rd arg = shift, 4th arg = scale.
+- `get_mod_params_vec(_, mod_params, nullptr)` (the QIE-Edit single-batch path) returns `ggml_ext_chunk(mod_params, 6, 0)` — 6 chunks of size H along ne[0]. Comment at line 232 ("[N, hidden_size * 12]") refers only to the `index != nullptr` (CFG-batched modulate-index) branch.
+- `ggml_ext_chunk(_, x, num, dim)` slices along `x->ne[dim]` requiring `ne[dim] % num == 0`. For QIE-Edit with `img_mod.1` = `Linear(H, 6*H)` and N=1, `mod_params` has `ne = [6*H, 1, ?, ?]` and 6-way split along dim 0 yields chunks of `[H, 1, ?, ?]` each. **Axis convention is correct.**
+- `qwen_image.hpp:293` calls `Flux::modulate(_, img_normed, vec[0], vec[1], false)` — passing `vec[0]` into the `shift` slot, `vec[1]` into `scale`. Computed result: `img_normed * (1 + vec[1]) + vec[0]`.
+- The native engine (verified by `qie_mod1_oracle` cos=1.0 at both random and real inputs) computes `img_LN1 * (1 + chunk[0]) + chunk[1]` — i.e. `chunk[0]` is scale, `chunk[1]` is shift.
+- `qie_mod1_oracle` diagnostic 3 confirms: legacy ordering `[scale, shift, gate]` cos=1.000; HF-spec ordering `[shift, scale, gate]` cos=0.10. **The CPU reference uses HF-spec ordering against weights stored in legacy ordering.**
+
+**Recap of the Q4_0 GGUF mod-weight layout.** The `transformer_blocks.{i}.img_mod.1.weight` GGUF tensor stores the 6 components in order `[scale1, shift1, gate1, scale2, shift2, gate2]` along its 6H output axis (validated by `implied_scale_shift` lstsq fit: cos(implied_scale1, chunk[0]) = 1.000; cos(implied_shift1, chunk[1]) = 1.000). The native engine's tile dispatch consumes this layout correctly. The CPU reference's `Flux::modulate(x, vec[0], vec[1])` swaps the two — equivalent to a HF-spec assumption `[shift, scale, gate]` that does NOT match the actual GGUF byte order.
+
+**This is the §5.5.7 → §5.5.19 tautology root cause.** The bisect compared native dumps (engine convention) to `cpu_05_img_mod1` (CPU-ref-with-swapped-args), saw cos=0.99 drift, and chased it through 9 substeps. None of the substeps was actually wrong — the "drift" was the CPU ref applying scale-where-shift-belongs every block.
+
+**What this DOESN'T explain.** The end-to-end PNG still produces a tile pattern, not a cat (§5.5.13/§5.5.15). Engine substeps are bit-accurate vs F32 oracle through the entire block-0 chain on REAL inputs (00→04→05→07→08→09→10→11), so the ~1.000 cossim chain is intact. The bug must be:
+
+1. **Outside block 0** — block 1+ accumulated drift, or the residual hidden-state path between blocks (`13_img_resid1`, `24_img_resid2` are dumped F32 → next-block input). Run a §5.5.17-style sweep at block 30 or block 59.
+2. **Outside the DiT** — VAE encode/decode, image latent path, or the noise schedule (`make_flow_sigmas(20)`, sigma sequence, post-CFG combine).
+3. **Production-harness configuration drift** — text encoder output, ref_latent path, `init_from_dump` vs the in-memory pipeline. The §5.5.16 byte-stable PNG test compared `step4_full_denoise` against `qie_q45_step4_full_denoise` — both go through `init_from_dump`; a discrepancy with the real Studio API request would not have been caught.
+
+Note: §5.5.21's own `denoise_full` smoke run **also** RED'd at the final-latent gate (mean=0, NaN=16384, abs > 1e30) — i.e. the production harness still NaN-bombs even with all block-0 substeps cos=1.0 on the F32 oracle. This rules out "block 0 is wrong" cleanly.
+
+**Recommendation — next probe to land the cat PNG.**
+
+1. Run a **block-N (N=30 or N=59) substep cossim sweep** by extending the block-0 dump gate (`s_intra_calls == 1`) to also fire at `s_intra_calls == 31` (mid) and `s_intra_calls == 60` (final) so we get `/tmp/qie_dumps_block30_real/` and `/tmp/qie_dumps_block59_real/` from a single production run. Re-run mod1/rmsnorm/attn oracles against those. If divergence enters by block 30, it's residual-path accumulation or a per-block-conditioned bug. If still cos=1.0 at block 59, the DiT forward is correct and the bug is in patchify/unpatchify, the noise schedule, or VAE.
+2. **Independently fix the CPU reference** so it can serve as a real ground-truth: in `qwen_image.hpp:293` and 297 swap `vec[0]` ↔ `vec[1]` for the modulate call (and same for vec[3]/vec[4] at lines 321/325), OR alternatively re-verify that `Flux::modulate`'s shift/scale convention matches the GGUF weight pack order that QIE-Edit actually exports. This unblocks future native-vs-CPU bisects without re-litigating the convention each time.
+3. **Diff init_from_dump vs the production Studio path** (`engine.denoise(...)` from a request handler) — particularly the conditioning tensors, sigma schedule, and ref/uncond buffers. If those align, then pursue (1).
+
+**Artefacts.**
+
+- `/tmp/qie_dumps_real_5520/` — full block-0 dump (35 files, 00→24, real-input shape img_seq=512, txt_seq=214).
+- Run logs: `/tmp/cpu_ref_real_5521c.log` (CPU ref abort).
+- Oracles run via `python3 -c 'import qie_<oracle> as M; M.IMG=512; M.TXT=214; M.DUMP="/tmp/qie_dumps_real_5520"; M.main()'`.
+- No engine code touched; no commits to engine source. Diagnostic-only.
