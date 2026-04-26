@@ -5443,3 +5443,204 @@ for §5.5.31's bisect (no cost — only fires under `QIE_CLI_DUMP_RESID`).
 CLI was killed gracefully after sampling completed (mid-VAE-decode);
 HBM lock manually released; NPU clean. No bytes pushed.
 
+
+### §5.5.31 Bit-exact img_mod_1.weight bisect — WEIGHT_LOAD_OK_BUG_DOWNSTREAM
+
+**Verdict:** Engine's per-block weight load and Q4_0 repack pipeline is
+**bit-exact** to the GGUF source. Per-block weight selection hypothesis
+from §5.5.30 (#1) is FALSIFIED. Bug surface narrows to forward path
+(WQBMMv3 / aclnnMm dispatch / scale broadcast / scratch reuse).
+
+#### Per-block GGUF dtype table
+
+
+
+Q5_K weights are not natively supported by WQBMMv3, so the engine takes the
+ path (line 458 in ) for
+those blocks. Q4_0 weights are repacked via  (line 287)
+into WQBMMv3 layout (signed nibbles via , scale view [K/32, N]).
+
+#### gguf-py ↔ engine repack bit-compare
+
+Probe:  reads the GGUF tensor's raw bytes,
+mimics  byte-for-byte (vectorized numpy), and
+reconstructs fp32 via the engine's documented WQBMMv3 view formula:
+. CLI uses ggml-quants.c which is
+identical to gguf-py's  for Q4_0 — so gguf-py == CLI.
+
+
+
+**Cossim 1.000000, max-abs-diff 0.0e+00 across all four Q4_0 blocks tested.**
+The engine's Q4_0 repack is bit-perfect in both nibble layout (signed via
+) and scale layout ([K/32, N] row-major F16). The §5.5.30
+hypothesis #1 (per-block selection bug) is falsified — block 0 and block N
+load CORRECT distinct weights, byte-for-byte matching the GGUF source.
+
+#### Bug surface localization
+
+ENGINE_Q4_DEQUANT: ❌ ruled out (bit-exact at load time)
+ENGINE_Q5K_DEQUANT: ❌ irrelevant (matches at blocks 0/59, both Q5_K)
+ENGINE_MATMUL_DISPATCH: ✅ candidate — the §5.5.30 mod2 drift at Q4_0
+  blocks 1/2/4/8/30/45 (but NOT block 16) must originate inside
+   Q4 path ().
+
+Block 16 Q4_0 matching while blocks 1/2/4/8/30/45 (also Q4_0) do not is
+NOT explained by a uniform Q4 dispatch bug. Two remaining candidates:
+
+(a) **Block-dependent state leak in scratch buffers**: 
+    (line 1551) and  (line 1573) are reused
+    across calls without explicit clear. If the F16→BF16 scale cast for
+    block N reads stale bytes when scale_elems shrinks (e.g. scale buffer
+    grew larger for an earlier larger matmul), trailing junk could
+    contaminate the WQBMMv3 view at [K/32, N]. The img_mod_1 scale tile
+    is 96 × 18432 = 1.77M elems = 3.54 MiB BF16 — relatively small.
+
+(b) **F16 saturation in modulate_ at large per-block t_emb projections**:
+    The mod-1 Linear bias  is F16 (loaded by
+    ). If the per-block bias has a large dynamic
+    range, post-bias output approaches F16 max and saturates. Block 16 may
+    happen to have a smaller bias norm. Need per-block bias absmax dump to
+    confirm.
+
+Block 16 is also the same block where §5.5.27 saw outlier matching —
+this signal is consistent with magnitude-dependent saturation, not with
+indexing.
+
+#### Recommended §5.5.32
+
+1. **Engine instrumentation**: add  immediately after the img_mod.1 dispatch_matmul at line 3337
+   (already has intra_probe — file dump trivially follows). Same for
+   . Rebuild + run on the 9-block selection.
+
+2. **CLI side**: add matching  ggml_set_output in
+    immediately after
+   .
+
+3. **Bit-compare**: per block, max-abs-diff and cossim engine vs CLI for
+   . If Q4_0 blocks 1/2/4/8/30/45 diverge but block 16
+   matches → confirms the WQBMMv3 dispatch path has a magnitude-dependent
+   numerical bug (F16 accumulator overflow or scale-cast precision). If
+   ALL Q4_0 blocks diverge similarly → indicates the issue is in 
+   or LN2 path further downstream.
+
+4. **F32 accumulator probe**: re-run §5.5.30 with
+    env (HIGH_PRECISION F32 accum for WQBMMv3,
+   line 1500). If mod2 drift disappears → F16 accum overflow confirmed.
+
+#### Artefacts
+
+-  — vectorized gguf-py vs engine repack probe
+-  output — 6 blocks × cossim 1.0 / max_diff 0.0
+
+No engine rebuild this dispatch (probe is host-side numpy only). No HBM
+allocated. No bytes pushed.
+
+### §5.5.31 Bit-exact img_mod_1.weight bisect — WEIGHT_LOAD_OK_BUG_DOWNSTREAM
+
+**Verdict:** Engine's per-block weight load and Q4_0 repack pipeline is
+**bit-exact** to the GGUF source. Per-block weight selection hypothesis
+from §5.5.30 (#1) is FALSIFIED. Bug surface narrows to forward path
+(WQBMMv3 / aclnnMm dispatch / scale broadcast / scratch reuse).
+
+#### Per-block GGUF dtype table
+
+```
+blk | dtype | shape         | engine path
+----|-------|---------------|---------------------------------------
+  0 | Q5_K  | [3072, 18432] | F16 fallback (dequant_upload_f16 → aclnnMm)
+  1 | Q4_0  | [3072, 18432] | Q4-resident (repack_q4_0_upload → WQBMMv3)
+  2 | Q4_0  | [3072, 18432] | Q4-resident
+ 16 | Q4_0  | [3072, 18432] | Q4-resident
+ 30 | Q4_0  | [3072, 18432] | Q4-resident
+ 59 | Q5_K  | [3072, 18432] | F16 fallback
+```
+
+Q5_K weights are not natively supported by WQBMMv3, so the engine takes the
+`dequant_upload_f16` path (line 458 in `image_diffusion_engine.cpp`) for
+those blocks. Q4_0 weights are repacked via `repack_q4_0_upload` (line 287)
+into WQBMMv3 layout (signed nibbles via `u XOR 0x08`, scale view [K/32, N]).
+
+#### gguf-py vs engine repack bit-compare
+
+Probe: `/tmp/qie_5531/qie_bisect.py` reads the GGUF tensor's raw bytes,
+mimics `repack_q4_0_upload` byte-for-byte (vectorized numpy), and
+reconstructs fp32 via the engine's documented WQBMMv3 view formula:
+`w[k,n] = (nibble - 8) * scales[k/32, n]`. CLI uses ggml-quants.c which is
+identical to gguf-py's `dequantize` for Q4_0 — so gguf-py == CLI.
+
+```
+blk | dtype | absmax  | gguf vs cli | gguf vs eng | cli vs eng | max|gguf-eng|
+----|-------|---------|-------------|-------------|------------|---------------
+  0 | Q5_K  | 1.7867  |   1.000000  |   1.000000  |  1.000000  |   N/A (F16 fallback)
+  1 | Q4_0  | 2.3906  |   1.000000  |   1.000000  |  1.000000  |   0.0000e+00
+  2 | Q4_0  | 1.4375  |   1.000000  |   1.000000  |  1.000000  |   0.0000e+00
+ 16 | Q4_0  | 2.8125  |   1.000000  |   1.000000  |  1.000000  |   0.0000e+00
+ 30 | Q4_0  | 4.6875  |   1.000000  |   1.000000  |  1.000000  |   0.0000e+00
+ 59 | Q5_K  | 3.2973  |   1.000000  |   1.000000  |  1.000000  |   N/A (F16 fallback)
+```
+
+**Cossim 1.000000, max-abs-diff 0.0e+00 across all four Q4_0 blocks tested.**
+The engine's Q4_0 repack is bit-perfect in both nibble layout (signed via
+`u XOR 0x08`) and scale layout ([K/32, N] row-major F16). The §5.5.30
+hypothesis #1 (per-block selection bug) is falsified — block 0 and block N
+load CORRECT distinct weights, byte-for-byte matching the GGUF source.
+
+#### Bug surface localization
+
+ENGINE_Q4_DEQUANT: ruled out (bit-exact at load time).
+ENGINE_Q5K_DEQUANT: irrelevant (matches at blocks 0/59, both Q5_K).
+ENGINE_MATMUL_DISPATCH: candidate — the §5.5.30 mod2 drift at Q4_0
+  blocks 1/2/4/8/30/45 (but NOT block 16) must originate inside
+  `dispatch_matmul_` Q4 path (`image_diffusion_engine.cpp:1644-1740`).
+
+Block 16 Q4_0 matching while blocks 1/2/4/8/30/45 (also Q4_0) do not is
+NOT explained by a uniform Q4 dispatch bug. Two remaining candidates:
+
+(a) **Block-dependent state leak in scratch buffers**: `scratch_bf16_scale_dev_`
+    (line 1551) and `scratch_bf16_src_f32_dev_` (line 1573) are reused
+    across calls without explicit clear. If the F16 to BF16 scale cast for
+    block N reads stale bytes when scale_elems shrinks (e.g. scale buffer
+    grew larger for an earlier larger matmul), trailing junk could
+    contaminate the WQBMMv3 view at [K/32, N]. The img_mod_1 scale tile
+    is 96 x 18432 = 1.77M elems = 3.54 MiB BF16 — relatively small.
+
+(b) **F16 saturation in modulate_ at large per-block t_emb projections**:
+    The mod-1 Linear bias `img_mod_b` is F16 (loaded by
+    `dequant_upload_f16`). If the per-block bias has a large dynamic
+    range, post-bias output approaches F16 max and saturates. Block 16 may
+    happen to have a smaller bias norm. Need per-block bias absmax dump to
+    confirm.
+
+Block 16 is also the same block where §5.5.27 saw "outlier" matching —
+this signal is consistent with magnitude-dependent saturation, not with
+indexing.
+
+#### Recommended §5.5.32
+
+1. **Engine instrumentation**: add `dump_tensor_f32("02_img_mod_out.f32",
+   ...)` immediately after the img_mod.1 dispatch_matmul at line 3337
+   (already has intra_probe — file dump trivially follows). Same for
+   `03_txt_mod_out`. Rebuild + run on the 9-block selection.
+
+2. **CLI side**: add matching `02_img_mod_out` ggml_set_output in
+   `qwen_image.hpp::QwenImageTransformerBlock::forward` immediately after
+   `img_mod_linear(silu(t_emb))`.
+
+3. **Bit-compare**: per block, max-abs-diff and cossim engine vs CLI for
+   `02_img_mod_out`. If Q4_0 blocks 1/2/4/8/30/45 diverge but block 16
+   matches → confirms the WQBMMv3 dispatch path has a magnitude-dependent
+   numerical bug (F16 accumulator overflow or scale-cast precision). If
+   ALL Q4_0 blocks diverge similarly → indicates the issue is in `modulate_`
+   or LN2 path further downstream.
+
+4. **F32 accumulator probe**: re-run §5.5.30 with
+   `QIE_MATMUL_INNER_PRECISE=0` env (HIGH_PRECISION F32 accum for WQBMMv3,
+   line 1500). If mod2 drift disappears → F16 accum overflow confirmed.
+
+#### Artefacts
+
+- `/tmp/qie_5531/qie_bisect.py` — vectorized gguf-py vs engine repack probe
+- Probe stdout — 6 blocks x cossim 1.0 / max_diff 0.0
+
+No engine rebuild this dispatch (probe is host-side numpy only). No HBM
+allocated. No bytes pushed.
