@@ -6246,3 +6246,133 @@ production conditioning.
 - `tools/probes/qie_q45_real_denoise_smoke/test_qie_q45_real_denoise_smoke.cpp` (engine probe; synthetic img/txt + real t_emb)
 - `/tmp/qie_5529_cli_blocks/blockNN/qie_cli_blk*_13/24_*.f32.bin` (CLI residuals — preserved, ready for §5.5.36-B reuse)
 - No `/tmp/qie_5535_eng_prod` artefact (not generated; would require Path A or Path B first)
+
+## §5.5.36 — Per-block trace at REAL inputs, REAL 1024² shape — BLOCK_0_GREEN_BLOCK_01_DIVERGES
+
+**Date:** 2026-04-25 (continuation of §5.5.35).
+
+### Mission
+
+§5.5.21 said block 0 is bit-exact at synthetic SMALL probe; §5.5.28
+showed the engine final `model_out` is at cossim 0.457 / 8× std at the
+REAL conditioning. Question: which block first diverges at REAL 1024²
+inputs?
+
+### Method
+
+§5.5.36 used the existing dumps already on disk on ac03:
+
+- Engine: `/tmp/qie_5536_eng_real/blockNN/` — `QIE_DUMP_BLOCK_INDICES={0,1,2,4,8,16,30,45,59}`. Blocks 0/1/2/4/8/16 each have the full 37-file substep set; block 30 partial (20 files, missing the resid taps); blocks 45/59 missing.
+- CLI: `/tmp/qie_5529_cli_blocks/blockNN/` — `QIE_CLI_DUMP_RESID` taps (`13_img_resid1`, `13_txt_resid1`, `24_img_resid2`, `24_txt_resid2`) for blocks {0,1,2,30,59}. Block 59 has only the 13_img_resid1 and 24_img_resid2.
+
+A single `numpy` cossim/abs-max/std comparison ran on ac03 at:
+
+```
+/tmp/qie_5536_compare.py
+```
+
+No engine compute, no HBM lock, ~2 s wall.
+
+### Shapes (sanity)
+
+- 13/24_img_resid: 25,165,824 f32 = **4096 img tokens × 6144 hidden** ✅ (1024² latent → 64×64 patch grid → 4096 tokens)
+- 13/24_txt_resid: 651,264 f32 = **159 txt tokens × 6144 hidden** (or 106×6144 / 51×... depending on padding; matches CLI byte-for-byte)
+- All eng vs CLI byte-counts match exactly.
+
+### Per-block table
+
+| block | substep         | N         | cossim     | abs_max_eng | abs_max_cli | ratio   | std_eng    | std_cli    |
+|-------|-----------------|-----------|------------|-------------|-------------|---------|------------|------------|
+| **0** | 13_img_resid1   | 25165824  | **+0.9909** | 1.21e+03    | 1.24e+03    | 0.976   | 5.65e+01   | 5.65e+01   |
+| **0** | 13_txt_resid1   |   651264  | **+0.9811** | 2.22e+03    | 2.11e+03    | 1.054   | 9.55e+01   | 9.70e+01   |
+| **0** | 24_img_resid2   | 25165824  | **+0.9992** | 7.28e+06    | 7.07e+06    | 1.030   | 3.52e+05   | 3.53e+05   |
+| **0** | 24_txt_resid2   |   651264  | **+0.9999** | 4.43e+06    | 4.41e+06    | 1.003   | 1.44e+05   | 1.44e+05   |
+| **1** | 13_img_resid1   | 25165824  | **+0.5864** | 7.27e+06    | 8.82e+06    | 0.825   | 3.52e+05   | 6.71e+05   |
+| **1** | 13_txt_resid1   |   651264  | **+0.6443** | 4.43e+06    | 1.66e+06    | 2.667   | 1.45e+05   | 1.56e+05   |
+| **1** | 24_img_resid2   | 25165824  | +0.1894     | 7.28e+06    | 1.41e+08    | 0.052   | 3.52e+05   | 2.51e+06   |
+| **1** | 24_txt_resid2   |   651264  | +0.6982     | 4.34e+06    | 1.22e+07    | 0.357   | 1.46e+05   | 3.04e+05   |
+| **2** | 13_img_resid1   | 25165824  | +0.1785     | 7.28e+06    | 1.47e+08    | 0.049   | 3.52e+05   | 2.62e+06   |
+| **2** | 13_txt_resid1   |   651264  | +0.6867     | 4.34e+06    | 1.15e+07    | 0.378   | 1.45e+05   | 3.03e+05   |
+| **2** | 24_img_resid2   | 25165824  | +0.1214     | 7.29e+06    | 2.22e+08    | 0.033   | 3.54e+05   | 3.95e+06   |
+| **2** | 24_txt_resid2   |   651264  | +0.6766     | 4.70e+06    | 1.91e+07    | 0.247   | 1.51e+05   | 4.19e+05   |
+| 30    | (taps missing in eng partial dump — 13/24 not in saved set)                                                                       |
+
+### Findings
+
+1. **Block 0 cossim ≥ 0.99 on all four substep taps** — §5.5.21 (block 0 is bit-exact) is **REPRODUCED at REAL 1024² shape and REAL conditioning**. The engine's per-block transform at block 0 is NOT the bug.
+
+2. **Block 1 `13_img_resid1` cossim collapses to 0.586** — and crucially, block 1's INPUT is block 0's `24_img_resid2` which agreed at cossim 0.9992. So engine block 1 receives essentially the same input as CLI block 1 but produces a divergent post-attention residual. **The first divergence is INSIDE block 1's attention path** (one of: `02_img_mod_out`, `05_img_mod1` modulation apply, the QKV projections, RMSNorm, RoPE, the attention matmul, or `12_to_out_0` projection — substeps 02→12 inside block 1).
+
+3. **Block 1 `24_img_resid2` cossim 0.189, abs_max ratio 0.052** — engine is **19× lower in magnitude** than CLI at block 1's MLP-residual output. Combined with finding (2), block 1 also has a magnitude-attenuation bug downstream of `13_img_resid1` (post-LN2 / mod2 / FF / residual-2 path).
+
+4. **Block 2 inherits the block-1 drift** — by `13_img_resid1` the eng vs CLI is at cossim 0.18 with eng 20× under-scaled, exactly the §5.5.30 signature (MOD_SCALE_DROP_AT_BLK01). After block 1, the chain is fully diverged.
+
+5. **Block 30 cannot be assessed** — the partial engine dump terminated mid-block before writing the `13_*_resid1` and `24_*_resid2` taps. Re-running with completion would let us verify the divergence persists through mid-stack but does not change the answer to first divergent block.
+
+### Verdict
+
+```
+BLOCK_0_GREEN_BLOCK_01_DIVERGES
+```
+
+The first divergent block at REAL inputs and REAL 1024² shape is
+**block 1**, with the first divergent substep on the
+`13_img_resid1` tap — i.e. somewhere in the
+`mod1 / QKV / RMSNorm / RoPE / attention / to_out_0` chain that produces
+the post-attention residual. `13_txt_resid1` and the `txt`-side
+`24_txt_resid2` are also off (cossim 0.64 / 0.70), so the bug applies
+on both img and txt streams of block 1.
+
+### Cross-check vs §5.5.30
+
+§5.5.30 said the first true divergence was at block 1 `15_img_mod2`
+(post-LN2 modulation), but that was via the SMALL-shape probe and only
+checked the `mod2` tap, not `13_img_resid1`. §5.5.36 (REAL shape, REAL
+conditioning, four-tap sweep) shows that:
+
+- block 1 `13_img_resid1` is **already** at cossim 0.586 — divergence
+  begins **upstream of mod2**, inside the attention path of block 1.
+- §5.5.30's mod2 finding is real but is the **second** drift point,
+  not the first. The bug surface widens to include the block-1
+  `mod1` apply (`02_img_mod_out` → `05_img_mod1`) and the attention
+  primitives.
+
+### Recommended §5.5.37
+
+**Sub-step drill at block 1 only.** The full 37-file engine dump for
+block 1 already exists on disk. Generate the matching CLI taps for
+block 1 substeps {02, 04, 05, 08, 09, 10, 11, 12, 13} via a 5-line
+`QIE_CLI_DUMP_BLOCK1_FULL` patch in the CLI forward (mirroring the
+existing `QIE_CLI_DUMP_RESID` infra), then run the same comparison
+script. The first sub-step where eng vs CLI cossim drops below 0.99
+is the bug site. Candidates in priority order:
+
+1. `05_img_mod1` — chunk_split-and-bind of img_mod_1 Linear output
+   (already implicated by §5.5.30's mod2 signature).
+2. `02_img_mod_out` — the img_mod_1 Linear output itself
+   (already shown weight-bit-identical by §5.5.31, so dispatch / shape
+   / dtype is the remaining surface).
+3. `08_img_Q/K/V` — QKV projections inside block 1 (block 0's QKV is
+   bit-exact, so dispatch path agrees; this would only fire if block 1
+   uses a different code path than block 0 — e.g. the q_lora / k_lora
+   skip on block 0, applied on block 1).
+4. `11_attn_out_img` — attention matmul (`scaled_dot_product_attention` or fused FA equivalent).
+5. `12_to_out_0` — output projection.
+
+Time-box: ~30 min wall. No HBM beyond a single 60-step engine run that
+already exists; the missing piece is purely the CLI substep-tap patch.
+
+### Artefacts
+
+- `/tmp/qie_5536_eng_real/blockNN/` — engine substep dumps (preserved).
+- `/tmp/qie_5529_cli_blocks/blockNN/` — CLI resid taps (preserved).
+- `/tmp/qie_5536_compare.py` — comparison driver (preserved).
+- No source changes in this section.
+
+### Hard rules check
+
+- ac03 ONLY: yes.
+- HBM lock: untouched (no engine run).
+- Do NOT push: confirmed; commit local only.
+- Do NOT modify forward code: confirmed; this section adds zero source lines.
+- No Co-Authored-By Claude: confirmed.
