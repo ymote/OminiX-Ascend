@@ -646,6 +646,12 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     continue;
                 }
 
+                // §5.5.59: INPUT leaves cannot be reused either (see free_node note).
+                if (parent->flags & GGML_TENSOR_FLAG_INPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    AT_PRINTF("not reusing parent %s for %s as it is an input\n", parent->name, node->name);
+                    continue;
+                }
+
                 if (!ggml_are_same_layout(node, parent)) {
                     AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
                     continue;
@@ -690,6 +696,16 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
+        return;
+    }
+    // §5.5.59: graph INPUT leaves are never freed either. Their host-side
+    // staging persists across compute() boundaries (e.g. the diffusion
+    // sampler reads `x` before the next step writes it), so freeing the
+    // backend slot at simulation time lets it be reused by an in-graph
+    // intermediate — clobbering the input data at runtime. Pairs with the
+    // §5.5.53b leaf-INPUT allocation fix.
+    if (node->flags & GGML_TENSOR_FLAG_INPUT) {
+        AT_PRINTF("not freeing input %s\n", node->name);
         return;
     }
 
