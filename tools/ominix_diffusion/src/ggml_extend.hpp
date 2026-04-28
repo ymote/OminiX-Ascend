@@ -2031,6 +2031,10 @@ public:
 
     // do copy after alloc graph
     void set_backend_tensor_data(struct ggml_tensor* tensor, const void* data) {
+        // §5.5.53b: every host-staged input tensor must carry the INPUT flag
+        // so the graph allocator allocates a real backend slot instead of
+        // taking the leaf->data short-circuit at ggml-alloc.c:888-901.
+        ggml_set_input(tensor);
         backend_tensor_data_map[tensor] = data;
     }
 
@@ -2044,6 +2048,7 @@ public:
             // pass input tensors to gpu memory
             auto backend_tensor = ggml_dup_tensor(compute_ctx, tensor);
 
+            // §5.5.53b: set_backend_tensor_data marks tensor with INPUT flag.
             set_backend_tensor_data(backend_tensor, tensor->data);
             return backend_tensor;
         } else {
