@@ -2154,16 +2154,47 @@ public:
             std::vector<float> readback;
             int first_nan_node = -1;
 
+            // Count NaN/Inf elements. Supports F32, F16, BF16. For other dtypes
+            // (quant block formats etc.) returns -1 to mean "not scanned".
             auto count_nans = [&](struct ggml_tensor* t) -> int64_t {
-                if (t == nullptr || t->type != GGML_TYPE_F32) return -1;
+                if (t == nullptr) return -1;
                 int64_t n = ggml_nelements(t);
-                readback.resize((size_t)n);
-                ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
+                if (n == 0) return 0;
                 int64_t nans = 0;
-                for (int64_t j = 0; j < n; j++) {
-                    if (std::isnan(readback[j]) || std::isinf(readback[j])) nans++;
+                if (t->type == GGML_TYPE_F32) {
+                    readback.resize((size_t)n);
+                    ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
+                    for (int64_t j = 0; j < n; j++) {
+                        if (std::isnan(readback[j]) || std::isinf(readback[j])) nans++;
+                    }
+                    return nans;
                 }
-                return nans;
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<uint16_t> raw((size_t)n);
+                    ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
+                    // F16 NaN: exp==0x1F (all-ones in 5-bit exp) AND mantissa != 0
+                    // F16 Inf: exp==0x1F AND mantissa == 0
+                    for (int64_t j = 0; j < n; j++) {
+                        uint16_t v = raw[j];
+                        uint16_t exp = (v >> 10) & 0x1F;
+                        uint16_t mant = v & 0x3FF;
+                        if (exp == 0x1F) nans++;  // both NaN and Inf
+                        (void)mant;
+                    }
+                    return nans;
+                }
+                if (t->type == GGML_TYPE_BF16) {
+                    std::vector<uint16_t> raw((size_t)n);
+                    ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
+                    // BF16 NaN/Inf: exp==0xFF (8-bit exp all ones)
+                    for (int64_t j = 0; j < n; j++) {
+                        uint16_t v = raw[j];
+                        uint16_t exp = (v >> 7) & 0xFF;
+                        if (exp == 0xFF) nans++;
+                    }
+                    return nans;
+                }
+                return -1;
             };
 
             for (int i = 0; i < n_nodes; i++) {
@@ -2183,10 +2214,9 @@ public:
                 }
                 ggml_backend_synchronize(runtime_backend);
 
-                if (node->type != GGML_TYPE_F32) continue;
-
                 int64_t n   = ggml_nelements(node);
                 int64_t nans = count_nans(node);
+                if (nans < 0) continue;  // non-scannable dtype (quant blocks, I32 etc.)
                 if (nans > 0) {
                     LOG_ERROR("[FIRST-NAN] %s: node %d/%d op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld",
                               get_desc().c_str(), i, n_nodes,
