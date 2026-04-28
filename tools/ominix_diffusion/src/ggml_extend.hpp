@@ -2117,18 +2117,130 @@ public:
             ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
 
-        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
-            return false;
-        }
+        // §5.5.65 — POST-compute per-node first-NaN trace.
+        // Earlier SD_NAN_CHECK fine-scan read tensor data AFTER the full graph
+        // had already executed; gallocr buffer reuse meant a node's slot could
+        // have been overwritten by a later node, producing misleading "first
+        // NaN" hits. Here we instead dispatch the graph one node at a time and
+        // read each node's data immediately after that node alone has executed,
+        // before any later node can write to its slot.
+        //
+        // Mechanism:
+        //   - Build a single-node sub-graph (`ggml_graph_add_node(node)`) per
+        //     graph node and call `ggml_backend_graph_compute(runtime_backend,
+        //     subgraph)` for it. The node's data pointer was already assigned
+        //     by `ggml_gallocr_alloc_graph(compute_allocr, gf)` above, so the
+        //     backend writes into the correct slot.
+        //   - Synchronize, read F32 tensor data, count NaN/Inf.
+        //   - On first NaN, log node info + every src tensor's nan-count so we
+        //     can tell whether this op produced NaN from clean inputs (kernel
+        //     bug at this shape) or merely consumed already-NaN inputs.
+        //
+        // Gated behind SD_FIRST_NAN_TRACE=1; production path is unchanged.
+        bool first_nan_trace = (getenv("SD_FIRST_NAN_TRACE") != nullptr) && !ggml_backend_is_cpu(runtime_backend);
+        if (first_nan_trace) {
+            int n_nodes = ggml_graph_n_nodes(gf);
+            LOG_INFO("[FIRST-NAN] %s: tracing %d nodes one-at-a-time", get_desc().c_str(), n_nodes);
+
+            // Temp ctx for a 1-node sub-graph. Reused via ggml_graph_clear each iter.
+            struct ggml_init_params tmp_params;
+            tmp_params.mem_size   = ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false);
+            tmp_params.mem_buffer = nullptr;
+            tmp_params.no_alloc   = true;
+            struct ggml_context* tmp_ctx = ggml_init(tmp_params);
+            GGML_ASSERT(tmp_ctx != nullptr);
+            struct ggml_cgraph* sub = ggml_new_graph_custom(tmp_ctx, 8, false);
+
+            std::vector<float> readback;
+            int first_nan_node = -1;
+
+            auto count_nans = [&](struct ggml_tensor* t) -> int64_t {
+                if (t == nullptr || t->type != GGML_TYPE_F32) return -1;
+                int64_t n = ggml_nelements(t);
+                readback.resize((size_t)n);
+                ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
+                int64_t nans = 0;
+                for (int64_t j = 0; j < n; j++) {
+                    if (std::isnan(readback[j]) || std::isinf(readback[j])) nans++;
+                }
+                return nans;
+            };
+
+            for (int i = 0; i < n_nodes; i++) {
+                struct ggml_tensor* node = ggml_graph_node(gf, i);
+
+                ggml_graph_clear(sub);
+                ggml_graph_add_node(sub, node);
+
+                ggml_status st = ggml_backend_graph_compute(runtime_backend, sub);
+                if (st != GGML_STATUS_SUCCESS) {
+                    LOG_ERROR("[FIRST-NAN] %s: compute failed at node %d/%d op=%s name='%s': %s",
+                              get_desc().c_str(), i, n_nodes,
+                              ggml_op_name(node->op), ggml_get_name(node),
+                              ggml_status_to_string(st));
+                    ggml_free(tmp_ctx);
+                    return false;
+                }
+                ggml_backend_synchronize(runtime_backend);
+
+                if (node->type != GGML_TYPE_F32) continue;
+
+                int64_t n   = ggml_nelements(node);
+                int64_t nans = count_nans(node);
+                if (nans > 0) {
+                    LOG_ERROR("[FIRST-NAN] %s: node %d/%d op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld",
+                              get_desc().c_str(), i, n_nodes,
+                              ggml_op_name(node->op), ggml_get_name(node),
+                              (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
+                              ggml_type_name(node->type),
+                              (long long)nans, (long long)n);
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        struct ggml_tensor* src = node->src[s];
+                        if (src == nullptr) continue;
+                        int64_t src_n    = ggml_nelements(src);
+                        int64_t src_nans = count_nans(src);
+                        if (src_nans < 0) {
+                            LOG_ERROR("[FIRST-NAN]   src[%d]: op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s (non-F32, not scanned)",
+                                      s, ggml_op_name(src->op), ggml_get_name(src),
+                                      (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3],
+                                      ggml_type_name(src->type));
+                        } else {
+                            LOG_ERROR("[FIRST-NAN]   src[%d]: op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld",
+                                      s, ggml_op_name(src->op), ggml_get_name(src),
+                                      (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3],
+                                      ggml_type_name(src->type),
+                                      (long long)src_nans, (long long)src_n);
+                        }
+                    }
+                    first_nan_node = i;
+                    break;
+                }
+            }
+
+            ggml_free(tmp_ctx);
+
+            if (first_nan_node >= 0) {
+                LOG_ERROR("[FIRST-NAN] %s: aborting at first-NaN node %d/%d (SD_FIRST_NAN_TRACE)",
+                          get_desc().c_str(), first_nan_node, n_nodes);
+                return false;
+            } else {
+                LOG_INFO("[FIRST-NAN] %s: no NaN found across %d nodes (SD_FIRST_NAN_TRACE)",
+                         get_desc().c_str(), n_nodes);
+            }
+        } else {
+            ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+                return false;
+            }
 #ifdef SD_USE_CANN
-        // CANN dispatches operations asynchronously to a stream.
-        // Must synchronize before reading results or reusing buffers.
-        if (!ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_synchronize(runtime_backend);
-        }
+            // CANN dispatches operations asynchronously to a stream.
+            // Must synchronize before reading results or reusing buffers.
+            if (!ggml_backend_is_cpu(runtime_backend)) {
+                ggml_backend_synchronize(runtime_backend);
+            }
 #endif
+        }
 #ifdef GGML_PERF
         ggml_graph_print(gf);
 #endif
@@ -2200,129 +2312,6 @@ public:
                         }
                     }
                 }
-            }
-        }
-        // [QIE Q2.4.5.5.29] Per-block residual abs-max / std dump for CLI vs engine
-        // comparison. Gated by QIE_CLI_DUMP_RESID. Tags set by qwen_image.hpp at
-        // the 4 residual addition sites with names like
-        // "qie_cli_blkNN_13_img_resid1", "qie_cli_blkNN_24_img_resid2", etc.
-        if (std::getenv("QIE_CLI_DUMP_RESID") && !ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_synchronize(runtime_backend);
-            const bool dump_f32 = (std::getenv("QIE_CLI_DUMP_BLOCKS_F32") != nullptr);
-            const char* outdir  = "/tmp/qie_5529_cli_blocks";
-            if (dump_f32) {
-                std::string mk = std::string("mkdir -p ") + outdir;
-                (void)system(mk.c_str());
-            }
-            int n_nodes = ggml_graph_n_nodes(gf);
-            std::vector<float> buf;
-            for (int i = 0; i < n_nodes; i++) {
-                struct ggml_tensor* node = ggml_graph_node(gf, i);
-                const char* name = ggml_get_name(node);
-                if (!name || strncmp(name, "qie_cli_blk", 11) != 0) continue;
-                if (node->type != GGML_TYPE_F32) continue;
-                int64_t n = ggml_nelements(node);
-                buf.resize(n);
-                ggml_backend_tensor_get(node, buf.data(), 0, n * sizeof(float));
-                double sum = 0.0, sumsq = 0.0, absmax = 0.0;
-                int nans = 0;
-                for (int64_t j = 0; j < n; j++) {
-                    float v = buf[j];
-                    if (std::isnan(v) || std::isinf(v)) { nans++; continue; }
-                    double a = std::fabs((double)v);
-                    if (a > absmax) absmax = a;
-                    sum += v; sumsq += (double)v * (double)v;
-                }
-                double mean = sum / (double)std::max<int64_t>(1, n);
-                double var  = sumsq / (double)std::max<int64_t>(1, n) - mean * mean;
-                double stdv = var > 0 ? std::sqrt(var) : 0.0;
-                LOG_INFO("[QIE_CLI_RESID] %s shape=[%ld,%ld,%ld,%ld] absmax=%.4e mean=%+.4e std=%.4e nans=%d/%ld",
-                         name, (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
-                         absmax, mean, stdv, nans, (long)n);
-                if (dump_f32) {
-                    int bn = -1;
-                    if (sscanf(name, "qie_cli_blk%d_", &bn) == 1 &&
-                        (bn == 0 || bn == 1 || bn == 2 || bn == 30 || bn == 59)) {
-                        char path[256];
-                        snprintf(path, sizeof(path), "%s/block%02d", outdir, bn);
-                        std::string mk = std::string("mkdir -p ") + path;
-                        (void)system(mk.c_str());
-                        char fpath[512];
-                        snprintf(fpath, sizeof(fpath), "%s/%s.f32.bin", path, name);
-                        FILE* f = std::fopen(fpath, "wb");
-                        if (f) { std::fwrite(buf.data(), sizeof(float), (size_t)n, f); std::fclose(f); }
-                    }
-                }
-            }
-        }
-        // [QIE Q2.4.5.5.33] Bit-bisect dump for silu(t_emb) and 02_img_mod_out
-        // matched against engine /tmp/qie_5533_eng layout. Names produced by
-        // qwen_image.hpp at lines ~282-301:
-        //   qie_cli_blkNN_01_silu_t_emb
-        //   qie_cli_blkNN_02_img_mod_out
-        if (std::getenv("QIE_CLI_DUMP_5533") && !ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_synchronize(runtime_backend);
-            const char* outdir = "/tmp/qie_5533_cli";
-            { std::string mk = std::string("mkdir -p ") + outdir; (void)system(mk.c_str()); }
-            int n_nodes = ggml_graph_n_nodes(gf);
-            std::vector<float> buf;
-            for (int i = 0; i < n_nodes; i++) {
-                struct ggml_tensor* node = ggml_graph_node(gf, i);
-                const char* name = ggml_get_name(node);
-                if (!name || strncmp(name, "qie_cli_blk", 11) != 0) continue;
-                // Only 01_silu_t_emb / 02_img_mod_out tags.
-                const char* tail = strchr(name + 11, '_');
-                if (!tail) continue;
-                tail++;
-                if (strncmp(tail, "01_silu_t_emb", 13) != 0 &&
-                    strncmp(tail, "02_img_mod_out", 14) != 0) continue;
-                if (node->type != GGML_TYPE_F32) continue;
-                int bn = -1;
-                if (sscanf(name, "qie_cli_blk%d_", &bn) != 1) continue;
-                if (!(bn == 0 || bn == 1 || bn == 2 ||
-                      bn == 16 || bn == 30 || bn == 59)) continue;
-                int64_t n = ggml_nelements(node);
-                buf.resize(n);
-                ggml_backend_tensor_get(node, buf.data(), 0, n * sizeof(float));
-                char path[256];
-                snprintf(path, sizeof(path), "%s/block%02d", outdir, bn);
-                { std::string mk = std::string("mkdir -p ") + path; (void)system(mk.c_str()); }
-                char fpath[512];
-                snprintf(fpath, sizeof(fpath), "%s/%s.f32.bin", path, tail);
-                FILE* f = std::fopen(fpath, "wb");
-                if (f) { std::fwrite(buf.data(), sizeof(float), (size_t)n, f); std::fclose(f); }
-                LOG_INFO("[QIE_CLI_5533] %s -> %s (%lld floats)",
-                         name, fpath, (long long)n);
-            }
-        }
-        // [QIE Q2.4.5.5.37] Block-1 full substep dump for engine bit-compare.
-        // Tags emitted by qwen_image.hpp under QIE_CLI_DUMP_BLOCK1_FULL.
-        // Output layout matches engine /tmp/qie_5536_eng_real/block01/<tail>.f32
-        // (we use .f32.bin extension; comparison script accounts for that).
-        if (std::getenv("QIE_CLI_DUMP_BLOCK1_FULL") && !ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_synchronize(runtime_backend);
-            const char* outdir = "/tmp/qie_5537_cli_block1";
-            { std::string mk = std::string("mkdir -p ") + outdir; (void)system(mk.c_str()); }
-            int n_nodes = ggml_graph_n_nodes(gf);
-            std::vector<float> buf;
-            for (int i = 0; i < n_nodes; i++) {
-                struct ggml_tensor* node = ggml_graph_node(gf, i);
-                const char* name = ggml_get_name(node);
-                if (!name || strncmp(name, "qie_cli_blk01_", 14) != 0) continue;
-                if (node->type != GGML_TYPE_F32) continue;
-                const char* tail = name + 14;  // strip "qie_cli_blk01_"
-                int64_t n = ggml_nelements(node);
-                buf.resize(n);
-                ggml_backend_tensor_get(node, buf.data(), 0, n * sizeof(float));
-                char path[256];
-                snprintf(path, sizeof(path), "%s/block01", outdir);
-                { std::string mk = std::string("mkdir -p ") + path; (void)system(mk.c_str()); }
-                char fpath[512];
-                snprintf(fpath, sizeof(fpath), "%s/%s.f32.bin", path, tail);
-                FILE* f = std::fopen(fpath, "wb");
-                if (f) { std::fwrite(buf.data(), sizeof(float), (size_t)n, f); std::fclose(f); }
-                LOG_INFO("[QIE_CLI_BLOCK1_FULL] %s shape=[%ld,%ld,%ld,%ld] -> %s",
-                         name, (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3], fpath);
             }
         }
         copy_cache_tensors_to_cache_buffer();
