@@ -2031,10 +2031,6 @@ public:
 
     // do copy after alloc graph
     void set_backend_tensor_data(struct ggml_tensor* tensor, const void* data) {
-        // §5.5.53b: every host-staged input tensor must carry the INPUT flag
-        // so the graph allocator allocates a real backend slot instead of
-        // taking the leaf->data short-circuit at ggml-alloc.c:888-901.
-        ggml_set_input(tensor);
         backend_tensor_data_map[tensor] = data;
     }
 
@@ -2048,7 +2044,6 @@ public:
             // pass input tensors to gpu memory
             auto backend_tensor = ggml_dup_tensor(compute_ctx, tensor);
 
-            // §5.5.53b: set_backend_tensor_data marks tensor with INPUT flag.
             set_backend_tensor_data(backend_tensor, tensor->data);
             return backend_tensor;
         } else {
@@ -2154,8 +2149,11 @@ public:
             std::vector<float> readback;
             int first_nan_node = -1;
 
-            // Count NaN/Inf elements. Supports F32, F16, BF16. For other dtypes
-            // (quant block formats etc.) returns -1 to mean "not scanned".
+            // Count true NaN elements (NOT Inf) — causal attention masks are
+            // intentionally populated with -INFINITY for masked positions, so
+            // counting Inf as NaN gives a false positive at every masked
+            // softmax bias. Supports F32, F16, BF16. Returns -1 for
+            // non-scannable dtypes (quant blocks, I32 etc.).
             auto count_nans = [&](struct ggml_tensor* t) -> int64_t {
                 if (t == nullptr) return -1;
                 int64_t n = ggml_nelements(t);
@@ -2165,32 +2163,33 @@ public:
                     readback.resize((size_t)n);
                     ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
                     for (int64_t j = 0; j < n; j++) {
-                        if (std::isnan(readback[j]) || std::isinf(readback[j])) nans++;
+                        if (std::isnan(readback[j])) nans++;
                     }
                     return nans;
                 }
                 if (t->type == GGML_TYPE_F16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
-                    // F16 NaN: exp==0x1F (all-ones in 5-bit exp) AND mantissa != 0
-                    // F16 Inf: exp==0x1F AND mantissa == 0
+                    // F16 NaN: exp==0x1F (5-bit exp all ones) AND mantissa != 0
+                    // F16 Inf: exp==0x1F AND mantissa == 0  → not counted here
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
                         uint16_t exp = (v >> 10) & 0x1F;
                         uint16_t mant = v & 0x3FF;
-                        if (exp == 0x1F) nans++;  // both NaN and Inf
-                        (void)mant;
+                        if (exp == 0x1F && mant != 0) nans++;
                     }
                     return nans;
                 }
                 if (t->type == GGML_TYPE_BF16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
-                    // BF16 NaN/Inf: exp==0xFF (8-bit exp all ones)
+                    // BF16 NaN: exp==0xFF (8-bit exp all ones) AND mantissa != 0
+                    // BF16 Inf: exp==0xFF AND mantissa == 0  → not counted here
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
                         uint16_t exp = (v >> 7) & 0xFF;
-                        if (exp == 0xFF) nans++;
+                        uint16_t mant = v & 0x7F;
+                        if (exp == 0xFF && mant != 0) nans++;
                     }
                     return nans;
                 }
