@@ -2154,51 +2154,108 @@ public:
             std::vector<float> readback;
             int first_nan_node = -1;
 
-            // Count true NaN elements (NOT Inf) — causal attention masks are
-            // intentionally populated with -INFINITY for masked positions, so
-            // counting Inf as NaN gives a false positive at every masked
-            // softmax bias. Supports F32, F16, BF16. Returns -1 for
-            // non-scannable dtypes (quant blocks, I32 etc.).
-            auto count_nans = [&](struct ggml_tensor* t) -> int64_t {
-                if (t == nullptr) return -1;
+            // §5.5.66 — extended scan stats. The earlier `count_nans` deliberately
+            // skipped Inf (because causal attention masks are populated with
+            // -INFINITY for masked positions). That hid the dominant first-NaN
+            // mechanism in QIE 1024² step 1: `Inf × 0 = NaN` through RMSNorm.
+            // We now also report:
+            //   - inf_count: total ±Inf count (combined; positive vs negative
+            //     not split here to keep one F16/BF16 pass).
+            //   - max_finite_abs: largest |x| among finite values, useful to
+            //     detect "near-Inf" saturation that hasn't yet wrapped to Inf.
+            // scannable=true if dtype is F32/F16/BF16 (else stats are -1/-inf).
+            struct ScanStats {
+                int64_t nans;
+                int64_t infs;
+                double  max_finite_abs;
+                bool    scannable;
+            };
+            auto scan_tensor = [&](struct ggml_tensor* t) -> ScanStats {
+                ScanStats s{0, 0, 0.0, false};
+                if (t == nullptr) return s;
                 int64_t n = ggml_nelements(t);
-                if (n == 0) return 0;
-                int64_t nans = 0;
+                if (n == 0) { s.scannable = true; return s; }
                 if (t->type == GGML_TYPE_F32) {
                     readback.resize((size_t)n);
                     ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
                     for (int64_t j = 0; j < n; j++) {
-                        if (std::isnan(readback[j])) nans++;
+                        float v = readback[j];
+                        if (std::isnan(v)) { s.nans++; continue; }
+                        if (std::isinf(v)) { s.infs++; continue; }
+                        float a = std::fabs(v);
+                        if (a > s.max_finite_abs) s.max_finite_abs = a;
                     }
-                    return nans;
+                    s.scannable = true;
+                    return s;
                 }
                 if (t->type == GGML_TYPE_F16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
-                    // F16 NaN: exp==0x1F (5-bit exp all ones) AND mantissa != 0
-                    // F16 Inf: exp==0x1F AND mantissa == 0  → not counted here
+                    // F16: exp==0x1F (all ones, 5-bit) AND mantissa != 0 → NaN; mant == 0 → Inf
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
                         uint16_t exp = (v >> 10) & 0x1F;
                         uint16_t mant = v & 0x3FF;
-                        if (exp == 0x1F && mant != 0) nans++;
+                        if (exp == 0x1F) {
+                            if (mant != 0) s.nans++; else s.infs++;
+                            continue;
+                        }
+                        // Decode F16→F32 for max_finite_abs.
+                        // ggml provides ggml_compute_fp16_to_fp32 / GGML_CPU_FP16_TO_FP32 macros;
+                        // use a portable inline path here.
+                        uint32_t sign = (v & 0x8000u) << 16;
+                        uint32_t e    = exp;
+                        uint32_t m    = mant;
+                        uint32_t f;
+                        if (e == 0) {
+                            if (m == 0) { f = sign; }
+                            else {
+                                // subnormal
+                                e = 1;
+                                while ((m & 0x400) == 0) { m <<= 1; e--; }
+                                m &= 0x3FF;
+                                f = sign | (((e + 127 - 15) << 23)) | (m << 13);
+                            }
+                        } else {
+                            f = sign | ((e + 127 - 15) << 23) | (m << 13);
+                        }
+                        float fv;
+                        std::memcpy(&fv, &f, sizeof(fv));
+                        float a = std::fabs(fv);
+                        if (a > s.max_finite_abs) s.max_finite_abs = a;
                     }
-                    return nans;
+                    s.scannable = true;
+                    return s;
                 }
                 if (t->type == GGML_TYPE_BF16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
-                    // BF16 NaN: exp==0xFF (8-bit exp all ones) AND mantissa != 0
-                    // BF16 Inf: exp==0xFF AND mantissa == 0  → not counted here
+                    // BF16: exp==0xFF (8-bit) AND mantissa != 0 → NaN; mant == 0 → Inf
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
                         uint16_t exp = (v >> 7) & 0xFF;
                         uint16_t mant = v & 0x7F;
-                        if (exp == 0xFF && mant != 0) nans++;
+                        if (exp == 0xFF) {
+                            if (mant != 0) s.nans++; else s.infs++;
+                            continue;
+                        }
+                        // BF16 → F32: just shift left by 16.
+                        uint32_t f = ((uint32_t)v) << 16;
+                        float fv;
+                        std::memcpy(&fv, &f, sizeof(fv));
+                        float a = std::fabs(fv);
+                        if (a > s.max_finite_abs) s.max_finite_abs = a;
                     }
-                    return nans;
+                    s.scannable = true;
+                    return s;
                 }
-                return -1;
+                return s;  // not scannable
+            };
+            // Backward-compat wrapper for existing call sites that just want the
+            // NaN count. Returns -1 for non-scannable dtypes.
+            auto count_nans = [&](struct ggml_tensor* t) -> int64_t {
+                ScanStats s = scan_tensor(t);
+                return s.scannable ? s.nans : -1;
             };
 
             for (int i = 0; i < n_nodes; i++) {
@@ -2219,31 +2276,33 @@ public:
                 ggml_backend_synchronize(runtime_backend);
 
                 int64_t n   = ggml_nelements(node);
-                int64_t nans = count_nans(node);
-                if (nans < 0) continue;  // non-scannable dtype (quant blocks, I32 etc.)
-                if (nans > 0) {
-                    LOG_ERROR("[FIRST-NAN] %s: node %d/%d op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld",
+                ScanStats node_stats = scan_tensor(node);
+                if (!node_stats.scannable) continue;  // non-scannable dtype (quant blocks, I32 etc.)
+                if (node_stats.nans > 0) {
+                    LOG_ERROR("[FIRST-NAN] %s: node %d/%d op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld inf=%lld max_abs=%g",
                               get_desc().c_str(), i, n_nodes,
                               ggml_op_name(node->op), ggml_get_name(node),
                               (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
                               ggml_type_name(node->type),
-                              (long long)nans, (long long)n);
+                              (long long)node_stats.nans, (long long)n,
+                              (long long)node_stats.infs, node_stats.max_finite_abs);
                     for (int s = 0; s < GGML_MAX_SRC; s++) {
                         struct ggml_tensor* src = node->src[s];
                         if (src == nullptr) continue;
-                        int64_t src_n    = ggml_nelements(src);
-                        int64_t src_nans = count_nans(src);
-                        if (src_nans < 0) {
+                        int64_t src_n     = ggml_nelements(src);
+                        ScanStats src_stats = scan_tensor(src);
+                        if (!src_stats.scannable) {
                             LOG_ERROR("[FIRST-NAN]   src[%d]: op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s (non-F32, not scanned)",
                                       s, ggml_op_name(src->op), ggml_get_name(src),
                                       (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3],
                                       ggml_type_name(src->type));
                         } else {
-                            LOG_ERROR("[FIRST-NAN]   src[%d]: op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld",
+                            LOG_ERROR("[FIRST-NAN]   src[%d]: op=%s name='%s' shape=[%ld,%ld,%ld,%ld] type=%s nans=%lld/%lld inf=%lld max_abs=%g",
                                       s, ggml_op_name(src->op), ggml_get_name(src),
                                       (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3],
                                       ggml_type_name(src->type),
-                                      (long long)src_nans, (long long)src_n);
+                                      (long long)src_stats.nans, (long long)src_n,
+                                      (long long)src_stats.infs, src_stats.max_finite_abs);
                         }
                     }
                     first_nan_node = i;
