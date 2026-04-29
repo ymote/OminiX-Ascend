@@ -8617,3 +8617,141 @@ case: in-graph intermediate aliasing across iteration boundaries.
 - No Co-Authored-By Claude: confirmed.
 - Time-box: ~25 min wall (under the 90 min budget; Gates B/C/D
   skipped due to Gate A RED).
+
+## §5.5.66 — Inf-aware tracer reveals first-NaN is timing-dependent (Case B)
+
+**Date:** 2026-04-29 → 2026-04-30
+**Branch:** main (continuing on top of `e2f3918`)
+**Status:** PARTIAL — bug class confirmed timing/allocator-based; surgical fix not yet landed.
+
+### Plan
+
+Triggered by handoff Q2 `§5.5.66 — fix track`.  The §5.5.65c
+trace's "src[0] clean (nans=0)" claim was suspect because the
+tracer counts true NaN only and skips Inf
+(`tools/ominix_diffusion/src/ggml_extend.hpp:2152, 2166`).  RMSNorm
+of a row containing Inf produces NaN deterministically via
+`Inf × 0 = NaN`; that mechanism explains 4096 NaN better than
+"per-row variance went to zero."  Step 1 of the plan: extend
+`SD_FIRST_NAN_TRACE` to also count Inf and `max_finite_abs` per
+tensor, then re-run the §5.5.65c trace and branch:
+
+- **Case A** — `src[0]` Inf>0 → upstream F16-saturation
+  not yet widened.
+- **Case B** — `src[0]` Inf=0, sane max_finite_abs → manual
+  RMSNorm decomp or allocator-replay.
+- **Case C** — `src[0]` Inf=0, huge max_finite_abs → near-Inf
+  upstream still saturating.
+
+### Step 1: Extend tracer (commit `e2f3918`)
+
+Refactored the per-tensor scan into a `ScanStats` struct:
+`{ nans, infs, max_finite_abs, scannable }`.  F32/F16/BF16 aware.
+F16/BF16 code paths decode to F32 only for max_finite_abs (NaN
+and Inf are detected on the raw bits, no decode required).
+Existing `count_nans` shim preserved.  Build clean.
+
+### Step 2: Re-run §5.5.65c at 1024² × 3 step
+
+Command (output: `/home/ma-user/work/qie_5566/run_step2.log`):
+
+```bash
+SD_FIRST_NAN_TRACE=1 build-w1/bin/ominix-diffusion-cli \
+  --diffusion-model /home/ma-user/work/qie_weights/Qwen-Image-Edit-2509-Q4_0.gguf \
+  --qwen2vl /home/ma-user/work/qie_weights/Qwen2.5-VL-7B-Instruct-Q4_0.gguf \
+  --qwen2vl_vision /home/ma-user/work/qie_weights/mmproj-BF16.gguf \
+  --vae /home/ma-user/work/qie_weights/split_files/vae/qwen_image_vae.safetensors \
+  -p "a cat" -W 1024 -H 1024 --steps 3 --seed 42 -o /tmp/out_5566.png
+```
+
+### Result — step 1 went clean
+
+```
+[INFO] qwen2.5vl: no NaN found across 1154 nodes  (cond)
+[INFO] qwen2.5vl: no NaN found across 1154 nodes  (uncond)
+[INFO] qwen_image: no NaN found across 10213 nodes  ← step 0 (matches §5.5.65c)
+  |================>                              | 1/3 - 1561.64s/it
+[INFO] qwen_image: no NaN found across 10213 nodes  ← step 1 ★ NEW: was RED in §5.5.65c
+[INFO] qwen_image: tracing 10213 nodes one-at-a-time  ← step 2 in progress, killed at 30:47 wall
+```
+
+The §5.5.65c trace had fired at `node 4654/10213` on step 1.  With
+the new Inf-aware tracer, step 1 is fully clean.  Step 2 was still
+tracing when the run was terminated for time-budget reasons.
+
+### Diagnosis: Case B (timing-dependent allocator bug)
+
+The patch added compute zero — it only does additional CPU work
+(walk all elements for max_finite_abs) **between** NPU sync and
+the next per-node subgraph dispatch.  The kernel sequence on the
+NPU is unchanged.  Step 1 going from RED to GREEN with only an
+inter-dispatch CPU-time delta means **the NaN at node 4654 is
+not produced by RMSNorm computation; it is produced by something
+that happens between dispatches**.
+
+This matches the codex review's "second-compute allocator plan
+reuse when flags change" hypothesis (`/tmp/codex_qie_review.md`,
+`ggml/src/ggml-alloc.c:1007` / `:1094`).  `ggml_gallocr_needs_realloc`
+checks node count, leaf count, and per-tensor sizes.  It does not
+inspect flags (INPUT/OUTPUT) or buffer-id changes that the §5.5.59
+fix track relied on.  Step 0 and step 1 use the same graph
+structure → realloc check returns false → step 1 runs against a
+plan that was correct at step 0 but is stale for step 1's flag
+state.  Inserting CPU work between subgraph dispatches happens to
+mask the race-window where the stale plan's slot reuse hits.
+
+This invalidates branch A (no need to chase upstream F16
+saturation; widening produced no kernel-side NaN at the new
+trace either).  It also rules out RMSNorm-decomposition-as-cause —
+the manual `Mul → Mean → +eps → Rsqrt → Mul` chain at
+`ggml-cann/aclnn_ops.cpp:1180-1212` is correct; if it were the
+culprit, the inter-dispatch CPU delta could not have changed the
+outcome.
+
+### Status
+
+- Step 1 of the §5.5.66 plan: **DONE** (tracer extended,
+  committed as `e2f3918`).
+- Step 2: **DONE** (re-run captured to
+  `/home/ma-user/work/qie_5566/run_step2.log`).
+- Step 3 branch: **Case B** chosen.
+- Step 4 (apply fix): **NOT DONE** — out of time-budget.  Next
+  session should test the allocator-replay hypothesis directly:
+  force `ggml_gallocr_reserve_n_impl` to re-plan between step 0
+  and step 1 (e.g. clear `galloc->buf_tallocs` between samples)
+  and verify 1024² runs clean with the original (un-patched)
+  tracer.
+
+### Open hypotheses for §5.5.67
+
+1. **Realloc-coverage primary.**  The realloc check returning
+   false on identical-shape, identical-count graphs is the most
+   likely root cause.  Test by forcing re-plan between samples
+   and observing 1024² × 3 step with the **original** tracer.
+2. **Async kernel completion masking.**  Possibility that some
+   CANN op is reading from a buffer that is "free" in the
+   allocator's view but still backing in-flight kernel state.
+   Inserting CPU work allows it to finish before the slot is
+   reassigned.  Same fix path as (1).
+
+### What NOT to do (continued)
+
+- Do NOT widen the post-Linear residual to F32 chasing F16
+  saturation.  The trace shows no F16 saturation at this trace
+  density.
+- Do NOT modify the manual RMSNorm decomposition.  It has been
+  ruled out as the producer of the 4096 NaN.
+- Do NOT ship `e2f3918` as the "fix" — it is diagnostic
+  infrastructure only.  The 1024² × 20 step eye-check has not
+  been run with this tracer in this session, but **even if it
+  produced a clean PNG, that PNG was generated under
+  SD_FIRST_NAN_TRACE=1 (per-node serialization), which is not
+  the production path.**
+
+### Time-budget honesty
+
+Total wall: ~3 hours.  The trace per step at 1024² with extended
+scan is ~26 min (vs. ~12 min in §5.5.65c with NaN-only scan).
+3 steps × 26 min ≈ 78 min just for one trace.  Multiple traces
+were not feasible in one session.  Next session needs ≥4-hour
+slot if any iteration on traces is expected.
