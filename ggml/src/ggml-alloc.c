@@ -466,6 +466,13 @@ struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    // §5.5.67: cache GGML_TENSOR_FLAG_INPUT / GGML_TENSOR_FLAG_OUTPUT (and
+    // friends) so ggml_gallocr_needs_realloc() can detect annotation
+    // changes between successive compute() calls. The realloc check
+    // previously inspected only counts and sizes, missing the case where
+    // the same graph is rebuilt with different INPUT/OUTPUT flags between
+    // sampler steps -- step N+1 then reused step N's stale plan.
+    int32_t flags;
 };
 
 struct leaf_alloc {
@@ -618,6 +625,37 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
+// 5.5.62: walk view-source chain recursively to find ground tensor.
+// A view-of-view-of-INPUT is morally still INPUT data.
+static struct ggml_tensor * ggml_gallocr_view_root(struct ggml_tensor * t) {
+    int safety = 0;
+    while (t != NULL && t->src[0] != NULL && safety++ < 32) {
+        if (t->op == GGML_OP_CONT ||
+            t->op == GGML_OP_VIEW ||
+            t->op == GGML_OP_RESHAPE ||
+            t->op == GGML_OP_PERMUTE ||
+            t->op == GGML_OP_TRANSPOSE) {
+            t = t->src[0];
+        } else {
+            break;
+        }
+    }
+    return t;
+}
+
+// 5.5.63: evidence-driven trace. Gated by env GGML_GALLOC_TRACE=1.
+// Emits one line per ALLOC/REUSE/FREE/SKIP event so we can find the
+// offending alias pair empirically (view-chain hypothesis exhausted).
+static int ggml_gallocr_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_GALLOC_TRACE");
+        cached = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+#define GALLOC_TRACE(...) do { if (ggml_gallocr_trace_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -651,6 +689,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     AT_PRINTF("not reusing parent %s for %s as it is an input\n", parent->name, node->name);
                     continue;
                 }
+                // 5.5.62: parent is a (possibly chained) view of an INPUT -- same protection.
+                {
+                    struct ggml_tensor * parent_root = ggml_gallocr_view_root(parent);
+                    if (parent_root != NULL && (parent_root->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        AT_PRINTF("not reusing parent %s for %s (view chain -> input %s)\n", parent->name, node->name, parent_root->name);
+                        continue;
+                    }
+                }
 
                 if (!ggml_are_same_layout(node, parent)) {
                     AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
@@ -669,6 +715,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             hn->addr = p_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
+                            GALLOC_TRACE("[GALLOC] REUSE_VIEW node=%s op=%d parent=%s view_src=%s chunk=%d off=%zu ne=[%lld,%lld,%lld,%lld]\n",
+                                node->name, (int)node->op, parent->name, view_src->name, (int)hn->addr.chunk, hn->addr.offset,
+                                (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
                             return;
                         }
@@ -677,6 +726,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
+                        GALLOC_TRACE("[GALLOC] REUSE_PARENT node=%s op=%d parent=%s chunk=%d off=%zu ne=[%lld,%lld,%lld,%lld]\n",
+                            node->name, (int)node->op, parent->name, (int)hn->addr.chunk, hn->addr.offset,
+                            (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3]);
                         ggml_gallocr_free_extra_space(galloc, node, parent);
                         return;
                     }
@@ -689,6 +741,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        GALLOC_TRACE("[GALLOC] ALLOC node=%s op=%d type=%d chunk=%d off=%zu size=%zu ne=[%lld,%lld,%lld,%lld] flags=0x%x\n",
+            node->name, (int)node->op, (int)node->type, (int)hn->addr.chunk, hn->addr.offset, size,
+            (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3], (unsigned)node->flags);
     }
 }
 
@@ -696,6 +751,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
+        GALLOC_TRACE("[GALLOC] SKIP_OUTPUT node=%s\n", node->name);
         return;
     }
     // §5.5.59: graph INPUT leaves are never freed either. Their host-side
@@ -706,7 +762,20 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     // §5.5.53b leaf-INPUT allocation fix.
     if (node->flags & GGML_TENSOR_FLAG_INPUT) {
         AT_PRINTF("not freeing input %s\n", node->name);
+        GALLOC_TRACE("[GALLOC] SKIP_INPUT node=%s\n", node->name);
         return;
+    }
+    // 5.5.62: A (possibly chained) view of an INPUT is morally still input data --
+    // its slot must survive across compute() boundaries, otherwise gallocr
+    // recycles the slot at sim-time and the runtime read-back picks up
+    // clobbered bytes (NaN at 1024^2 multi-step). Pairs with 5.5.59.
+    {
+        struct ggml_tensor * root = ggml_gallocr_view_root(node);
+        if (root != NULL && (root->flags & GGML_TENSOR_FLAG_INPUT) && root != node) {
+            AT_PRINTF("not freeing %s (view chain -> input %s)\n", node->name, root->name);
+            GALLOC_TRACE("[GALLOC] SKIP_VIEW_INPUT node=%s root=%s\n", node->name, root->name);
+            return;
+        }
     }
 
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -717,6 +786,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 
     AT_PRINTF("%s: freeing %s at {chunk=%d, offset=%zu} (%zu bytes) - n_free_blocks = %d\n",
         __func__, node->name, hn->addr.chunk, hn->addr.offset, size, alloc->chunks[hn->addr.chunk]->n_free_blocks);
+    GALLOC_TRACE("[GALLOC] FREE node=%s op=%d type=%d chunk=%d off=%zu size=%zu ne=[%lld,%lld,%lld,%lld] flags=0x%x\n",
+        node->name, (int)node->op, (int)node->type, (int)hn->addr.chunk, hn->addr.offset, size,
+        (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3], (unsigned)node->flags);
 #ifdef GGML_ALLOCATOR_DEBUG
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
@@ -881,6 +953,7 @@ static bool ggml_gallocr_reserve_n_impl(
             node_alloc->dst.addr = hn->addr;
             node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
         }
+        node_alloc->dst.flags = node->flags; // §5.5.67
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (!src || src->view_src || src->data) {
@@ -893,6 +966,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 node_alloc->src[j].addr = hn->addr;
                 node_alloc->src[j].size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], src);
             }
+            node_alloc->src[j].flags = src ? src->flags : 0; // §5.5.67
         }
     }
     if (galloc->n_leafs < graph->n_leafs) {
@@ -919,6 +993,7 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
             galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
         }
+        galloc->leaf_allocs[i].leaf.flags = leaf->flags; // §5.5.67
     }
 
     // reallocate buffers if needed
@@ -1052,6 +1127,20 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             return true;
         }
 
+        // §5.5.67: detect INPUT/OUTPUT (and other) flag changes vs cached plan.
+        // The previous check inspects only sizes, so flag re-annotations
+        // between successive compute() calls (e.g. clobbered + restored
+        // GGML_TENSOR_FLAG_INPUT on a leaf at sampler step boundary) silently
+        // re-used the stale plan -- producing nondeterministic NaN at 1024^2
+        // step >= 1. See docs/qie_q2_phase4_smoke.md §5.5.66.
+        if ((int32_t)node->flags != node_alloc->dst.flags) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: node %s flags changed (0x%x -> 0x%x)\n",
+                __func__, node->name, (unsigned)node_alloc->dst.flags, (unsigned)node->flags);
+#endif
+            return true;
+        }
+
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (src == NULL) {
@@ -1063,6 +1152,34 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #endif
                 return true;
             }
+            // §5.5.67: same flag check on srcs.
+            if ((int32_t)src->flags != node_alloc->src[j].flags) {
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: src %d (%s) of node %s flags changed (0x%x -> 0x%x)\n",
+                    __func__, j, src->name, node->name,
+                    (unsigned)node_alloc->src[j].flags, (unsigned)src->flags);
+#endif
+                return true;
+            }
+        }
+    }
+
+    // §5.5.67: leaf flag check. Leaves are not iterated above but their
+    // flag-driven allocation path (is_input branch in reserve) is exactly
+    // where the original §5.5.59 fix lives, so flag mutation here is the
+    // most likely realloc trigger to miss.
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        if (i >= galloc->n_leafs) {
+            return true;
+        }
+        if ((int32_t)leaf->flags != galloc->leaf_allocs[i].leaf.flags) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s flags changed (0x%x -> 0x%x)\n",
+                __func__, leaf->name,
+                (unsigned)galloc->leaf_allocs[i].leaf.flags, (unsigned)leaf->flags);
+#endif
+            return true;
         }
     }
 
