@@ -2170,6 +2170,13 @@ public:
                 double  max_finite_abs;
                 bool    scannable;
             };
+            // §5.5.67 Step 4: legacy tracer toggle.
+            // SD_FIRST_NAN_TRACE_LEGACY=1 reverts to the §5.5.65-style scan:
+            // count true NaN only, skip Inf, skip max_finite_abs work. This
+            // minimizes inter-dispatch CPU time so we can verify the §5.5.67
+            // gallocr-flag fix actually closes the bug (rather than just
+            // adding another timing perturbation that hides it).
+            const bool legacy_scan = (getenv("SD_FIRST_NAN_TRACE_LEGACY") != nullptr);
             auto scan_tensor = [&](struct ggml_tensor* t) -> ScanStats {
                 ScanStats s{0, 0, 0.0, false};
                 if (t == nullptr) return s;
@@ -2178,6 +2185,14 @@ public:
                 if (t->type == GGML_TYPE_F32) {
                     readback.resize((size_t)n);
                     ggml_backend_tensor_get(t, readback.data(), 0, n * sizeof(float));
+                    if (legacy_scan) {
+                        // §5.5.65: NaN-only path, no Inf, no max_finite_abs.
+                        for (int64_t j = 0; j < n; j++) {
+                            if (std::isnan(readback[j])) s.nans++;
+                        }
+                        s.scannable = true;
+                        return s;
+                    }
                     for (int64_t j = 0; j < n; j++) {
                         float v = readback[j];
                         if (std::isnan(v)) { s.nans++; continue; }
@@ -2191,6 +2206,16 @@ public:
                 if (t->type == GGML_TYPE_F16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
+                    if (legacy_scan) {
+                        for (int64_t j = 0; j < n; j++) {
+                            uint16_t v = raw[j];
+                            uint16_t exp = (v >> 10) & 0x1F;
+                            uint16_t mant = v & 0x3FF;
+                            if (exp == 0x1F && mant != 0) s.nans++;
+                        }
+                        s.scannable = true;
+                        return s;
+                    }
                     // F16: exp==0x1F (all ones, 5-bit) AND mantissa != 0 → NaN; mant == 0 → Inf
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
@@ -2230,6 +2255,16 @@ public:
                 if (t->type == GGML_TYPE_BF16) {
                     std::vector<uint16_t> raw((size_t)n);
                     ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(uint16_t));
+                    if (legacy_scan) {
+                        for (int64_t j = 0; j < n; j++) {
+                            uint16_t v = raw[j];
+                            uint16_t exp = (v >> 7) & 0xFF;
+                            uint16_t mant = v & 0x7F;
+                            if (exp == 0xFF && mant != 0) s.nans++;
+                        }
+                        s.scannable = true;
+                        return s;
+                    }
                     // BF16: exp==0xFF (8-bit) AND mantissa != 0 → NaN; mant == 0 → Inf
                     for (int64_t j = 0; j < n; j++) {
                         uint16_t v = raw[j];
