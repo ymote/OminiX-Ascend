@@ -3677,9 +3677,35 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // per-block dir to verify identical input to mod1 matmul.
     dump_tensor_f32("01_silu_t_emb.f32", scratch_q_dev_, H, /*is_f16*/ true);
 
+    // Q2.4.5.5.13c: BF16 widening for img_mod.1 / txt_mod.1 matmul outputs.
+    // Mirrors §5.5.45/46 QKV (line 3846) + §5.5.45/46 ff_down (line 4377)
+    // pattern. Per agent #202's pure-F32 numpy oracle (cos=1.000000 vs
+    // engine, oracle absmax 491 ≈ engine 491.5 at block-1 img_mod.1) the
+    // matmul output magnitudes are intrinsic to the trained Q4_0 / Q5_K
+    // weights and are reproduced bit-exactly. The §5.5.13/§5.5.47 polka-
+    // dot pattern at 256²×20 traces to F16 saturation in the downstream
+    // residual chain (over ~27 blocks `(1+491)*x_LN1` accumulates past
+    // 65504). Widening this matmul output to BF16 lets the chunks store
+    // up to F32 dynamic range losslessly. The downstream consumer
+    // (modulate_) is F16-only, so we cast BF16→F16 in place before the
+    // chunk reader; this is functionally equivalent to F16-store *until*
+    // any individual element exceeds 65504, in which case BF16 storage
+    // preserves it where F16 would have saturated to ±Inf.
+    // Default OFF on this commit; flip to ON once verified.
+    static int s_mod_bf16 = -1;
+    if (s_mod_bf16 < 0) {
+        const char *v = std::getenv("QIE_MOD_BF16");
+        s_mod_bf16 = (v && *v && v[0] != '0') ? 1 : 0;
+        QIE_LOG("forward_block_: QIE_MOD_BF16=%d (1=BF16 storage on "
+                "img_mod.1 / txt_mod.1 matmul outputs, BF16→F16 cast "
+                "before chunk reader; 0=legacy F16 output)", s_mod_bf16);
+    }
+    const aclDataType mod_out_dtype = s_mod_bf16 ? ACL_BF16 : ACL_FLOAT16;
+
     // img_mod_params = img_mod.1 Linear → scratch_mod_dev_[0 .. 6H)
     if (!dispatch_matmul_(scratch_q_dev_, lw.img_mod_w_q4, lw.img_mod_scale,
-                          lw.img_mod_b, B, H, 6 * H, scratch_mod_dev_))
+                          lw.img_mod_b, B, H, 6 * H, scratch_mod_dev_,
+                          mod_out_dtype))
         return false;
     intra_probe("02_img_mod_out", scratch_mod_dev_, 6 * H, true);
     // Q2.4.5.5.33: dump mod1 matmul output BEFORE chunk/modulate.
@@ -3688,11 +3714,27 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     if (!dispatch_matmul_(scratch_q_dev_, lw.txt_mod_w_q4, lw.txt_mod_scale,
                           lw.txt_mod_b, B, H, 6 * H,
                           (uint8_t *)scratch_mod_dev_ + (size_t)6 * H *
-                                                          sizeof(uint16_t)))
+                                                          sizeof(uint16_t),
+                          mod_out_dtype))
         return false;
     intra_probe("03_txt_mod_out",
                 (uint8_t *)scratch_mod_dev_ + (size_t)6 * H * sizeof(uint16_t),
                 6 * H, true);
+
+    // Q2.4.5.5.13c: cast BF16 → F16 in place so downstream modulate_ /
+    // gated_residual_ (which build F16 tensors over scratch_mod_dev_
+    // chunks) see canonical F16 bytes. BF16 → F16 saturates to ±Inf if
+    // |x| > 65504; we accept that cost — without this widening the F16
+    // matmul-output store would have saturated identically. The win is
+    // that the BF16 intermediate accumulator inside the matmul and the
+    // BF16 storage itself preserve any in-range-of-BF16-but-out-of-range-
+    // of-F16 values until the cast point, instead of clamping at the
+    // store-cast inside dispatch_matmul_'s F16 store path.
+    if (s_mod_bf16) {
+        if (!cast_bf16_to_f16_(scratch_mod_dev_, scratch_mod_dev_,
+                                 (int64_t)12 * H))
+            return false;
+    }
 
     // Chunk pointers (6 × H each).
     // Q2.4.5.4g — empirically validated chunk order. The HF Diffusers
