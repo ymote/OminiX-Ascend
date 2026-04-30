@@ -52,6 +52,104 @@ struct Conditioner {
     }
 };
 
+// =============================================================================
+// CFG-batching support (issue #99).
+//
+// When CFG batching is enabled (OMINIX_CFG_BATCHED=1, see stable-diffusion.cpp)
+// the cond and uncond branches are stacked along ne[3]=2 and dispatched in a
+// single diffusion-model compute. The two branches' c_crossattn tensors come
+// from independent prompts, so their text seq_len (ne[1]) generally differ.
+// A clean batched concat requires both sides to share a common seq_len axis.
+//
+// `PaddedCondPair` holds:
+//   - `cond`/`uncond`   : SDConditions whose c_crossattn is right-padded with
+//                         zeros to a shared max_len on ne[1]. All other fields
+//                         (c_vector, c_concat, extra_c_crossattns) are passed
+//                         through untouched — they are not seq_len-shaped.
+//   - `valid_lens`      : per-batch valid token counts {s_cond, s_uncond}, in
+//                         row-major batch order. The downstream attention-mask
+//                         generator consumes this directly to mask out the
+//                         zero-padded slots so cross-attention does not pick
+//                         up garbage from the padding region.
+//   - `max_len`         : max(s_cond, s_uncond), the shared ne[1] of both
+//                         padded c_crossattn tensors.
+//
+// When CFG batching is OFF, callers never touch `pad_cond_uncond_for_cfg` and
+// this code is dead — the byte-identical sequential path is preserved.
+// =============================================================================
+struct PaddedCondPair {
+    SDCondition cond;
+    SDCondition uncond;
+    std::vector<int64_t> valid_lens;  // [s_cond, s_uncond]
+    int64_t max_len = 0;
+};
+
+// Right-pad a 3-D c_crossattn-style tensor [D, S, 1] (ne[3]=1) with zeros on
+// the S-axis up to `target_len`. Returns the original tensor when S already
+// equals target_len (no copy, no allocation). When S < target_len, allocates a
+// new work_ctx tensor of shape [D, target_len, ne[2], 1] with the original
+// content copied into rows [0, S) and rows [S, target_len) zero-filled.
+//
+// The pad value is exactly 0.0f (in whatever dtype the source uses); paired
+// with the additive attention mask that sets padded-key columns to -INFINITY,
+// the zero-padded slots cannot influence attention output.
+__STATIC_INLINE__ struct ggml_tensor* pad_crossattn_to_len_(struct ggml_context* work_ctx,
+                                                            struct ggml_tensor* src,
+                                                            int64_t target_len) {
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(src->ne[3] == 1);
+    if (src->ne[1] == target_len) {
+        return src;  // no-op fast path
+    }
+    GGML_ASSERT(src->ne[1] < target_len);  // never asked to truncate
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(src->ne[2] == 1);  // c_crossattn layout is [D, S, 1, 1]
+    struct ggml_tensor* dst = ggml_new_tensor_4d(work_ctx, src->type,
+                                                 src->ne[0], target_len,
+                                                 src->ne[2], src->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    std::memset(dst->data, 0, ggml_nbytes(dst));
+    // Contiguous [D, S, 1, 1]: each row on the S-axis spans nb[1] bytes; copy
+    // src->ne[1] valid rows into the front, leave the tail zero-filled.
+    const size_t valid_bytes = static_cast<size_t>(src->ne[1]) * src->nb[1];
+    memcpy(dst->data, src->data, valid_bytes);
+    return dst;
+}
+
+// Pad cond.c_crossattn and uncond.c_crossattn to a common seq_len of
+// max(cond.seq_len, uncond.seq_len), reporting the original (valid) lengths
+// for downstream attention masking. Returns a PaddedCondPair; the caller wires
+// valid_lens into the attention mask generator (see cfg_build_attention_mask
+// in stable-diffusion.cpp). If either branch's c_crossattn is null, returns
+// the inputs untouched with valid_lens = {0, 0} — caller must handle nulls.
+__STATIC_INLINE__ PaddedCondPair pad_cond_uncond_for_cfg(struct ggml_context* work_ctx,
+                                                         const SDCondition& cond,
+                                                         const SDCondition& uncond) {
+    PaddedCondPair out;
+    out.cond   = cond;
+    out.uncond = uncond;
+    out.valid_lens = {0, 0};
+    out.max_len    = 0;
+
+    if (cond.c_crossattn == nullptr || uncond.c_crossattn == nullptr) {
+        return out;
+    }
+    GGML_ASSERT(cond.c_crossattn->type == uncond.c_crossattn->type);
+    GGML_ASSERT(cond.c_crossattn->ne[0] == uncond.c_crossattn->ne[0]);
+    GGML_ASSERT(cond.c_crossattn->ne[3] == 1);
+    GGML_ASSERT(uncond.c_crossattn->ne[3] == 1);
+
+    const int64_t s_cond   = cond.c_crossattn->ne[1];
+    const int64_t s_uncond = uncond.c_crossattn->ne[1];
+    const int64_t s_max    = std::max(s_cond, s_uncond);
+
+    out.cond.c_crossattn   = pad_crossattn_to_len_(work_ctx, cond.c_crossattn,   s_max);
+    out.uncond.c_crossattn = pad_crossattn_to_len_(work_ctx, uncond.c_crossattn, s_max);
+    out.valid_lens         = {s_cond, s_uncond};
+    out.max_len            = s_max;
+    return out;
+}
+
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
 // Ref: https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/cad87bf4e3e0b0a759afa94e933527c3123d59bc/modules/sd_hijack_clip.py#L283
 struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {

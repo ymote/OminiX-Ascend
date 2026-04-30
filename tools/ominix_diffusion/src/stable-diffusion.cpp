@@ -201,17 +201,28 @@ __STATIC_INLINE__ struct ggml_tensor* cfg_dup_timesteps(struct ggml_context* wor
 // — trivial. At 1024×1024 (~8200 tokens) ≈ 12.6 GiB — too large; callers
 // should fall back to sequential when resolution pushes the mask budget (see
 // CFG_BATCHED_MAX_MASK_BYTES guard in the dispatch site).
+// `valid_lens` is the per-row valid-length array from
+// PaddedCondPair::valid_lens (indexed by batch position 0=cond, 1=uncond).
+// Each entry s_valid satisfies 0 < s_valid <= s_max; the mask sets KEY columns
+// [s_valid, s_max) on every query row to -INFINITY for that batch slot. When
+// every entry already equals s_max (i.e. cond and uncond share seq_len), the
+// mask is identity-zero and we return nullptr to skip the add (byte-identical
+// math to the unbatched path).
 __STATIC_INLINE__ struct ggml_tensor* cfg_build_attention_mask(struct ggml_context* work_ctx,
-                                                               int64_t s_cond,
-                                                               int64_t s_uncond,
+                                                               const std::vector<int64_t>& valid_lens,
                                                                int64_t s_max,
                                                                int64_t n_non_text_tokens,
                                                                int64_t n_head) {
-    if (s_cond == s_uncond) {
+    GGML_ASSERT(valid_lens.size() == 2);
+    const int64_t s_cond   = valid_lens[0];
+    const int64_t s_uncond = valid_lens[1];
+    GGML_ASSERT(s_cond > 0 && s_uncond > 0);
+    GGML_ASSERT(s_cond <= s_max && s_uncond <= s_max);
+    if (s_cond == s_max && s_uncond == s_max) {
         return nullptr;
     }
     const int64_t L_total = s_max + n_non_text_tokens;
-    const int64_t N       = 2;
+    const int64_t N       = static_cast<int64_t>(valid_lens.size());
     // Mask shape: [L_k, L_q, n_head*N, 1].
     struct ggml_tensor* mask = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32,
                                                   L_total, L_total, n_head * N, 1);
@@ -221,7 +232,11 @@ __STATIC_INLINE__ struct ggml_tensor* cfg_build_attention_mask(struct ggml_conte
 
     // Build a single-batch mask template once, then memcpy-tile it n_head
     // times per batch. Template: all zeros except columns [s_valid, s_max) =
-    // -INFINITY.
+    // -INFINITY. Driven by valid_lens[batch_idx] so the mask correctly tracks
+    // each branch's padding. (Issue #99: previously the call site inferred
+    // s_cond / s_uncond directly; now both the conditioner-side pad and the
+    // mask-side mask consume the same valid_lens array, eliminating any drift
+    // between padded-tensor shape and per-row valid-length signal.)
     auto fill_batch = [&](int64_t batch_idx, int64_t s_valid) {
         // First head slot for this batch: compute once.
         float* head0 = mdata + batch_idx * stride_batch;
@@ -239,8 +254,9 @@ __STATIC_INLINE__ struct ggml_tensor* cfg_build_attention_mask(struct ggml_conte
             memcpy(head0 + h * stride_head, head0, stride_head * sizeof(float));
         }
     };
-    fill_batch(0, s_cond);
-    fill_batch(1, s_uncond);
+    for (int64_t b = 0; b < N; ++b) {
+        fill_batch(b, valid_lens[b]);
+    }
     return mask;
 }
 
@@ -2358,21 +2374,39 @@ public:
             bool took_batched_path = false;
             if (cfg_batched_eligible) {
                 // -------- Batched path --------
-                // Stack cond + uncond context with right-padding on S-axis, build additive
-                // attention mask when S_cond != S_uncond, duplicate x / timesteps / refs
-                // across ne[3]=2, dispatch one compute(), then split output into cond/uncond.
-                int64_t s_cond   = 0;
-                int64_t s_uncond = 0;
-                int64_t s_max    = 0;
+                // Step 1 (issue #99): pad cond/uncond c_crossattn to a common
+                // seq_len in the conditioner-side helper, returning the
+                // per-row valid-length array used to drive both the stacked
+                // tensor and the additive attention mask. Without this, an
+                // S_cond != S_uncond pair could not be cleanly concatenated
+                // for batched attention; with it, padding and mask are
+                // produced together so they cannot drift.
+                PaddedCondPair padded = pad_cond_uncond_for_cfg(work_ctx, cond, uncond);
+                const int64_t s_max   = padded.max_len;
+
+                // Step 2: stack the equal-length padded contexts on ne[2]=2.
+                // cfg_stack_context_padded accepts already-equal-length inputs
+                // as a fast path (no extra copy beyond the stack itself).
+                int64_t stack_s_cond_unused   = 0;
+                int64_t stack_s_uncond_unused = 0;
+                int64_t stack_s_max_unused    = 0;
                 struct ggml_tensor* ctx_batched =
-                    cfg_stack_context_padded(work_ctx, cond.c_crossattn, uncond.c_crossattn,
-                                             s_cond, s_uncond, s_max);
+                    cfg_stack_context_padded(work_ctx,
+                                             padded.cond.c_crossattn,
+                                             padded.uncond.c_crossattn,
+                                             stack_s_cond_unused,
+                                             stack_s_uncond_unused,
+                                             stack_s_max_unused);
 
                 int64_t non_text_tokens = cfg_count_non_text_tokens_qwen_image(noised_input, ref_latents, /*patch_size=*/2);
                 // Qwen-Image has 24 attention heads (see QwenImageParams::num_attention_heads).
                 constexpr int64_t kQwenImageNumHeads = 24;
                 struct ggml_tensor* attn_mask =
-                    cfg_build_attention_mask(work_ctx, s_cond, s_uncond, s_max, non_text_tokens, kQwenImageNumHeads);
+                    cfg_build_attention_mask(work_ctx,
+                                             padded.valid_lens,
+                                             s_max,
+                                             non_text_tokens,
+                                             kQwenImageNumHeads);
                 // Budget guard: at high resolution the 48-slot mask footprint dominates. Fall
                 // back to sequential if the mask would blow past CFG_BATCHED_MAX_MASK_BYTES.
                 const bool mask_over_budget =
