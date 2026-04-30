@@ -4400,12 +4400,41 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
         return s == 0;
     };
 
+    // Q2.4.5.5.13d: BF16 widening for img_ff_up / txt_ff_up matmul outputs.
+    // Empirically identified as the top un-widened F16 matmul output by
+    // QIE_TRACE_FFN_SUBSTEPS instrumentation at HEAD 5b1e032 (256²×20 with
+    // QIE_MOD_BF16=1): 18_img_ff_up F16 max_abs=23,070, 21_txt_ff_up F16
+    // max_abs=9,736 — closest un-widened producer to the F16 ±65,504 limit
+    // and earliest in the FFN chain (upstream of gelu→ff_down which is
+    // already BF16). Cast back to F16 in place before gelu_activate (which
+    // builds F16 tensors). Default OFF on this commit; flip ON if the
+    // empirical close-out at Step 6 verifies VERDICT GREEN.
+    static int s_ff_up_bf16 = -1;
+    if (s_ff_up_bf16 < 0) {
+        const char *v = std::getenv("QIE_FFN_UP_BF16");
+        s_ff_up_bf16 = (v && *v && v[0] != '0') ? 1 : 0;
+        QIE_LOG("forward_block_: QIE_FFN_UP_BF16=%d (1=BF16 storage on "
+                "img_ff_up / txt_ff_up matmul outputs, BF16->F16 cast "
+                "before gelu_activate; 0=legacy F16 output)", s_ff_up_bf16);
+    }
+    const aclDataType ff_up_out_dtype = s_ff_up_bf16 ? ACL_BF16 : ACL_FLOAT16;
+
     // img FFN.
     if (!dispatch_matmul_(scratch_img_norm_dev_, lw.img_ff_up_w_q4,
                           lw.img_ff_up_scale, lw.img_ff_up_b,
-                          img_seq, H, FF, scratch_mlp_dev_)) return false;
-    intra_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, true);
-    ffn_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF, PROBE_F16);
+                          img_seq, H, FF, scratch_mlp_dev_,
+                          ff_up_out_dtype)) return false;
+    intra_probe_dt("18_img_ff_up", scratch_mlp_dev_, img_seq * FF,
+                    s_ff_up_bf16 ? PROBE_BF16 : PROBE_F16);
+    ffn_probe("18_img_ff_up", scratch_mlp_dev_, img_seq * FF,
+               s_ff_up_bf16 ? PROBE_BF16 : PROBE_F16);
+    // Q2.4.5.5.13d: cast BF16 -> F16 in place so gelu_activate (which
+    // builds F16 tensors over scratch_mlp_dev_) sees canonical F16 bytes.
+    if (s_ff_up_bf16) {
+        if (!cast_bf16_to_f16_(scratch_mlp_dev_, scratch_mlp_dev_,
+                                 (int64_t)img_seq * FF))
+            return false;
+    }
     if (!gelu_activate(scratch_mlp_dev_, img_seq)) return false;
     intra_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, true);
     ffn_probe("19_img_gelu", scratch_mlp_dev_, img_seq * FF, PROBE_F16);
@@ -4427,9 +4456,18 @@ bool ImageDiffusionEngine::forward_block_(const DiTLayerWeights &lw,
     // txt FFN.
     if (!dispatch_matmul_(scratch_txt_norm_dev_, lw.txt_ff_up_w_q4,
                           lw.txt_ff_up_scale, lw.txt_ff_up_b,
-                          txt_seq, H, FF, scratch_mlp_dev_)) return false;
-    intra_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF, true);
-    ffn_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF, PROBE_F16);
+                          txt_seq, H, FF, scratch_mlp_dev_,
+                          ff_up_out_dtype)) return false;
+    intra_probe_dt("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF,
+                    s_ff_up_bf16 ? PROBE_BF16 : PROBE_F16);
+    ffn_probe("21_txt_ff_up", scratch_mlp_dev_, txt_seq * FF,
+               s_ff_up_bf16 ? PROBE_BF16 : PROBE_F16);
+    // Q2.4.5.5.13d: cast BF16 -> F16 before gelu_activate (F16 tensor view).
+    if (s_ff_up_bf16) {
+        if (!cast_bf16_to_f16_(scratch_mlp_dev_, scratch_mlp_dev_,
+                                 (int64_t)txt_seq * FF))
+            return false;
+    }
     if (!gelu_activate(scratch_mlp_dev_, txt_seq)) return false;
     intra_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, true);
     ffn_probe("22_txt_gelu", scratch_mlp_dev_, txt_seq * FF, PROBE_F16);
